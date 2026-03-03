@@ -825,11 +825,13 @@ async def upload_recording(
 ):
     session = _get_session_or_404(session_id, db)
 
-    os.makedirs("uploads/recordings", exist_ok=True)
+    _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+    _upload_root = "/tmp/uploads" if _is_serverless else "uploads"
+    os.makedirs(f"{_upload_root}/recordings", exist_ok=True)
     ext = ".webm"
     if file.filename and "." in file.filename:
         ext = "." + file.filename.rsplit(".", 1)[-1]
-    file_path = f"uploads/recordings/{session_id}{ext}"
+    file_path = f"{_upload_root}/recordings/{session_id}{ext}"
 
     content = await file.read()
     with open(file_path, "wb") as f:

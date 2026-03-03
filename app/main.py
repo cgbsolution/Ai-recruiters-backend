@@ -149,12 +149,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Static file serving for uploaded JDs ─────────────────────────────────────
+# ── Static file serving for uploads ──────────────────────────────────────────
 import os
-os.makedirs("uploads/jd", exist_ok=True)
-os.makedirs("uploads/resumes", exist_ok=True)
-os.makedirs("uploads/recordings", exist_ok=True)
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+UPLOAD_ROOT = "/tmp/uploads" if IS_SERVERLESS else "uploads"
+
+os.makedirs(f"{UPLOAD_ROOT}/jd", exist_ok=True)
+os.makedirs(f"{UPLOAD_ROOT}/resumes", exist_ok=True)
+os.makedirs(f"{UPLOAD_ROOT}/recordings", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
 
 # ── Routers ──────────────────────────────────────────────────────────────────
 app.include_router(jobs.router, prefix="/jobs", tags=["Jobs"])

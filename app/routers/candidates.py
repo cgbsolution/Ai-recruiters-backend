@@ -23,7 +23,9 @@ from app.services import candidate_service
 
 router = APIRouter()
 
-RESUME_UPLOAD_DIR = "uploads/resumes"
+IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+UPLOAD_ROOT = "/tmp/uploads" if IS_SERVERLESS else "uploads"
+RESUME_UPLOAD_DIR = f"{UPLOAD_ROOT}/resumes"
 os.makedirs(RESUME_UPLOAD_DIR, exist_ok=True)
 
 ALLOWED_RESUME_TYPES = {

@@ -25,7 +25,8 @@ async def upload_jd(file: UploadFile = File(...)):
         )
 
     filename = f"{uuid.uuid4()}{ext}"
-    upload_dir = settings.UPLOAD_DIR
+    _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+    upload_dir = "/tmp/uploads/jd" if _is_serverless else settings.UPLOAD_DIR
     os.makedirs(upload_dir, exist_ok=True)
     path = os.path.join(upload_dir, filename)
 
