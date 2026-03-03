@@ -1,4 +1,5 @@
 import json
+import time
 
 import anthropic
 
@@ -26,14 +27,21 @@ def _client() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 
-def _ask(prompt: str, model: str = SONNET, max_tokens: int = 1024) -> str:
+def _ask(prompt: str, model: str = SONNET, max_tokens: int = 1024, retries: int = 3) -> str:
     client = _client()
-    message = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return message.content[0].text
+    for attempt in range(retries):
+        try:
+            message = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return message.content[0].text
+        except anthropic.APIStatusError as exc:
+            if exc.status_code == 529 and attempt < retries - 1:
+                time.sleep(2 ** attempt)  # 1s, 2s backoff
+                continue
+            raise
 
 
 def _parse_json(raw: str) -> any:

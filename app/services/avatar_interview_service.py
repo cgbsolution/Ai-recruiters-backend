@@ -1,4 +1,5 @@
 import json
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -32,16 +33,24 @@ def _ask(
     model: str = SONNET,
     max_tokens: int = 512,
     timeout_seconds: int = 25,
+    retries: int = 3,
 ) -> str:
     client = _client()
-    response = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=system,
-        messages=messages,
-        timeout=timeout_seconds,
-    )
-    return response.content[0].text
+    for attempt in range(retries):
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages,
+                timeout=timeout_seconds,
+            )
+            return response.content[0].text
+        except anthropic.APIStatusError as exc:
+            if exc.status_code == 529 and attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
 
 
 def _parse_json(raw: str) -> dict:
