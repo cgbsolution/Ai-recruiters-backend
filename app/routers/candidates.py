@@ -1,15 +1,23 @@
 import json
+import logging
 import os
 import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+logger = logging.getLogger(__name__)
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
+
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 from app.database import get_db
 from app.models.candidate import Candidate
+
+limiter = Limiter(key_func=get_remote_address)
 from app.schemas.candidate import (
     CancelInterviewRequest,
     CandidateCreate,
@@ -113,7 +121,9 @@ def delete_candidate(candidate_id: int, db: Session = Depends(get_db)):
         "**Content-Type:** `multipart/form-data`"
     ),
 )
+@limiter.limit("10/minute")
 async def upload_resumes(
+    request: Request,
     job_id: Optional[int] = Form(None),
     files: List[UploadFile] = File(...),
     db: Session = Depends(get_db),
@@ -141,7 +151,7 @@ async def upload_resumes(
             shutil.copyfileobj(file.file, f)
 
         try:
-            result = parse_resume_file(file_path, job_id=job_id)
+            result = await parse_resume_file(file_path, job_id=job_id)
             parsed = result["parsed"]
             resume_text = result["text"]
 
@@ -162,7 +172,7 @@ async def upload_resumes(
                         required_skills=skills,
                         responsibilities=responsibilities,
                     )
-                    fit_result = calculate_fit_score(fit_req)
+                    fit_result = await calculate_fit_score(fit_req)
                     fit_level = fit_result.fit_level
                     fit_reasoning_json = json.dumps({
                         "summary": fit_result.summary,
@@ -233,7 +243,7 @@ async def upload_resumes(
     summary="Recompute resume fit score",
     description="Re-runs Claude LLM fit-score calculation for an existing candidate against their linked job. Requires resume file on disk and a linked `job_id`.",
 )
-def compute_fit_score(candidate_id: int, db: Session = Depends(get_db)):
+async def compute_fit_score(candidate_id: int, db: Session = Depends(get_db)):
     """Re-compute the LLM fit score for an existing candidate against their linked job."""
     from app.services.resume_service import extract_text, calculate_fit_score
     from app.schemas.ai import FitScoreRequest
@@ -263,7 +273,7 @@ def compute_fit_score(candidate_id: int, db: Session = Depends(get_db)):
         required_skills=skills,
         responsibilities=responsibilities,
     )
-    fit_result = calculate_fit_score(fit_req)
+    fit_result = await calculate_fit_score(fit_req)
 
     candidate.resume_fit_score = fit_result.fit_level
     candidate.fit_score_reasoning = json.dumps({
@@ -295,7 +305,7 @@ def compute_fit_score(candidate_id: int, db: Session = Depends(get_db)):
         "- Saves custom email template overrides in `schedule_email_template` (JSON)"
     ),
 )
-def schedule_interview(
+async def schedule_interview(
     candidate_id: int,
     payload: ScheduleInterviewRequest,
     db: Session = Depends(get_db),
@@ -339,9 +349,9 @@ def schedule_interview(
     db.refresh(candidate)
 
     try:
-        send_schedule_email(candidate, db, is_reschedule=is_reschedule)
+        await send_schedule_email(candidate, db, is_reschedule=is_reschedule)
     except Exception:
-        pass
+        logger.warning("Failed to send schedule email for candidate %s", candidate.id, exc_info=True)
 
     if payload.send_whatsapp and candidate.phone:
         try:
@@ -349,9 +359,9 @@ def schedule_interview(
             job = db.query(Job).filter(Job.id == candidate.job_id).first()
             job_title = job.title if job else "the role"
             msg = _build_whatsapp_message(candidate, job_title, is_reschedule=is_reschedule)
-            send_whatsapp_message(candidate.phone, msg)
+            await send_whatsapp_message(candidate.phone, msg)
         except Exception:
-            pass
+            logger.warning("Failed to send WhatsApp to candidate %s", candidate.id, exc_info=True)
 
     return candidate
 
@@ -371,7 +381,7 @@ def schedule_interview(
         "Only works when current status is 'Scheduled'."
     ),
 )
-def cancel_interview(
+async def cancel_interview(
     candidate_id: int,
     payload: CancelInterviewRequest,
     db: Session = Depends(get_db),
@@ -407,9 +417,9 @@ def cancel_interview(
 
     # Send cancellation notifications
     try:
-        send_cancel_email(candidate, db)
+        await send_cancel_email(candidate, db)
     except Exception:
-        pass
+        logger.warning("Failed to send cancel email for candidate %s", candidate.id, exc_info=True)
 
     if payload.send_whatsapp and candidate.phone:
         try:
@@ -421,9 +431,9 @@ def cancel_interview(
                 f"Your interview for the role of {job_title} at CGBiz Solutions Private Limited "
                 f"has been cancelled. Please contact HR for further details."
             )
-            send_whatsapp_message(candidate.phone, msg)
+            await send_whatsapp_message(candidate.phone, msg)
         except Exception:
-            pass
+            logger.warning("Failed to send WhatsApp cancellation to candidate %s", candidate.id, exc_info=True)
 
     return candidate
 
@@ -468,7 +478,7 @@ def promote_candidate(
     summary="Send WhatsApp message",
     description="Send a custom free-form text message to the candidate via Meta WhatsApp Business Cloud API. Requires `WHATSAPP_TOKEN` and `WHATSAPP_PHONE_NUMBER_ID` in `.env`.",
 )
-def send_whatsapp(
+async def send_whatsapp(
     candidate_id: int,
     payload: SendWhatsAppRequest,
     db: Session = Depends(get_db),
@@ -485,7 +495,7 @@ def send_whatsapp(
         raise HTTPException(status_code=400, detail="No phone number available")
 
     try:
-        result = send_whatsapp_message(phone, payload.message)
+        result = await send_whatsapp_message(phone, payload.message)
         return {"success": True, "detail": result}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"WhatsApp send failed: {str(exc)}")

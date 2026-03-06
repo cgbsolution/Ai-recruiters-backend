@@ -1,9 +1,9 @@
 import json
-import time
+import logging
+import re
 from datetime import datetime
 from typing import Optional
 
-import anthropic
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -16,49 +16,16 @@ from app.models.interview import (
     SessionStatus,
 )
 from app.models.job import InterviewSettings, Job
+from app.services.ai_service import (
+    SONNET,
+    OPUS,
+    _ask_with_system,
+    _parse_json,
+)
 
-SONNET = "claude-sonnet-4-6"
-OPUS = "claude-opus-4-6"
+logger = logging.getLogger(__name__)
 
 VIOLATION_TERMINATE_THRESHOLD = 5
-
-
-def _client() -> anthropic.Anthropic:
-    return anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-
-
-def _ask(
-    system: str,
-    messages: list,
-    model: str = SONNET,
-    max_tokens: int = 512,
-    timeout_seconds: int = 25,
-    retries: int = 3,
-) -> str:
-    client = _client()
-    for attempt in range(retries):
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=messages,
-                timeout=timeout_seconds,
-            )
-            return response.content[0].text
-        except anthropic.APIStatusError as exc:
-            if exc.status_code == 529 and attempt < retries - 1:
-                time.sleep(2 ** attempt)
-                continue
-            raise
-
-
-def _parse_json(raw: str) -> dict:
-    raw = raw.strip()
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        raw = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
-    return json.loads(raw)
 
 
 def _build_system_prompt(job: Job, candidate: Candidate, settings_obj: Optional[InterviewSettings]) -> str:
@@ -245,7 +212,6 @@ def _build_contextual_fallback(
     Uses the candidate's actual message and interview context to produce
     something intelligent rather than a generic "repeat" request.
     """
-    # Get the last AI question for context
     last_ai_msg = (
         db.query(InterviewMessage)
         .filter(InterviewMessage.session_id == session.id, InterviewMessage.role == "ai")
@@ -255,9 +221,7 @@ def _build_contextual_fallback(
     last_question = last_ai_msg.content if last_ai_msg else ""
     skills = ", ".join([s.skill for s in job.skills]) if job and job.skills else "the role"
 
-    # If we have the candidate's message, try to respond to it contextually
     if candidate_message and len(candidate_message.strip()) > 5:
-        # Candidate gave a substantive answer — acknowledge and move forward
         contextual_responses = [
             f"That's an interesting perspective. Let me ask you something related — can you tell me about your experience with {skills}?",
             f"Thank you for sharing that. Moving on, could you describe a challenging project you've worked on recently?",
@@ -266,13 +230,11 @@ def _build_contextual_fallback(
             f"Thanks for that. Tell me, how do you stay updated with new technologies and best practices in your field?",
         ]
     elif candidate_message and len(candidate_message.strip()) <= 5:
-        # Very short/unclear input
         if consecutive_fallbacks == 0:
             return "I didn't quite catch that. Could you elaborate a bit more on your answer?"
         elif consecutive_fallbacks == 1:
             return "It seems there may be an audio issue. Could you please speak a bit more clearly and give me a detailed answer?"
         else:
-            # Don't ask again — just move on with a new question
             contextual_responses = [
                 f"No worries, let's move on. Can you tell me about your experience with {skills}?",
                 f"Let's try a different question. What's a technical challenge you've solved recently that you're proud of?",
@@ -280,19 +242,17 @@ def _build_contextual_fallback(
                 f"Let's switch topics. Can you describe your ideal development workflow and the tools you use daily?",
             ]
     else:
-        # Opening turn failed — give a generic intro
         return (
             f"Hello! I'm Alex, and I'll be conducting your interview today for the "
             f"{job.title} position. Thank you for joining us. "
             f"Let's start with a quick introduction — could you tell me about your background and experience?"
         )
 
-    # Pick a response based on consecutive count to avoid repetition
     idx = consecutive_fallbacks % len(contextual_responses)
     return contextual_responses[idx]
 
 
-def conduct_turn(
+async def conduct_turn(
     session: InterviewSession,
     candidate_message: Optional[str],
     db: Session,
@@ -303,7 +263,6 @@ def conduct_turn(
 
     system_prompt = _build_system_prompt(job, candidate, interview_settings)
 
-    # Build conversation history from DB
     past_messages = (
         db.query(InterviewMessage)
         .filter(InterviewMessage.session_id == session.id)
@@ -318,11 +277,9 @@ def conduct_turn(
             "content": msg.content,
         })
 
-    # If this is the opening turn (no candidate message), use a trigger
     if candidate_message is None:
         claude_messages.append({"role": "user", "content": "Please begin the interview."})
     else:
-        # Save candidate message first
         db.add(InterviewMessage(
             session_id=session.id,
             role="candidate",
@@ -335,36 +292,26 @@ def conduct_turn(
     # ── Attempt 1: Call Claude with standard settings ──
     result = None
     raw = None
-    last_error = None
 
     try:
-        raw = _ask(system_prompt, claude_messages, model=SONNET, max_tokens=512, timeout_seconds=25)
+        raw = await _ask_with_system(system_prompt, claude_messages, model=SONNET, max_tokens=512, timeout_seconds=25)
         result = _parse_json(raw)
     except Exception as e:
-        last_error = e
-        import traceback
-        traceback.print_exc()
+        logger.warning(f"Claude attempt 1 failed for session {session.id}: {e}")
 
-    # ── Attempt 2: Retry once with shorter timeout if first attempt failed ──
+    # ── Attempt 2: Retry once with shorter timeout ──
     if result is None:
         try:
-            # Retry with a slightly simplified approach
-            raw = _ask(system_prompt, claude_messages, model=SONNET, max_tokens=256, timeout_seconds=20)
+            raw = await _ask_with_system(system_prompt, claude_messages, model=SONNET, max_tokens=256, timeout_seconds=20)
             result = _parse_json(raw)
         except Exception as e:
-            last_error = e
-            import traceback
-            traceback.print_exc()
+            logger.warning(f"Claude attempt 2 failed for session {session.id}: {e}")
 
-    # ── Attempt 3: If JSON parse failed but we got raw text, try to salvage it ──
+    # ── Attempt 3: If JSON parse failed but we got raw text, salvage it ──
     if result is None and raw and len(raw.strip()) > 10:
-        # The model responded but not in JSON — use the raw text as the message
         clean_text = raw.strip()
-        # Remove any partial JSON artifacts
         if clean_text.startswith("{"):
-            # Try to extract just the "message" field
             try:
-                import re
                 match = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', clean_text)
                 if match:
                     clean_text = match.group(1)
@@ -378,14 +325,12 @@ def conduct_turn(
                 "is_off_topic": False,
             }
 
-    # ── All attempts failed — use contextual fallback instead of static message ──
+    # ── All attempts failed — use contextual fallback ──
     if result is None:
         consecutive_fallbacks = _count_recent_fallbacks(db, session.id)
         fallback_msg = _build_contextual_fallback(
             candidate_message, consecutive_fallbacks, session, job, db
         )
-        # Move to next question index if we've had 2+ consecutive fallbacks
-        # (avoids getting stuck on the same question forever)
         q_index = session.current_question_index
         if consecutive_fallbacks >= 2 and candidate_message is not None:
             q_index = (session.current_question_index or 0) + 1
@@ -412,7 +357,6 @@ def conduct_turn(
     is_off_topic = result.get("is_off_topic", False)
     question_index = result.get("question_index", session.current_question_index + 1)
 
-    # Save AI message
     db.add(InterviewMessage(
         session_id=session.id,
         role="ai",
@@ -420,7 +364,6 @@ def conduct_turn(
         question_index=question_index,
     ))
 
-    # Update session state — only advance question_index when it's a real new question
     session.current_question_index = question_index
     if is_complete:
         session.status = SessionStatus.completed
@@ -438,7 +381,7 @@ def conduct_turn(
     }
 
 
-def generate_evaluation(session: InterviewSession, db: Session) -> Evaluation:
+async def generate_evaluation(session: InterviewSession, db: Session) -> Evaluation:
     job = db.query(Job).filter(Job.id == session.job_id).first()
     candidate = db.query(Candidate).filter(Candidate.id == session.candidate_id).first() if session.candidate_id else None
 
@@ -509,7 +452,7 @@ Return ONLY valid JSON:
   "detailed_feedback": "..."
 }}"""
 
-    raw = _ask(
+    raw = await _ask_with_system(
         system="You are a senior technical evaluator. Return only valid JSON.",
         messages=[{"role": "user", "content": prompt}],
         model=OPUS,
@@ -545,7 +488,6 @@ Return ONLY valid JSON:
     )
     db.add(evaluation)
 
-    # Mirror all scores and status back to candidate — dashboard auto-update
     if candidate:
         candidate.score = overall
         candidate.confidence_score = float(data.get("confidence_score", 0))
@@ -558,7 +500,7 @@ Return ONLY valid JSON:
         candidate.ai_cheating_score = candidate.trust_score
         candidate.interview_status = "Completed"
         candidate.interview_date = datetime.utcnow()
-        candidate.candidate_stage = "AI Round"         # auto-promote to AI Round
+        candidate.candidate_stage = "AI Round"
 
     db.commit()
     db.refresh(evaluation)

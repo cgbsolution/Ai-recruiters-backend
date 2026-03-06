@@ -2,26 +2,30 @@
 Interview scheduling notifications.
 
 Email: uses smtplib with SMTP credentials from settings.
-WhatsApp: uses Meta WhatsApp Business Cloud API.
+WhatsApp: uses Meta WhatsApp Business Cloud API (httpx async).
 
 Configure credentials in .env:
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM
   WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID
 """
 
+import asyncio
 import json
+import logging
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import TYPE_CHECKING
 
-import requests
+import httpx
 
 from app.config import settings
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
     from app.models.candidate import Candidate
+
+logger = logging.getLogger(__name__)
 
 
 # ── Email ─────────────────────────────────────────────────────────────────────
@@ -34,16 +38,28 @@ def _format_interview_date(candidate) -> str:
     return dt.strftime(f"%a, %b %d, %Y, %I:%M %p") + f" ({tz})"
 
 
-def send_schedule_email(candidate, db: "Session", is_reschedule: bool = False) -> bool:
+def _send_email_sync(msg, recipients) -> bool:
+    """Blocking SMTP send — called via asyncio.to_thread."""
+    try:
+        port = int(getattr(settings, "SMTP_PORT", 587))
+        with smtplib.SMTP(settings.SMTP_HOST, port) as server:
+            server.starttls()
+            server.login(settings.SMTP_USER, settings.SMTP_PASS)
+            server.sendmail(msg["From"], recipients, msg.as_string())
+        return True
+    except Exception as exc:
+        logger.warning(f"Email send failed: {exc}")
+        return False
+
+
+async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = False) -> bool:
     """
     Send interview schedule/reschedule notification email to the candidate.
     Reads SMTP settings from config; returns True on success.
     """
     if not getattr(settings, "SMTP_HOST", None) or not getattr(settings, "SMTP_USER", None):
-        # Email not configured — skip silently in dev
         return False
 
-    # Load email template overrides
     template = {}
     if candidate.schedule_email_template:
         try:
@@ -51,7 +67,6 @@ def send_schedule_email(candidate, db: "Session", is_reschedule: bool = False) -
         except Exception:
             pass
 
-    # Fetch job title
     from app.models.job import Job
     job_title = "the role"
     if candidate.job_id:
@@ -101,21 +116,11 @@ def send_schedule_email(candidate, db: "Session", is_reschedule: bool = False) -
 
     msg.attach(MIMEText(html_body, "html"))
 
-    try:
-        port = int(getattr(settings, "SMTP_PORT", 587))
-        with smtplib.SMTP(settings.SMTP_HOST, port) as server:
-            server.starttls()
-            server.login(settings.SMTP_USER, settings.SMTP_PASS)
-            recipients = [candidate.email] + cc_emails
-            server.sendmail(msg["From"], recipients, msg.as_string())
-        return True
-    except Exception as exc:
-        # In production, replace with proper logging
-        print(f"[interview_service] Email send failed: {exc}")
-        return False
+    recipients = [candidate.email] + cc_emails
+    return await asyncio.to_thread(_send_email_sync, msg, recipients)
 
 
-def send_cancel_email(candidate, db: "Session") -> bool:
+async def send_cancel_email(candidate, db: "Session") -> bool:
     """
     Send interview cancellation notification email to the candidate.
     """
@@ -151,21 +156,12 @@ def send_cancel_email(candidate, db: "Session") -> bool:
     msg["To"] = candidate.email
     msg.attach(MIMEText(html_body, "html"))
 
-    try:
-        port = int(getattr(settings, "SMTP_PORT", 587))
-        with smtplib.SMTP(settings.SMTP_HOST, port) as server:
-            server.starttls()
-            server.login(settings.SMTP_USER, settings.SMTP_PASS)
-            server.sendmail(msg["From"], [candidate.email], msg.as_string())
-        return True
-    except Exception as exc:
-        print(f"[interview_service] Cancel email send failed: {exc}")
-        return False
+    return await asyncio.to_thread(_send_email_sync, msg, [candidate.email])
 
 
 # ── WhatsApp Business Cloud API ───────────────────────────────────────────────
 
-def send_whatsapp_message(phone: str, message: str) -> str:
+async def send_whatsapp_message(phone: str, message: str) -> str:
     """
     Send a free-form text message via Meta WhatsApp Business Cloud API.
 
@@ -183,7 +179,6 @@ def send_whatsapp_message(phone: str, message: str) -> str:
             "WhatsApp not configured. Set WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID in .env"
         )
 
-    # Normalise phone: strip non-digit chars, ensure no leading +
     clean_phone = "".join(c for c in phone if c.isdigit())
 
     url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
@@ -199,8 +194,10 @@ def send_whatsapp_message(phone: str, message: str) -> str:
         "text": {"preview_url": False, "body": message},
     }
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=15)
-    if not resp.ok:
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, json=payload, timeout=15)
+
+    if resp.status_code >= 400:
         raise RuntimeError(f"WhatsApp API error {resp.status_code}: {resp.text}")
 
     return resp.json().get("messages", [{}])[0].get("id", "sent")

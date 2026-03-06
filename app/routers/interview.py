@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import uuid
 from datetime import datetime
@@ -45,6 +46,10 @@ from app.schemas.interview import (
     ViolationResponse,
 )
 from app.services import avatar_interview_service as svc
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address)
 
 router = APIRouter()
 
@@ -140,6 +145,7 @@ def get_interview_config(token: str, db: Session = Depends(get_db)):
     ),
     tags=["Interview"],
 )
+@limiter.limit("5/minute")
 def register_candidate(
     token: str,
     payload: CandidateRegisterRequest,
@@ -475,9 +481,11 @@ def resume_session(session_id: int, db: Session = Depends(get_db)):
     ),
     tags=["Interview"],
 )
-def interview_message(
+@limiter.limit("10/minute")
+async def interview_message(
     session_id: int,
     payload: InterviewMessageRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     session = _get_session_or_404(session_id, db)
@@ -493,7 +501,7 @@ def interview_message(
         session.started_at = datetime.utcnow()
         db.flush()
 
-    result = svc.conduct_turn(session, payload.content, db)
+    result = await svc.conduct_turn(session, payload.content, db)
     return InterviewMessageResponse(**result)
 
 
@@ -510,7 +518,8 @@ def interview_message(
     ),
     tags=["Interview"],
 )
-def start_interview(session_id: int, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+async def start_interview(session_id: int, request: Request, db: Session = Depends(get_db)):
     session = _get_session_or_404(session_id, db)
 
     if session.status not in (SessionStatus.pending, SessionStatus.in_progress):
@@ -520,7 +529,7 @@ def start_interview(session_id: int, db: Session = Depends(get_db)):
     session.started_at = datetime.utcnow()
     db.flush()
 
-    result = svc.conduct_turn(session, None, db)
+    result = await svc.conduct_turn(session, None, db)
     return InterviewMessageResponse(**result)
 
 
@@ -541,9 +550,11 @@ def start_interview(session_id: int, db: Session = Depends(get_db)):
     ),
     tags=["Interview"],
 )
+@limiter.limit("20/minute")
 def log_violation(
     session_id: int,
     payload: ViolationRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     session = _get_session_or_404(session_id, db)
@@ -613,8 +624,10 @@ def log_violation(
     ),
     tags=["Interview"],
 )
-def complete_interview(
+@limiter.limit("3/minute")
+async def complete_interview(
     session_id: int,
+    request: Request,
     early_termination: bool = False,
     termination_reason: Optional[str] = None,
     db: Session = Depends(get_db),
@@ -636,7 +649,7 @@ def complete_interview(
     if session.status == SessionStatus.completed:
         if session.evaluation:
             return _format_evaluation(session.evaluation)
-        evaluation = svc.generate_evaluation(session, db)
+        evaluation = await svc.generate_evaluation(session, db)
         return _format_evaluation(evaluation)
 
     if session.status == SessionStatus.terminated:
@@ -669,7 +682,7 @@ def complete_interview(
 
     db.flush()
 
-    evaluation = svc.generate_evaluation(session, db)
+    evaluation = await svc.generate_evaluation(session, db)
     return _format_evaluation(evaluation)
 
 
@@ -817,12 +830,16 @@ def schedule_meeting(
     description="Stores the candidate's interview video recording and updates the candidate record with the link and duration.",
     tags=["Interview"],
 )
+@limiter.limit("3/minute")
 async def upload_recording(
     session_id: int,
+    request: Request,
     file: UploadFile = File(...),
     duration: str = Form(default=""),
     db: Session = Depends(get_db),
 ):
+    MAX_RECORDING_SIZE = 100 * 1024 * 1024  # 100 MB
+
     session = _get_session_or_404(session_id, db)
 
     _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
@@ -833,9 +850,15 @@ async def upload_recording(
         ext = "." + file.filename.rsplit(".", 1)[-1]
     file_path = f"{_upload_root}/recordings/{session_id}{ext}"
 
-    content = await file.read()
+    total_size = 0
     with open(file_path, "wb") as f:
-        f.write(content)
+        while chunk := await file.read(8192):
+            total_size += len(chunk)
+            if total_size > MAX_RECORDING_SIZE:
+                f.close()
+                os.remove(file_path)
+                raise HTTPException(status_code=413, detail="Recording too large (max 100 MB)")
+            f.write(chunk)
 
     recording_link = f"/uploads/recordings/{session_id}{ext}"
 
@@ -856,7 +879,10 @@ async def upload_recording(
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _compute_fit_score_bg(candidate_id: int, job_id: int) -> None:
+_bg_logger = logging.getLogger("fit_score_bg")
+
+
+async def _compute_fit_score_bg(candidate_id: int, job_id: int) -> None:
     """Background task: compute resume fit score after candidate registration."""
     db = SessionLocal()
     try:
@@ -866,12 +892,14 @@ def _compute_fit_score_bg(candidate_id: int, job_id: int) -> None:
         candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
         job = db.query(Job).filter(Job.id == job_id).first()
         if not candidate or not job or not candidate.resume_path:
+            _bg_logger.info(f"Fit score skip: candidate={candidate_id}, job={job_id}")
             return
 
         full_path = candidate.resume_path
         if not full_path.startswith("/"):
             full_path = full_path.lstrip("/")
         if not os.path.exists(full_path):
+            _bg_logger.warning(f"Fit score skip: file not found at {full_path}")
             return
 
         resume_text = extract_text(full_path)
@@ -886,7 +914,7 @@ def _compute_fit_score_bg(candidate_id: int, job_id: int) -> None:
             required_experience_min=job.experience_min,
             required_experience_max=job.experience_max,
         )
-        result = calculate_fit_score(req)
+        result = await calculate_fit_score(req)
 
         candidate.resume_fit_score = result.fit_level
         candidate.fit_score_reasoning = json.dumps({
@@ -899,8 +927,10 @@ def _compute_fit_score_bg(candidate_id: int, job_id: int) -> None:
         })
         candidate.fit_score_details = json.dumps(result.reasoning_points)
         db.commit()
-    except Exception:
-        pass
+        _bg_logger.info(f"Fit score computed: candidate={candidate_id}, level={result.fit_level}")
+    except Exception as exc:
+        _bg_logger.exception(f"Fit score failed for candidate={candidate_id}: {exc}")
+        db.rollback()
     finally:
         db.close()
 

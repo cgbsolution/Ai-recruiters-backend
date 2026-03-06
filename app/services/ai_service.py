@@ -1,5 +1,5 @@
+import asyncio
 import json
-import time
 
 import anthropic
 
@@ -22,16 +22,23 @@ from app.schemas.ai import (
 SONNET = "claude-sonnet-4-6"
 OPUS = "claude-opus-4-6"
 
+# ── Singleton async client ───────────────────────────────────────────────────
 
-def _client() -> anthropic.Anthropic:
-    return anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+_async_client: anthropic.AsyncAnthropic | None = None
 
 
-def _ask(prompt: str, model: str = SONNET, max_tokens: int = 1024, retries: int = 3) -> str:
-    client = _client()
+def get_async_client() -> anthropic.AsyncAnthropic:
+    global _async_client
+    if _async_client is None:
+        _async_client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+    return _async_client
+
+
+async def _ask(prompt: str, model: str = SONNET, max_tokens: int = 1024, retries: int = 3) -> str:
+    client = get_async_client()
     for attempt in range(retries):
         try:
-            message = client.messages.create(
+            message = await client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
@@ -39,7 +46,33 @@ def _ask(prompt: str, model: str = SONNET, max_tokens: int = 1024, retries: int 
             return message.content[0].text
         except anthropic.APIStatusError as exc:
             if exc.status_code == 529 and attempt < retries - 1:
-                time.sleep(2 ** attempt)  # 1s, 2s backoff
+                await asyncio.sleep(2 ** attempt)
+                continue
+            raise
+
+
+async def _ask_with_system(
+    system: str,
+    messages: list,
+    model: str = SONNET,
+    max_tokens: int = 512,
+    timeout_seconds: int = 25,
+    retries: int = 3,
+) -> str:
+    client = get_async_client()
+    for attempt in range(retries):
+        try:
+            response = await client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages,
+                timeout=timeout_seconds,
+            )
+            return response.content[0].text
+        except anthropic.APIStatusError as exc:
+            if exc.status_code == 529 and attempt < retries - 1:
+                await asyncio.sleep(2 ** attempt)
                 continue
             raise
 
@@ -52,7 +85,7 @@ def _parse_json(raw: str) -> any:
     return json.loads(raw)
 
 
-def generate_jd(req: GenerateJDRequest) -> GenerateJDResponse:
+async def generate_jd(req: GenerateJDRequest) -> GenerateJDResponse:
     exp_min = req.experience_min if req.experience_min is not None else 0
     exp_max = req.experience_max if req.experience_max is not None else 2
 
@@ -118,12 +151,12 @@ Generate 2–4 skill groups that logically cluster the required skills.
 Generate 4–6 responsibilities relevant to the role.
 coding_questions_count must be at least 1 for technical roles."""
 
-    raw = _ask(prompt, model=SONNET, max_tokens=2048)
+    raw = await _ask(prompt, model=SONNET, max_tokens=2048)
     data = _parse_json(raw)
     return GenerateJDResponse(**data)
 
 
-def generate_questions(req: GenerateQuestionsRequest) -> GenerateQuestionsResponse:
+async def generate_questions(req: GenerateQuestionsRequest) -> GenerateQuestionsResponse:
     skills_str = ", ".join(req.skills) if req.skills else "general"
     prompt = f"""You are a senior technical interviewer.
 Generate {req.count} interview questions for a {req.job_title} ({req.department}) role.
@@ -136,12 +169,12 @@ Return ONLY a valid JSON array (no markdown fences):
   {{"text": "question text", "category": "skill category", "difficulty": "{req.difficulty}"}},
   ...
 ]"""
-    raw = _ask(prompt, model=SONNET, max_tokens=2048)
+    raw = await _ask(prompt, model=SONNET, max_tokens=2048)
     questions = _parse_json(raw)
     return GenerateQuestionsResponse(questions=questions)
 
 
-def evaluate_answer(req: EvaluateCandidateRequest) -> EvaluateCandidateResponse:
+async def evaluate_answer(req: EvaluateCandidateRequest) -> EvaluateCandidateResponse:
     prompt = f"""You are an AI recruiter evaluating a candidate's interview answer.
 
 Job: {req.job_title}
@@ -155,7 +188,7 @@ Evaluate the answer and return ONLY valid JSON (no markdown fences):
   "feedback": "detailed evaluation feedback",
   "passed": <true|false>
 }}"""
-    raw = _ask(prompt, model=OPUS, max_tokens=512)
+    raw = await _ask(prompt, model=OPUS, max_tokens=512)
     data = _parse_json(raw)
     return EvaluateCandidateResponse(
         score=data["score"],
@@ -164,25 +197,25 @@ Evaluate the answer and return ONLY valid JSON (no markdown fences):
     )
 
 
-def suggest_questions(req: SuggestQuestionsRequest) -> SuggestQuestionsResponse:
+async def suggest_questions(req: SuggestQuestionsRequest) -> SuggestQuestionsResponse:
     prompt = f"""Suggest {req.count} interview questions for:
 Category: {req.category}
 Difficulty: {req.difficulty}
 
 Return ONLY a valid JSON array of question strings (no markdown fences):
 ["question 1", "question 2", ...]"""
-    raw = _ask(prompt, model=SONNET, max_tokens=1024)
+    raw = await _ask(prompt, model=SONNET, max_tokens=1024)
     questions = _parse_json(raw)
     return SuggestQuestionsResponse(questions=questions)
 
 
-def parse_resume(req: ParseResumeRequest) -> ParseResumeResponse:
+async def parse_resume(req: ParseResumeRequest) -> ParseResumeResponse:
     """Delegate to resume_service (keeps LLM helpers importable from ai_service)."""
     from app.services.resume_service import parse_resume as _parse
-    return _parse(req)
+    return await _parse(req)
 
 
-def calculate_fit_score(req: FitScoreRequest) -> FitScoreResponse:
+async def calculate_fit_score(req: FitScoreRequest) -> FitScoreResponse:
     """Delegate to resume_service (keeps LLM helpers importable from ai_service)."""
     from app.services.resume_service import calculate_fit_score as _calc
-    return _calc(req)
+    return await _calc(req)

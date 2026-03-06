@@ -1,4 +1,8 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address)
 
 from app.schemas.ai import (
     EvaluateCandidateRequest,
@@ -25,9 +29,10 @@ router = APIRouter()
     summary="Generate Job Description",
     description="Uses Claude Sonnet to generate a complete structured JD from a title/description. Returns title, responsibilities, 2–4 skill groups with criteria/weight, special instructions, and coding question count.",
 )
-def generate_jd(payload: GenerateJDRequest):
+@limiter.limit("5/minute")
+async def generate_jd(request: Request, payload: GenerateJDRequest):
     try:
-        return ai_service.generate_jd(payload)
+        return await ai_service.generate_jd(payload)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI generation failed: {str(e)}")
 
@@ -38,9 +43,10 @@ def generate_jd(payload: GenerateJDRequest):
     summary="Generate interview questions",
     description="Generates `count` interview questions for a given job title, skills, difficulty, and interview mode (TRADITIONAL / SCENARIO) using Claude Sonnet.",
 )
-def generate_questions(payload: GenerateQuestionsRequest):
+@limiter.limit("5/minute")
+async def generate_questions(request: Request, payload: GenerateQuestionsRequest):
     try:
-        return ai_service.generate_questions(payload)
+        return await ai_service.generate_questions(payload)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI generation failed: {str(e)}")
 
@@ -51,9 +57,10 @@ def generate_questions(payload: GenerateQuestionsRequest):
     summary="Evaluate candidate interview answer",
     description="Scores a candidate's answer (0–100) against a question using Claude Opus. Returns score, feedback, and pass/fail status.",
 )
-def evaluate_answer(payload: EvaluateCandidateRequest):
+@limiter.limit("5/minute")
+async def evaluate_answer(request: Request, payload: EvaluateCandidateRequest):
     try:
-        return ai_service.evaluate_answer(payload)
+        return await ai_service.evaluate_answer(payload)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI evaluation failed: {str(e)}")
 
@@ -64,9 +71,10 @@ def evaluate_answer(payload: EvaluateCandidateRequest):
     summary="Suggest questions by category/difficulty",
     description="Returns `count` question suggestions for a given category and difficulty level using Claude Sonnet.",
 )
-def suggest_questions(payload: SuggestQuestionsRequest):
+@limiter.limit("5/minute")
+async def suggest_questions(request: Request, payload: SuggestQuestionsRequest):
     try:
-        return ai_service.suggest_questions(payload)
+        return await ai_service.suggest_questions(payload)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI suggestion failed: {str(e)}")
 
@@ -83,9 +91,10 @@ def suggest_questions(payload: SuggestQuestionsRequest):
         "For file uploads with auto-parsing use `POST /candidates/upload-resume` instead."
     ),
 )
-def parse_resume(payload: ParseResumeRequest):
+@limiter.limit("5/minute")
+async def parse_resume(request: Request, payload: ParseResumeRequest):
     try:
-        return ai_service.parse_resume(payload)
+        return await ai_service.parse_resume(payload)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Resume parsing failed: {str(e)}")
 
@@ -107,8 +116,9 @@ def parse_resume(payload: ParseResumeRequest):
         "- `low` — significant mismatch or missing core required skills"
     ),
 )
-def calculate_fit_score(payload: FitScoreRequest):
+@limiter.limit("5/minute")
+async def calculate_fit_score(request: Request, payload: FitScoreRequest):
     try:
-        return ai_service.calculate_fit_score(payload)
+        return await ai_service.calculate_fit_score(payload)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Fit score calculation failed: {str(e)}")

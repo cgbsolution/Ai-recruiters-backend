@@ -65,7 +65,7 @@ def extract_text(file_path: str) -> str:
 
 # ── LLM-backed Resume Parsing ─────────────────────────────────────────────────
 
-def parse_resume(req: ParseResumeRequest) -> ParseResumeResponse:
+async def parse_resume(req: ParseResumeRequest) -> ParseResumeResponse:
     """Use Claude to extract structured data from raw resume text."""
     from app.services.ai_service import _ask, _parse_json, SONNET
 
@@ -105,7 +105,7 @@ Rules:
 - If a field cannot be determined, use null
 """
 
-    raw = _ask(prompt, model=SONNET, max_tokens=2048)
+    raw = await _ask(prompt, model=SONNET, max_tokens=2048)
     data = _parse_json(raw)
 
     parsed = ParsedResumeData(
@@ -129,7 +129,7 @@ Rules:
 
 # ── LLM-backed Fit Score Calculation ─────────────────────────────────────────
 
-def calculate_fit_score(req: FitScoreRequest) -> FitScoreResponse:
+async def calculate_fit_score(req: FitScoreRequest) -> FitScoreResponse:
     """Use Claude to compare a resume against a job description and produce a fit score."""
     from app.services.ai_service import _ask, _parse_json, SONNET
 
@@ -194,7 +194,7 @@ Rules:
 - relevant_experience_summary: synthesize, do NOT copy-paste resume text
 """
 
-    raw = _ask(prompt, model=SONNET, max_tokens=1500)
+    raw = await _ask(prompt, model=SONNET, max_tokens=1500)
     data = _parse_json(raw)
 
     raw_pct = data.get("fit_percentage", 0)
@@ -223,14 +223,14 @@ Rules:
 
 # ── File-based Helpers ────────────────────────────────────────────────────────
 
-def parse_resume_file(file_path: str, job_id: Optional[int] = None) -> dict:
+async def parse_resume_file(file_path: str, job_id: Optional[int] = None) -> dict:
     """
     Full pipeline: extract text → LLM parse → return dict.
     Returns both the raw extracted text and the parsed structured data.
     """
     text = extract_text(file_path)
     req = ParseResumeRequest(resume_text=text, job_id=job_id)
-    result = parse_resume(req)
+    result = await parse_resume(req)
     return {
         "text": text,
         "parsed": result.parsed_data.model_dump(),
