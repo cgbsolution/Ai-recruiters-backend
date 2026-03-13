@@ -8,6 +8,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+import sqlalchemy as sa
 from app.config import settings
 
 logging.basicConfig(
@@ -25,14 +26,70 @@ try:
     from alembic import command
     import os
 
-    alembic_cfg = Config(os.path.join(os.path.dirname(os.path.dirname(__file__)), "alembic.ini"))
-    alembic_cfg.set_main_option("script_location", os.path.join(os.path.dirname(os.path.dirname(__file__)), "alembic"))
+    _base_dir = os.path.dirname(os.path.dirname(__file__))
+    alembic_cfg = Config(os.path.join(_base_dir, "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", os.path.join(_base_dir, "alembic"))
+
+    # Check if alembic_version table exists — if not, the DB was created
+    # with create_all() and we need to stamp it before upgrading
+    from sqlalchemy import inspect as sa_inspect
+    _inspector = sa_inspect(engine)
+    if "alembic_version" not in _inspector.get_table_names():
+        logging.info("No alembic_version table — stamping DB at base revision")
+        # Stamp at initial so Alembic knows tables exist, then upgrade the rest
+        command.stamp(alembic_cfg, "f9ffeeb88d8e")  # initial_schema
+
     command.upgrade(alembic_cfg, "head")
     logging.info("Alembic migrations applied successfully")
 except Exception as e:
-    logging.warning(f"Alembic migration skipped: {e}")
-    # Fallback: create tables that don't exist yet
+    logging.warning(f"Alembic migration failed: {e}")
+    # Fallback: create missing tables via SQLAlchemy, then apply critical columns via raw SQL
     Base.metadata.create_all(bind=engine)
+    logging.info("Fallback: Base.metadata.create_all() completed")
+
+    # Apply critical missing columns that create_all won't add to existing tables
+    _raw_migrations = [
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS resume_metadata_id INTEGER REFERENCES resume_metadata(id)",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS parsing_status VARCHAR(20)",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS mail_contact_history BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS pre_interview_responses TEXT",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS candidate_stage VARCHAR(50) DEFAULT 'Candidates'",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS interview_status VARCHAR(60) DEFAULT 'New'",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS interview_date TIMESTAMP",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS interview_timezone VARCHAR(100)",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS interview_link VARCHAR(500)",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS allow_candidate_reschedule BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS joining_flexibility VARCHAR(30) DEFAULT 'anytime'",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS schedule_email_template TEXT",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS score FLOAT",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS trust_score FLOAT",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS grammar_score FLOAT",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS confidence_score FLOAT",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS clarity_score FLOAT",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS pronunciation_score FLOAT",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS enthusiasm_score FLOAT",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS conciseness_score FLOAT",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS ai_cheating_score FLOAT",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS recording_link VARCHAR(500)",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS video_duration VARCHAR(50)",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS resume_fit_score VARCHAR(20)",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS fit_score_reasoning TEXT",
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS fit_score_details TEXT",
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'candidatestatus') THEN CREATE TYPE candidatestatus AS ENUM ('Applied','Interview','Offered','Selected','Hired','Rejected'); END IF; END $$;",
+        "DO $$ BEGIN ALTER TYPE candidatestatus ADD VALUE IF NOT EXISTS 'Selected'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+        "DO $$ BEGIN ALTER TYPE candidatestatus ADD VALUE IF NOT EXISTS 'Hired'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+    ]
+    try:
+        with engine.connect() as conn:
+            for sql in _raw_migrations:
+                try:
+                    conn.execute(sa.text(sql))
+                except Exception:
+                    pass  # column/type already exists — safe to skip
+            conn.commit()
+        logging.info("Fallback: raw SQL migrations applied")
+    except Exception as e2:
+        logging.warning(f"Fallback raw SQL also failed: {e2}")
 
 _DESCRIPTION = """
 ## CGB Solutions — AI Recruiters API
