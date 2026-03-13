@@ -19,8 +19,20 @@ from app.routers import ai, candidates, interview, jobs, questions, resume_datab
 
 import app.models  # noqa: F401 — ensure all models are registered with Base
 
-# Create tables (dev only — use Alembic for production)
-Base.metadata.create_all(bind=engine)
+# Run Alembic migrations on startup (adds missing columns/tables safely)
+try:
+    from alembic.config import Config
+    from alembic import command
+    import os
+
+    alembic_cfg = Config(os.path.join(os.path.dirname(os.path.dirname(__file__)), "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", os.path.join(os.path.dirname(os.path.dirname(__file__)), "alembic"))
+    command.upgrade(alembic_cfg, "head")
+    logging.info("Alembic migrations applied successfully")
+except Exception as e:
+    logging.warning(f"Alembic migration skipped: {e}")
+    # Fallback: create tables that don't exist yet
+    Base.metadata.create_all(bind=engine)
 
 _DESCRIPTION = """
 ## CGB Solutions — AI Recruiters API
