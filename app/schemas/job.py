@@ -159,6 +159,7 @@ class JobRead(BaseModel):
     questions: List[QuestionOut] = []
     pre_interview_fields: List[PreInterviewFieldOut] = []
     interview_token: Optional[str] = None
+    summary: Optional[str] = None
     model_config = {"from_attributes": True}
 
 

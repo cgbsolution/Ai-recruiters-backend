@@ -86,8 +86,10 @@ Return JSON in EXACTLY this format:
   "location": "City, Country or null",
   "experience_years": <number or null>,
   "current_role": "Most recent job title or null",
+  "current_designation": "Current or most recent designation/title or null",
   "skills": ["skill1", "skill2", ...],
   "education": ["Degree, Institution, Year", ...],
+  "certifications": ["Certification name", ...],
   "work_experience": [
     {{
       "title": "Job title",
@@ -96,13 +98,25 @@ Return JSON in EXACTLY this format:
       "description": "Brief description"
     }}
   ],
+  "personal_details": {{
+    "date_of_birth": "DOB or null",
+    "gender": "Gender or null",
+    "languages": ["Language1", "Language2"],
+    "nationality": "Nationality or null",
+    "marital_status": "Status or null"
+  }},
+  "keywords": ["keyword1", "keyword2", ...],
   "summary": "2-3 sentence professional summary of the candidate"
 }}
 
 Rules:
 - experience_years should be a number (e.g. 4.5 for 4 years 6 months)
-- skills should be a flat list of individual technologies/tools
+- skills should be a flat list of individual technologies/tools/soft skills
+- certifications should list any professional certifications (AWS, PMP, etc.)
+- keywords should be 10-20 important terms from the resume useful for search/matching (job titles, domains, technologies, industries)
+- personal_details: extract whatever personal info is available; use null for missing fields
 - If a field cannot be determined, use null
+- For empty arrays use []
 """
 
     raw = await _ask(prompt, model=SONNET, max_tokens=2048)
@@ -115,9 +129,13 @@ Rules:
         location=data.get("location"),
         experience_years=data.get("experience_years"),
         current_role=data.get("current_role"),
+        current_designation=data.get("current_designation"),
         skills=data.get("skills", []),
         education=data.get("education", []),
+        certifications=data.get("certifications", []),
         work_experience=data.get("work_experience", []),
+        personal_details=data.get("personal_details"),
+        keywords=data.get("keywords", []),
         summary=data.get("summary"),
     )
 

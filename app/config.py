@@ -6,7 +6,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+psycopg://postgres:Deepak%40123@localhost:5432/ai_recruiters"
+    # ── AI Provider ─────────────────────────────────────────────────────────
+    # Set AI_PROVIDER to: "anthropic", "gemini", or "openai"
+    # Then set the corresponding API key below
+    AI_PROVIDER: str = "gemini"
     ANTHROPIC_API_KEY: str = ""
+    GEMINI_API_KEY: str = ""
+    OPENAI_API_KEY: str = ""
     CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000,https://ai-recruiters-frontend.vercel.app"
 
     @field_validator("CORS_ORIGINS", mode="before")

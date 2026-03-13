@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -8,14 +9,15 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-from app.database import get_db
+from app.database import get_db, SessionLocal
 from app.models.candidate import Candidate
+from app.models.resume_metadata import ResumeMetadata
 
 limiter = Limiter(key_func=get_remote_address)
 from app.schemas.candidate import (
@@ -27,6 +29,7 @@ from app.schemas.candidate import (
     ScheduleInterviewRequest,
     SendWhatsAppRequest,
 )
+from app.schemas.resume_metadata import DuplicateCheckResponse
 from app.services import candidate_service
 
 router = APIRouter()
@@ -42,16 +45,158 @@ ALLOWED_RESUME_TYPES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 
+# ── Sequential background parse queue ────────────────────────────────────────
+_parse_queue: asyncio.Queue = asyncio.Queue()
+_worker_started = False
+
+
+async def _parse_worker():
+    """Process resume parse jobs one at a time using fast regex parser + LLM fit score."""
+    while True:
+        candidate_id, file_path, job_id = await _parse_queue.get()
+        db = SessionLocal()
+        try:
+            candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+            if not candidate:
+                continue
+
+            candidate.parsing_status = "processing"
+            db.commit()
+
+            from app.services.fast_resume_parser import extract_text_from_file, fast_parse_resume
+            from app.models.job import Job, JobSkill, JobResponsibility
+
+            # ── Step 1: Extract text + fast regex parse (no AI) ───────────────
+            resume_text = extract_text_from_file(file_path)
+            if not resume_text:
+                raise RuntimeError(f"Could not extract text from {file_path}")
+
+            parsed = fast_parse_resume(resume_text)
+
+            # Update candidate with parsed data
+            parsed_email = parsed.get("candidate_email") or candidate.email
+            real_email = parsed_email if (parsed_email and not parsed_email.endswith("@resume.local")) else None
+
+            # If we found a real email, check for duplicates for this job
+            if real_email and real_email != candidate.email and job_id:
+                existing = db.query(Candidate).filter(
+                    Candidate.email == real_email,
+                    Candidate.job_id == job_id,
+                    Candidate.id != candidate.id,
+                ).first()
+                if existing:
+                    # Duplicate — update existing, delete this placeholder
+                    existing.resume_path = file_path
+                    existing.parsing_status = "completed"
+                    db.delete(candidate)
+                    db.commit()
+                    _parse_queue.task_done()
+                    continue
+
+            candidate.name = parsed.get("candidate_name") or candidate.name
+            candidate.email = real_email or candidate.email
+            candidate.phone = parsed.get("phone") or candidate.phone
+            candidate.location = parsed.get("location") or candidate.location
+            candidate.role = parsed.get("current_designation") or candidate.role
+
+            # ── Upsert ResumeMetadata ─────────────────────────────────────────
+            meta = None
+            if parsed_email and not parsed_email.endswith("@resume.local"):
+                meta = db.query(ResumeMetadata).filter(
+                    ResumeMetadata.candidate_email == parsed_email
+                ).first()
+
+            if not meta:
+                meta = ResumeMetadata(candidate_email=parsed_email or candidate.email)
+                db.add(meta)
+
+            meta.candidate_name = parsed.get("candidate_name")
+            meta.phone = parsed.get("phone")
+            meta.current_designation = parsed.get("current_designation")
+            meta.experience_years = parsed.get("experience_years")
+            meta.skills = json.dumps(parsed.get("skills", []))
+            meta.education = json.dumps(parsed.get("education", []))
+            meta.certifications = json.dumps(parsed.get("certifications", []))
+            meta.work_experience = json.dumps(parsed.get("work_experience", []))
+            meta.location = parsed.get("location")
+            meta.personal_details = json.dumps(parsed.get("personal_details") or {})
+            meta.keywords = json.dumps(parsed.get("keywords", []))
+            meta.summary = parsed.get("summary")
+            meta.resume_file_path = file_path
+            meta.raw_text = resume_text
+            meta.parsing_status = "completed"
+            meta.parsed_at = datetime.utcnow()
+            db.flush()
+
+            candidate.resume_metadata_id = meta.id
+
+            # ── Step 2: Compute fit score via LLM if job_id present ───────────
+            if job_id and resume_text:
+                try:
+                    from app.services.resume_service import calculate_fit_score
+                    from app.schemas.ai import FitScoreRequest
+
+                    job = db.query(Job).filter(Job.id == job_id).first()
+                    if job:
+                        skills = [s.skill for s in db.query(JobSkill).filter(JobSkill.job_id == job_id).all() if s.skill]
+                        responsibilities = [r.description for r in db.query(JobResponsibility).filter(JobResponsibility.job_id == job_id).all()]
+                        fit_req = FitScoreRequest(
+                            resume_text=resume_text,
+                            job_title=job.title,
+                            required_experience_min=job.experience_min,
+                            required_experience_max=job.experience_max,
+                            required_skills=skills,
+                            responsibilities=responsibilities,
+                        )
+                        fit_result = await calculate_fit_score(fit_req)
+                        candidate.resume_fit_score = fit_result.fit_level
+                        candidate.fit_score_reasoning = json.dumps({
+                            "summary": fit_result.summary,
+                            "breakdown": fit_result.breakdown.model_dump(),
+                            "percentage": fit_result.fit_percentage,
+                            "key_matching_skills": fit_result.key_matching_skills,
+                            "relevant_experience_summary": fit_result.relevant_experience_summary,
+                            "missing_weak_areas": fit_result.missing_weak_areas,
+                        })
+                        candidate.fit_score_details = json.dumps(fit_result.reasoning_points)
+                except Exception as fit_exc:
+                    logger.warning("Fit score computation failed for candidate %s: %s", candidate_id, fit_exc)
+                    # Parsing still succeeds even if fit score fails
+
+            candidate.parsing_status = "completed"
+            db.commit()
+
+        except Exception as exc:
+            logger.error("Background parse failed for candidate %s: %s", candidate_id, exc, exc_info=True)
+            try:
+                candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+                if candidate:
+                    candidate.parsing_status = "failed"
+                    db.commit()
+            except Exception:
+                pass
+        finally:
+            db.close()
+            _parse_queue.task_done()
+
+
+def _ensure_worker():
+    """Start the background parse worker if not already running."""
+    global _worker_started
+    if not _worker_started:
+        _worker_started = True
+        asyncio.get_event_loop().create_task(_parse_worker())
+
 
 # ── Standard CRUD ─────────────────────────────────────────────────────────────
 
 @router.get(
     "/",
     response_model=List[CandidateRead],
-    summary="List candidates",
+    summary="List candidates (deduplicated)",
     description=(
-        "Return candidates with optional filters.\n\n"
-        "- `status`: Applied | Interview | Offered | Rejected\n"
+        "Return candidates with optional filters. Deduplicates by email.\n\n"
+        "- `status`: Applied | Interview | Offered | Selected | Hired | Rejected\n"
         "- `job_id`: filter by opening\n"
         "- `stage`: Candidates | AI Round | Panel Round | Offer-Made | Rejected"
     ),
@@ -104,7 +249,188 @@ def delete_candidate(candidate_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Candidate not found")
 
 
-# ── Resume Upload & Auto-Parse ────────────────────────────────────────────────
+# ── Hire Candidate ──────────────────────────────────────────────────────────
+
+@router.post(
+    "/{candidate_id}/hire",
+    summary="Hire a candidate — updates status across all job associations",
+    description=(
+        "Marks the candidate as Hired. If `job_id` is provided and the candidate "
+        "is not already in that job, adds them. Updates the candidate's status to "
+        "'Offer-Made' in the linked job as well."
+    ),
+)
+def hire_candidate(
+    candidate_id: int,
+    payload: dict = None,
+    db: Session = Depends(get_db),
+):
+    from app.models.job import Job
+
+    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    job_id = (payload or {}).get("job_id")
+
+    # Find all job associations for this candidate (by email)
+    email = candidate.email
+    all_entries = db.query(Candidate).filter(
+        Candidate.email == email,
+        Candidate.job_id.isnot(None),
+    ).all()
+
+    job_ids_linked = [c.job_id for c in all_entries]
+
+    # If job_id provided and candidate not in that job, add them
+    if job_id and job_id not in job_ids_linked:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        new_entry = Candidate(
+            name=candidate.name,
+            role=candidate.role or job.title,
+            email=candidate.email,
+            phone=candidate.phone,
+            location=candidate.location,
+            status="Hired",
+            image=candidate.image,
+            job_id=job_id,
+            resume_path=candidate.resume_path,
+            candidate_stage="Offer-Made",
+            interview_status=candidate.interview_status,
+        )
+        db.add(new_entry)
+        job_ids_linked.append(job_id)
+
+    # Update status of all entries for this email to reflect hire
+    for entry in all_entries:
+        entry.candidate_stage = "Offer-Made"
+        if entry.id == candidate_id or (job_id and entry.job_id == job_id):
+            entry.status = "Hired"
+
+    # Update the main candidate record
+    candidate.status = "Hired"
+    db.commit()
+    db.refresh(candidate)
+
+    # Return enriched data
+    hired_job_title = None
+    if job_id:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if job:
+            hired_job_title = job.title
+    elif candidate.job_id:
+        job = db.query(Job).filter(Job.id == candidate.job_id).first()
+        if job:
+            hired_job_title = job.title
+
+    return {
+        "id": candidate.id,
+        "name": candidate.name,
+        "email": candidate.email,
+        "status": "Hired",
+        "job_id": job_id or candidate.job_id,
+        "job_title": hired_job_title,
+        "linked_jobs": job_ids_linked,
+    }
+
+
+@router.get(
+    "/{candidate_id}/job-associations",
+    summary="Get all jobs this candidate is linked to",
+)
+def get_job_associations(candidate_id: int, db: Session = Depends(get_db)):
+    from app.models.job import Job
+
+    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    entries = (
+        db.query(Candidate.job_id, Candidate.status, Candidate.candidate_stage, Job.title)
+        .outerjoin(Job, Candidate.job_id == Job.id)
+        .filter(Candidate.email == candidate.email, Candidate.job_id.isnot(None))
+        .all()
+    )
+
+    return {
+        "candidate_id": candidate.id,
+        "email": candidate.email,
+        "jobs": [
+            {
+                "job_id": job_id,
+                "job_title": title,
+                "status": s,
+                "stage": stage,
+            }
+            for job_id, s, stage, title in entries
+        ],
+    }
+
+
+# ── Duplicate Check ──────────────────────────────────────────────────────────
+
+@router.get(
+    "/check-duplicate",
+    response_model=DuplicateCheckResponse,
+    summary="Check if a resume/candidate already exists by email",
+    description=(
+        "Checks the central resume_metadata table to see if a candidate with "
+        "this email already has a parsed resume. Also returns which job_ids "
+        "the candidate is already linked to."
+    ),
+)
+def check_duplicate(
+    email: str,
+    job_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    meta = db.query(ResumeMetadata).filter(
+        ResumeMetadata.candidate_email == email
+    ).first()
+
+    if not meta:
+        return DuplicateCheckResponse(exists=False)
+
+    linked_jobs = [
+        c.job_id for c in db.query(Candidate.job_id).filter(
+            Candidate.email == email, Candidate.job_id.isnot(None)
+        ).all()
+    ]
+
+    return DuplicateCheckResponse(
+        exists=True,
+        candidate_email=meta.candidate_email,
+        candidate_name=meta.candidate_name,
+        current_designation=meta.current_designation,
+        resume_file_path=meta.resume_file_path,
+        parsed_at=meta.parsed_at,
+        linked_job_ids=linked_jobs,
+    )
+
+
+# ── Parsing Status ───────────────────────────────────────────────────────────
+
+@router.get(
+    "/{candidate_id}/parsing-status",
+    summary="Get resume parsing status for a candidate",
+)
+def get_parsing_status(candidate_id: int, db: Session = Depends(get_db)):
+    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    return {
+        "candidate_id": candidate.id,
+        "parsing_status": candidate.parsing_status,
+        "name": candidate.name,
+        "email": candidate.email,
+        "resume_fit_score": candidate.resume_fit_score,
+        "fit_score_reasoning": candidate.fit_score_reasoning,
+    }
+
+
+# ── Resume Upload & Async Background Parse ──────────────────────────────────
 
 @router.post(
     "/upload-resume",
@@ -112,12 +438,13 @@ def delete_candidate(candidate_id: int, db: Session = Depends(get_db)):
     status_code=status.HTTP_201_CREATED,
     summary="Upload resumes (batch)",
     description=(
-        "Upload one or more PDF/DOC/DOCX resume files. For each file:\n\n"
-        "1. Text is extracted (pdfplumber / python-docx)\n"
-        "2. Claude LLM parses structured data (name, email, phone, skills, experience)\n"
-        "3. If `job_id` is provided, Claude calculates a fit score (low / medium / high) "
-        "with breakdown reasoning\n"
-        "4. A `Candidate` record is created and returned\n\n"
+        "Upload one or more PDF/DOC/DOCX resume files.\n\n"
+        "Files are saved immediately and candidate records created with "
+        "`parsing_status='pending'`. Parsing runs **one at a time** in the "
+        "background to avoid overloading the AI. Poll "
+        "`GET /candidates/{id}/parsing-status` to track progress.\n\n"
+        "If `replace_existing=true` and a resume for the same email already "
+        "exists in metadata, the old metadata is replaced.\n\n"
         "**Content-Type:** `multipart/form-data`"
     ),
 )
@@ -125,17 +452,16 @@ def delete_candidate(candidate_id: int, db: Session = Depends(get_db)):
 async def upload_resumes(
     request: Request,
     job_id: Optional[int] = Form(None),
+    replace_existing: Optional[bool] = Form(False),
     files: List[UploadFile] = File(...),
     db: Session = Depends(get_db),
 ):
     """
-    Upload one or more resumes (PDF/DOC/DOCX).
-    For each file: extract text → LLM parse → compute fit score → create Candidate record.
+    Upload one or more resumes. Files are saved to disk, candidate records
+    created with parsing_status='pending', and parsing queued in background
+    (one-at-a-time to conserve AI resources).
     """
-    from app.services.resume_service import parse_resume_file, calculate_fit_score
-    from app.schemas.ai import FitScoreRequest
-    from app.models.job import Job, JobSkill, JobResponsibility
-
+    _ensure_worker()
     created_candidates = []
 
     for file in files:
@@ -150,87 +476,33 @@ async def upload_resumes(
         with open(file_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        try:
-            result = await parse_resume_file(file_path, job_id=job_id)
-            parsed = result["parsed"]
-            resume_text = result["text"]
+        # Use filename stem as placeholder name until parse completes
+        placeholder_name = Path(file.filename).stem
+        placeholder_email = f"pending_{safe_name[:20]}@resume.local"
 
-            fit_level = None
-            fit_reasoning_json = None
-            fit_details_json = None
+        # If same email+job candidate exists, update their resume file & re-queue
+        # (We won't know the real email until parse, but for re-uploads from the
+        # duplicate-check flow the frontend can pass replace_existing=true)
 
-            if job_id and resume_text:
-                job = db.query(Job).filter(Job.id == job_id).first()
-                if job:
-                    skills = [s.skill for s in db.query(JobSkill).filter(JobSkill.job_id == job_id).all() if s.skill]
-                    responsibilities = [r.description for r in db.query(JobResponsibility).filter(JobResponsibility.job_id == job_id).all()]
-                    fit_req = FitScoreRequest(
-                        resume_text=resume_text,
-                        job_title=job.title,
-                        required_experience_min=job.experience_min,
-                        required_experience_max=job.experience_max,
-                        required_skills=skills,
-                        responsibilities=responsibilities,
-                    )
-                    fit_result = await calculate_fit_score(fit_req)
-                    fit_level = fit_result.fit_level
-                    fit_reasoning_json = json.dumps({
-                        "summary": fit_result.summary,
-                        "breakdown": fit_result.breakdown.model_dump(),
-                        "percentage": fit_result.fit_percentage,
-                        "key_matching_skills": fit_result.key_matching_skills,
-                        "relevant_experience_summary": fit_result.relevant_experience_summary,
-                        "missing_weak_areas": fit_result.missing_weak_areas,
-                    })
-                    fit_details_json = json.dumps(fit_result.reasoning_points)
+        candidate = Candidate(
+            name=placeholder_name,
+            email=placeholder_email,
+            phone="",
+            location="",
+            role="",
+            resume_path=file_path,
+            job_id=job_id,
+            interview_status="New",
+            candidate_stage="Candidates",
+            parsing_status="pending",
+        )
+        db.add(candidate)
+        db.commit()
+        db.refresh(candidate)
+        created_candidates.append(candidate)
 
-            parsed_email = parsed.get("email") or f"unknown_{safe_name[:20]}@resume.local"
-            parsed_name = parsed.get("name") or Path(file.filename).stem
-
-            # Prevent duplicates: if same email + job already exists, update it
-            existing_candidate = None
-            if job_id and parsed.get("email"):
-                existing_candidate = db.query(Candidate).filter(
-                    Candidate.email == parsed_email,
-                    Candidate.job_id == job_id,
-                ).first()
-
-            if existing_candidate:
-                existing_candidate.name = parsed_name
-                existing_candidate.phone = parsed.get("phone") or existing_candidate.phone
-                existing_candidate.location = parsed.get("location") or existing_candidate.location
-                existing_candidate.role = parsed.get("current_role") or existing_candidate.role
-                existing_candidate.resume_path = file_path
-                existing_candidate.resume_fit_score = fit_level
-                existing_candidate.fit_score_reasoning = fit_reasoning_json
-                existing_candidate.fit_score_details = fit_details_json
-                db.commit()
-                db.refresh(existing_candidate)
-                created_candidates.append(existing_candidate)
-            else:
-                candidate = Candidate(
-                    name=parsed_name,
-                    email=parsed_email,
-                    phone=parsed.get("phone") or "",
-                    location=parsed.get("location") or "",
-                    role=parsed.get("current_role") or "",
-                    resume_path=file_path,
-                    job_id=job_id,
-                    resume_fit_score=fit_level,
-                    fit_score_reasoning=fit_reasoning_json,
-                    fit_score_details=fit_details_json,
-                    interview_status="New",
-                    candidate_stage="Candidates",
-                )
-                db.add(candidate)
-                db.commit()
-                db.refresh(candidate)
-                created_candidates.append(candidate)
-
-        except Exception as exc:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            raise HTTPException(status_code=500, detail=f"Failed to process {file.filename}: {str(exc)}")
+        # Queue for background processing (one-at-a-time)
+        await _parse_queue.put((candidate.id, file_path, job_id))
 
     return created_candidates
 

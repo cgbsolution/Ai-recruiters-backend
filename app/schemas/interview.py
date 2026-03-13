@@ -60,6 +60,37 @@ class CandidateRegisterResponse(BaseModel):
     message: str
 
 
+# ── Verify Access (invitation-based) ──────────────────────────────────────────
+
+class VerifyAccessRequest(BaseModel):
+    email: EmailStr
+
+
+class VerifyAccessResponse(BaseModel):
+    access: str  # "granted" | "apply" | "completed" | "terminated"
+    candidate_name: Optional[str] = None
+    session_id: Optional[int] = None
+    candidate_id: Optional[int] = None
+    can_resume: bool = False
+    session_status: Optional[str] = None
+    message: str
+
+
+# ── Apply for Job (resume upload + basic details) ────────────────────────────
+
+class ApplyForJobRequest(BaseModel):
+    name: str
+    email: EmailStr
+    phone: Optional[str] = None
+    resume_path: str  # path to uploaded resume file
+
+
+class ApplyForJobResponse(BaseModel):
+    success: bool
+    message: str
+    resume_metadata_id: Optional[int] = None
+
+
 # ── Login (returning candidate / admin-added) ─────────────────────────────────
 
 class CandidateLoginRequest(BaseModel):

@@ -27,6 +27,8 @@ from app.models.interview import (
 from app.models.job import Job
 from app.database import SessionLocal
 from app.schemas.interview import (
+    ApplyForJobRequest,
+    ApplyForJobResponse,
     CandidateLoginRequest,
     CandidateRegisterRequest,
     CandidateRegisterResponse,
@@ -42,6 +44,8 @@ from app.schemas.interview import (
     ResumeSessionResponse,
     ScheduleMeetingRequest,
     ScheduleMeetingResponse,
+    VerifyAccessRequest,
+    VerifyAccessResponse,
     ViolationRequest,
     ViolationResponse,
 )
@@ -126,6 +130,321 @@ def get_interview_config(token: str, db: Session = Depends(get_db)):
         skills=skills,
         pre_interview_fields=pre_fields,
     )
+
+
+# ── Verify Access (invitation-based) ─────────────────────────────────────────
+
+@router.post(
+    "/interview/{token}/verify-access",
+    response_model=VerifyAccessResponse,
+    summary="Verify candidate access by email",
+    description=(
+        "Checks if the candidate's email is associated with an invited candidate for this job.\n\n"
+        "Returns 'granted' if the candidate was invited (exists in candidates table for this job) "
+        "AND has a resume in the database.\n"
+        "Returns 'apply' if the email is not found — candidate should use Apply for Job.\n"
+        "Returns 'completed' if candidate already finished the interview.\n"
+        "Returns 'terminated' if candidate's session was terminated."
+    ),
+    tags=["Interview"],
+)
+@limiter.limit("10/minute")
+def verify_access(
+    token: str,
+    payload: VerifyAccessRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    from app.models.resume_metadata import ResumeMetadata
+
+    tok = _get_token_or_404(token, db)
+    email_str = str(payload.email).strip().lower()
+
+    # 1. Check if candidate exists for this job (invited by recruiter)
+    candidate = db.query(Candidate).filter(
+        Candidate.email == email_str,
+        Candidate.job_id == tok.job_id,
+    ).first()
+
+    if not candidate:
+        # Also check resume_metadata — if resume exists but not invited for this job
+        meta = db.query(ResumeMetadata).filter(
+            ResumeMetadata.candidate_email == email_str
+        ).first()
+
+        if meta:
+            return VerifyAccessResponse(
+                access="apply",
+                candidate_name=meta.candidate_name,
+                message="Your resume is on file but you haven't been invited for this position. You can apply for this job.",
+            )
+
+        return VerifyAccessResponse(
+            access="apply",
+            message="No record found. Please apply for this job by uploading your resume.",
+        )
+
+    # 2. Check for completed session
+    completed_session = (
+        db.query(InterviewSession)
+        .filter(
+            InterviewSession.candidate_id == candidate.id,
+            InterviewSession.job_id == tok.job_id,
+            InterviewSession.status == SessionStatus.completed,
+        )
+        .first()
+    )
+    if completed_session:
+        return VerifyAccessResponse(
+            access="completed",
+            candidate_name=candidate.name,
+            session_id=completed_session.id,
+            candidate_id=candidate.id,
+            message="You have already completed your interview for this position.",
+        )
+
+    # 3. Check for terminated session
+    terminated = (
+        db.query(InterviewSession)
+        .filter(
+            InterviewSession.candidate_id == candidate.id,
+            InterviewSession.job_id == tok.job_id,
+            InterviewSession.status == SessionStatus.terminated,
+        )
+        .first()
+    )
+    if terminated:
+        return VerifyAccessResponse(
+            access="terminated",
+            candidate_name=candidate.name,
+            session_id=terminated.id,
+            candidate_id=candidate.id,
+            message="Your previous interview was terminated. Please contact HR.",
+        )
+
+    # 4. Check for resumable session
+    active_session = (
+        db.query(InterviewSession)
+        .filter(
+            InterviewSession.candidate_id == candidate.id,
+            InterviewSession.job_id == tok.job_id,
+            InterviewSession.status.in_([SessionStatus.pending, SessionStatus.in_progress]),
+        )
+        .order_by(InterviewSession.created_at.desc())
+        .first()
+    )
+    if active_session:
+        return VerifyAccessResponse(
+            access="granted",
+            candidate_name=candidate.name,
+            session_id=active_session.id,
+            candidate_id=candidate.id,
+            can_resume=True,
+            session_status=active_session.status.value,
+            message="Welcome back! You can resume your interview.",
+        )
+
+    # 5. Candidate is invited but has no session yet — create one
+    job = db.query(Job).filter(Job.id == tok.job_id).first()
+    metadata_json = json.dumps({
+        "user_agent": request.headers.get("user-agent", ""),
+        "ip": request.client.host if request.client else "",
+    })
+    settings_obj = job.interview_settings if job else None
+    interview_session = InterviewSession(
+        token_id=tok.id,
+        candidate_id=candidate.id,
+        job_id=tok.job_id,
+        status=SessionStatus.pending,
+        total_questions=settings_obj.max_questions if settings_obj else 8,
+        session_metadata=metadata_json,
+    )
+    db.add(interview_session)
+    db.commit()
+    db.refresh(interview_session)
+
+    return VerifyAccessResponse(
+        access="granted",
+        candidate_name=candidate.name,
+        session_id=interview_session.id,
+        candidate_id=candidate.id,
+        can_resume=False,
+        message="Access verified. Ready to start your interview.",
+    )
+
+
+# ── Upload resume file (no candidate record — just save file) ────────────────
+
+@router.post(
+    "/interview/{token}/upload-resume",
+    summary="Upload a resume file for job application",
+    tags=["Interview"],
+)
+@limiter.limit("10/minute")
+async def upload_resume_for_apply(
+    token: str,
+    request: Request,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Save a resume file to disk and return the path. No candidate record is created."""
+    _get_token_or_404(token, db)  # validate token
+
+    allowed = {
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+    if file.content_type not in allowed:
+        raise HTTPException(status_code=400, detail="Only PDF, DOC, or DOCX files are accepted.")
+
+    upload_dir = "uploads/resumes"
+    os.makedirs(upload_dir, exist_ok=True)
+
+    safe_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{file.filename}"
+    file_path = os.path.join(upload_dir, safe_name)
+
+    with open(file_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+
+    return {"resume_path": file_path}
+
+
+# ── Apply for Job (upload resume without registration) ──────────────────────
+
+@router.post(
+    "/interview/{token}/apply",
+    response_model=ApplyForJobResponse,
+    summary="Apply for job — upload resume and basic details",
+    description=(
+        "Allows a candidate who hasn't been invited to submit their resume and basic details.\n"
+        "The resume is stored in the database and parsed as metadata.\n"
+        "The candidate will NOT be able to start the interview — only invited candidates can.\n"
+        "After applying, the recruiter can review and invite the candidate."
+    ),
+    tags=["Interview"],
+)
+@limiter.limit("5/minute")
+def apply_for_job(
+    token: str,
+    payload: ApplyForJobRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    from app.models.resume_metadata import ResumeMetadata
+
+    tok = _get_token_or_404(token, db)
+    job = db.query(Job).filter(Job.id == tok.job_id).first()
+    email_str = str(payload.email).strip().lower()
+
+    # Check if resume metadata already exists for this email
+    existing_meta = db.query(ResumeMetadata).filter(
+        ResumeMetadata.candidate_email == email_str
+    ).first()
+
+    if existing_meta:
+        # Update the existing record with new resume
+        existing_meta.candidate_name = payload.name
+        existing_meta.phone = payload.phone
+        existing_meta.resume_file_path = payload.resume_path
+        existing_meta.parsing_status = "pending"
+        db.commit()
+        meta_id = existing_meta.id
+    else:
+        # Create new resume metadata record
+        meta = ResumeMetadata(
+            candidate_email=email_str,
+            candidate_name=payload.name,
+            phone=payload.phone,
+            resume_file_path=payload.resume_path,
+            parsing_status="pending",
+        )
+        db.add(meta)
+        db.commit()
+        db.refresh(meta)
+        meta_id = meta.id
+
+    # Also create/update a candidate record for this job
+    existing_candidate = db.query(Candidate).filter(
+        Candidate.email == email_str,
+        Candidate.job_id == tok.job_id,
+    ).first()
+
+    if not existing_candidate:
+        candidate = Candidate(
+            name=payload.name,
+            email=email_str,
+            phone=payload.phone or None,
+            role=job.title if job else None,
+            job_id=tok.job_id,
+            resume_path=payload.resume_path,
+            interview_status="Applied",
+            candidate_stage="Candidates",
+            resume_metadata_id=meta_id,
+        )
+        db.add(candidate)
+        db.commit()
+
+    # Queue background parsing
+    background_tasks.add_task(_parse_resume_metadata_bg, meta_id)
+
+    return ApplyForJobResponse(
+        success=True,
+        message="Your application has been submitted. The recruiter will review your resume and may invite you for an interview.",
+        resume_metadata_id=meta_id,
+    )
+
+
+def _parse_resume_metadata_bg(meta_id: int):
+    """Background task to parse resume and update metadata."""
+    from app.services.fast_resume_parser import extract_text_from_file, fast_parse_resume
+    db = SessionLocal()
+    try:
+        from app.models.resume_metadata import ResumeMetadata
+        meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
+        if not meta or not meta.resume_file_path:
+            return
+
+        meta.parsing_status = "processing"
+        db.commit()
+
+        raw_text = extract_text_from_file(meta.resume_file_path)
+        if not raw_text:
+            meta.parsing_status = "failed"
+            meta.parsing_error = "Could not extract text from file"
+            db.commit()
+            return
+
+        parsed = fast_parse_resume(raw_text)
+        meta.raw_text = raw_text
+        meta.candidate_name = parsed.get("candidate_name") or meta.candidate_name
+        meta.phone = parsed.get("phone") or meta.phone
+        meta.skills = json.dumps(parsed.get("skills", []))
+        meta.experience_years = parsed.get("experience_years")
+        meta.education = json.dumps(parsed.get("education", []))
+        meta.certifications = json.dumps(parsed.get("certifications", []))
+        meta.work_experience = json.dumps(parsed.get("work_experience", []))
+        meta.location = parsed.get("location") or meta.location
+        meta.current_designation = parsed.get("current_designation")
+        meta.keywords = json.dumps(parsed.get("keywords", []))
+        meta.personal_details = json.dumps(parsed.get("personal_details") or {})
+        meta.summary = parsed.get("summary")
+        meta.parsing_status = "completed"
+        meta.parsed_at = datetime.utcnow()
+        db.commit()
+    except Exception as e:
+        try:
+            meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
+            if meta:
+                meta.parsing_status = "failed"
+                meta.parsing_error = str(e)[:500]
+                db.commit()
+        except:
+            pass
+    finally:
+        db.close()
 
 
 @router.post(
@@ -334,6 +653,166 @@ def register_candidate(
         already_completed=False,
         can_resume=False,
         message="Session created. Ready to start interview.",
+    )
+
+
+@router.post(
+    "/interview/{token}/auto-register",
+    response_model=CandidateRegisterResponse,
+    summary="Auto-register candidate from resume database (no form required)",
+    description=(
+        "Automatically registers a candidate for the interview using their email.\n"
+        "Looks up the resume database for candidate metadata (name, phone, resume path).\n"
+        "If found, creates a Candidate record and InterviewSession without any registration form.\n\n"
+        "Use this when sending interview links directly to known candidates from the resume database.\n"
+        "Falls back to the candidate table if not in resume_metadata.\n\n"
+        "**Query param:** `email` — the candidate's email address."
+    ),
+    tags=["Interview"],
+)
+@limiter.limit("10/minute")
+def auto_register_candidate(
+    token: str,
+    email: str,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    from app.models.resume_metadata import ResumeMetadata
+
+    tok = _get_token_or_404(token, db)
+    job = db.query(Job).filter(Job.id == tok.job_id).first()
+    email_str = email.strip().lower()
+
+    if not email_str:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    # Check for existing candidate for this job
+    existing = db.query(Candidate).filter(
+        Candidate.email == email_str,
+        Candidate.job_id == tok.job_id,
+    ).first()
+
+    if existing:
+        # Check completed/active sessions (same logic as register)
+        completed_session = (
+            db.query(InterviewSession)
+            .filter(
+                InterviewSession.candidate_id == existing.id,
+                InterviewSession.job_id == tok.job_id,
+                InterviewSession.status == SessionStatus.completed,
+            )
+            .first()
+        )
+        if completed_session:
+            return CandidateRegisterResponse(
+                session_id=completed_session.id,
+                candidate_id=existing.id,
+                is_existing_user=True,
+                already_completed=True,
+                message="You have already completed your interview for this position.",
+            )
+
+        active_session = (
+            db.query(InterviewSession)
+            .filter(
+                InterviewSession.candidate_id == existing.id,
+                InterviewSession.job_id == tok.job_id,
+                InterviewSession.status.in_([SessionStatus.pending, SessionStatus.in_progress]),
+            )
+            .order_by(InterviewSession.created_at.desc())
+            .first()
+        )
+        if active_session:
+            return CandidateRegisterResponse(
+                session_id=active_session.id,
+                candidate_id=existing.id,
+                is_existing_user=True,
+                can_resume=True,
+                session_status=active_session.status.value,
+                message="Welcome back! Resuming your interview.",
+            )
+
+        terminated = (
+            db.query(InterviewSession)
+            .filter(
+                InterviewSession.candidate_id == existing.id,
+                InterviewSession.job_id == tok.job_id,
+                InterviewSession.status == SessionStatus.terminated,
+            )
+            .first()
+        )
+        if terminated:
+            return CandidateRegisterResponse(
+                session_id=terminated.id,
+                candidate_id=existing.id,
+                is_existing_user=True,
+                already_completed=True,
+                message="Your previous interview was terminated. Please contact HR.",
+            )
+
+        candidate = existing
+        is_existing = True
+    else:
+        # Look up resume database for metadata
+        meta = db.query(ResumeMetadata).filter(
+            ResumeMetadata.candidate_email == email_str
+        ).first()
+
+        candidate_name = email_str.split("@")[0].replace(".", " ").title()
+        candidate_phone = None
+        resume_path = None
+
+        if meta:
+            candidate_name = meta.candidate_name or candidate_name
+            candidate_phone = meta.phone
+            resume_path = meta.resume_file_path
+
+        candidate = Candidate(
+            name=candidate_name,
+            email=email_str,
+            phone=candidate_phone,
+            role=job.title if job else None,
+            job_id=tok.job_id,
+            resume_path=resume_path,
+            interview_status="Scheduled",
+            resume_metadata_id=meta.id if meta else None,
+        )
+        db.add(candidate)
+        db.commit()
+        db.refresh(candidate)
+        is_existing = False
+
+    # Create session
+    metadata_json = json.dumps({
+        "user_agent": request.headers.get("user-agent", ""),
+        "ip": request.client.host if request.client else "",
+        "auto_registered": True,
+    })
+    settings_obj = job.interview_settings if job else None
+    interview_session = InterviewSession(
+        token_id=tok.id,
+        candidate_id=candidate.id,
+        job_id=tok.job_id,
+        status=SessionStatus.pending,
+        total_questions=settings_obj.max_questions if settings_obj else 8,
+        session_metadata=metadata_json,
+    )
+    db.add(interview_session)
+    db.commit()
+    db.refresh(interview_session)
+
+    # Background fit score
+    if candidate.resume_path:
+        background_tasks.add_task(_compute_fit_score_bg, candidate.id, tok.job_id)
+
+    return CandidateRegisterResponse(
+        session_id=interview_session.id,
+        candidate_id=candidate.id,
+        is_existing_user=is_existing,
+        already_completed=False,
+        can_resume=False,
+        message="Auto-registered successfully. Ready to start interview.",
     )
 
 

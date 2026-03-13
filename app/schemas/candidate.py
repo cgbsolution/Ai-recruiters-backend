@@ -79,6 +79,7 @@ class CandidateRead(BaseModel):
     image: Optional[str]
     applied_date: datetime
     job_id: Optional[int]
+    job_title: Optional[str] = None
     resume_path: Optional[str] = None
     # Fit score
     resume_fit_score: Optional[str] = None
@@ -108,6 +109,9 @@ class CandidateRead(BaseModel):
     video_duration: Optional[str] = None
     # Contact
     mail_contact_history: Optional[bool] = None
+    # Resume metadata
+    resume_metadata_id: Optional[int] = None
+    parsing_status: Optional[str] = None
 
     model_config = {"from_attributes": True}
 

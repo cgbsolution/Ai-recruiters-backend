@@ -11,10 +11,13 @@ email-validator>=2.2.0
 # ── Database ────────────────────────────────────────────────────────────────
 sqlalchemy>=2.0.36
 psycopg[binary]>=3.2.0
+psycopg2-binary>=2.9.9
 alembic>=1.14.0
 
-# ── AI / LLM ───────────────────────────────────────────────────────────────
+# ── AI / LLM (install the one you need based on AI_PROVIDER in .env) ──────
 anthropic>=0.40.0
+google-genai>=1.0.0
+openai>=1.50.0
 
 # ── Resume Parsing ──────────────────────────────────────────────────────────
 pdfplumber>=0.11.0

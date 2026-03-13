@@ -82,9 +82,13 @@ class ParsedResumeData(BaseModel):
     location: Optional[str] = None
     experience_years: Optional[float] = None
     current_role: Optional[str] = None
+    current_designation: Optional[str] = None
     skills: List[str] = []
     education: List[str] = []
+    certifications: List[str] = []
     work_experience: List[Dict[str, Any]] = []
+    personal_details: Optional[Dict[str, Any]] = None
+    keywords: List[str] = []
     summary: Optional[str] = None
 
 

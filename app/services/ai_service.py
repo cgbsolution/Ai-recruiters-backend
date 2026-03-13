@@ -1,9 +1,6 @@
-import asyncio
 import json
 
-import anthropic
-
-from app.config import settings
+from app.services.llm_provider import ask as _llm_ask, ask_with_system as _llm_ask_with_system, get_model
 from app.schemas.ai import (
     EvaluateCandidateRequest,
     EvaluateCandidateResponse,
@@ -19,36 +16,17 @@ from app.schemas.ai import (
     SuggestQuestionsResponse,
 )
 
-SONNET = "claude-sonnet-4-6"
-OPUS = "claude-opus-4-6"
-
-# ── Singleton async client ───────────────────────────────────────────────────
-
-_async_client: anthropic.AsyncAnthropic | None = None
+# Backward-compatible constants — now tier names resolved by llm_provider
+SONNET = "fast"
+OPUS = "advanced"
 
 
-def get_async_client() -> anthropic.AsyncAnthropic:
-    global _async_client
-    if _async_client is None:
-        _async_client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-    return _async_client
-
+# ── Backward-compatible wrappers (used by resume_service, avatar_interview_service) ─
 
 async def _ask(prompt: str, model: str = SONNET, max_tokens: int = 1024, retries: int = 3) -> str:
-    client = get_async_client()
-    for attempt in range(retries):
-        try:
-            message = await client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return message.content[0].text
-        except anthropic.APIStatusError as exc:
-            if exc.status_code == 529 and attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)
-                continue
-            raise
+    """Backward-compatible wrapper. `model` param is treated as tier name."""
+    tier = "advanced" if model in ("advanced", "claude-opus-4-6", "gpt-4o", "gemini-2.5-pro") else "fast"
+    return await _llm_ask(prompt, tier=tier, max_tokens=max_tokens, retries=retries)
 
 
 async def _ask_with_system(
@@ -59,22 +37,12 @@ async def _ask_with_system(
     timeout_seconds: int = 25,
     retries: int = 3,
 ) -> str:
-    client = get_async_client()
-    for attempt in range(retries):
-        try:
-            response = await client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=messages,
-                timeout=timeout_seconds,
-            )
-            return response.content[0].text
-        except anthropic.APIStatusError as exc:
-            if exc.status_code == 529 and attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)
-                continue
-            raise
+    """Backward-compatible wrapper. `model` param is treated as tier name."""
+    tier = "advanced" if model in ("advanced", "claude-opus-4-6", "gpt-4o", "gemini-2.5-pro") else "fast"
+    return await _llm_ask_with_system(
+        system, messages, tier=tier, max_tokens=max_tokens,
+        timeout_seconds=timeout_seconds, retries=retries,
+    )
 
 
 def _parse_json(raw: str) -> any:

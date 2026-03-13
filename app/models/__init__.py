@@ -18,3 +18,5 @@ from app.models.interview import (
     MeetingSlot,
     MeetingSchedule,
 )
+from app.models.resume_metadata import ResumeMetadata
+from app.models.job_metadata import JobMetadata

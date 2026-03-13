@@ -15,7 +15,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 from app.database import Base, engine
-from app.routers import ai, candidates, interview, jobs, questions, uploads
+from app.routers import ai, candidates, interview, jobs, questions, resume_database, uploads
 
 import app.models  # noqa: F401 — ensure all models are registered with Base
 
@@ -178,6 +178,7 @@ app.include_router(candidates.router, prefix="/candidates", tags=["Candidates"])
 app.include_router(ai.router, prefix="/ai", tags=["AI"])
 app.include_router(uploads.router, prefix="/uploads", tags=["Uploads"])
 app.include_router(interview.router, tags=["Interview"])
+app.include_router(resume_database.router, prefix="/resume-database", tags=["Resume Database"])
 
 
 @app.get("/health", tags=["Health"])
