@@ -139,11 +139,36 @@ def update_job(db: Session, job_id: int, data: JobUpdate) -> Optional[Job]:
 
 
 def delete_job(db: Session, job_id: int) -> bool:
+    from app.models.interview import InterviewToken, InterviewSession, MeetingSlot, MeetingSchedule
+    from app.models.job_metadata import JobMetadata
+
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         return False
 
-    # Nullify candidate FK before deleting job (no ondelete cascade on candidates.job_id)
+    # Delete related records in correct order (child → parent)
+
+    # Interview sessions (via tokens)
+    token_ids = [t.id for t in db.query(InterviewToken.id).filter(InterviewToken.job_id == job_id).all()]
+    if token_ids:
+        db.query(InterviewSession).filter(InterviewSession.token_id.in_(token_ids)).delete(synchronize_session="fetch")
+        db.query(InterviewToken).filter(InterviewToken.job_id == job_id).delete(synchronize_session="fetch")
+
+    # Meeting slots and schedules
+    db.query(MeetingSchedule).filter(MeetingSchedule.job_id == job_id).delete(synchronize_session="fetch")
+    db.query(MeetingSlot).filter(MeetingSlot.job_id == job_id).delete(synchronize_session="fetch")
+
+    # Job children
+    db.query(JobSkill).filter(JobSkill.job_id == job_id).delete(synchronize_session="fetch")
+    db.query(JobResponsibility).filter(JobResponsibility.job_id == job_id).delete(synchronize_session="fetch")
+    db.query(JobQuestion).filter(JobQuestion.job_id == job_id).delete(synchronize_session="fetch")
+    db.query(JobPreInterviewField).filter(JobPreInterviewField.job_id == job_id).delete(synchronize_session="fetch")
+    db.query(InterviewSettings).filter(InterviewSettings.job_id == job_id).delete(synchronize_session="fetch")
+
+    # Job metadata
+    db.query(JobMetadata).filter(JobMetadata.job_id == job_id).delete(synchronize_session="fetch")
+
+    # Nullify candidate FK
     db.query(Candidate).filter(Candidate.job_id == job_id).update(
         {Candidate.job_id: None}, synchronize_session="fetch"
     )
