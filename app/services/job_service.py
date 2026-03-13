@@ -148,15 +148,17 @@ def delete_job(db: Session, job_id: int) -> bool:
 
     # Delete related records in correct order (child → parent)
 
-    # Interview sessions (via tokens)
+    # Meeting schedules (linked via slot_id, not job_id)
+    slot_ids = [s.id for s in db.query(MeetingSlot.id).filter(MeetingSlot.job_id == job_id).all()]
+    if slot_ids:
+        db.query(MeetingSchedule).filter(MeetingSchedule.slot_id.in_(slot_ids)).delete(synchronize_session="fetch")
+    db.query(MeetingSlot).filter(MeetingSlot.job_id == job_id).delete(synchronize_session="fetch")
+
+    # Interview sessions (via tokens) — DB cascade handles messages, violations, evaluations
     token_ids = [t.id for t in db.query(InterviewToken.id).filter(InterviewToken.job_id == job_id).all()]
     if token_ids:
         db.query(InterviewSession).filter(InterviewSession.token_id.in_(token_ids)).delete(synchronize_session="fetch")
         db.query(InterviewToken).filter(InterviewToken.job_id == job_id).delete(synchronize_session="fetch")
-
-    # Meeting slots and schedules
-    db.query(MeetingSchedule).filter(MeetingSchedule.job_id == job_id).delete(synchronize_session="fetch")
-    db.query(MeetingSlot).filter(MeetingSlot.job_id == job_id).delete(synchronize_session="fetch")
 
     # Job children
     db.query(JobSkill).filter(JobSkill.job_id == job_id).delete(synchronize_session="fetch")
