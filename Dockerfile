@@ -17,5 +17,5 @@ COPY . .
 # Create upload directories
 RUN mkdir -p uploads/jd uploads/resumes uploads/recordings models
 
-# Run migrations and start server
-CMD alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+# Run migrations (stamp first if DB was created outside alembic) and start server
+CMD alembic upgrade head 2>/dev/null || (alembic stamp head && echo "Stamped DB to head") ; uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
