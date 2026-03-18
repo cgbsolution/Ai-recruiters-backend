@@ -49,6 +49,7 @@ class Candidate(Base):
     interview_timezone = Column(String(100), nullable=True)
     interview_link = Column(String(500), nullable=True)
     allow_candidate_reschedule = Column(Boolean, nullable=True, default=False)
+    allow_joining_early = Column(Boolean, nullable=True, default=False)
     # "scheduled_time" | "anytime"
     joining_flexibility = Column(String(30), nullable=True, default="anytime")
     schedule_email_template = Column(Text, nullable=True)    # JSON with subject + body overrides

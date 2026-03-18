@@ -620,7 +620,12 @@ async def schedule_interview(
     candidate.interview_timezone = payload.interview_timezone
     candidate.joining_flexibility = payload.joining_flexibility
     candidate.allow_candidate_reschedule = payload.allow_candidate_reschedule
+    candidate.allow_joining_early = payload.allow_joining_early
     candidate.interview_status = "Scheduled"
+
+    # Save the frontend-provided interview URL for email links
+    if payload.interview_url:
+        candidate.interview_link = payload.interview_url
 
     # Update token expiry if set
     if payload.link_expiry and candidate.job_id:

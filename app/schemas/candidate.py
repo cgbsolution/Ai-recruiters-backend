@@ -34,6 +34,7 @@ class CandidateUpdate(BaseModel):
     interview_timezone: Optional[str] = None
     interview_link: Optional[str] = None
     allow_candidate_reschedule: Optional[bool] = None
+    allow_joining_early: Optional[bool] = None
     joining_flexibility: Optional[str] = None
     schedule_email_template: Optional[str] = None
     # Fit score
@@ -66,6 +67,7 @@ class ScheduleInterviewRequest(BaseModel):
     joining_flexibility: str = "anytime"  # "scheduled_time" | "anytime"
     allow_candidate_reschedule: bool = False
     allow_joining_early: bool = False
+    interview_url: Optional[str] = None  # frontend-provided interview link
     link_expiry: Optional[LinkExpiry] = None
     email_subject: Optional[str] = None
     email_intro_text: Optional[str] = None
@@ -100,6 +102,7 @@ class CandidateRead(BaseModel):
     interview_timezone: Optional[str] = None
     interview_link: Optional[str] = None
     allow_candidate_reschedule: Optional[bool] = None
+    allow_joining_early: Optional[bool] = None
     joining_flexibility: Optional[str] = None
     # Post-interview scores
     score: Optional[float] = None

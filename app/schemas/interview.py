@@ -74,6 +74,11 @@ class VerifyAccessResponse(BaseModel):
     can_resume: bool = False
     session_status: Optional[str] = None
     message: str
+    # Scheduling settings for frontend enforcement
+    interview_date: Optional[datetime] = None
+    interview_timezone: Optional[str] = None
+    joining_flexibility: Optional[str] = None  # "scheduled_time" | "anytime"
+    allow_joining_early: Optional[bool] = None
 
 
 # ── Apply for Job (resume upload + basic details) ────────────────────────────

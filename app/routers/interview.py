@@ -236,6 +236,14 @@ def verify_access(
         .order_by(InterviewSession.created_at.desc())
         .first()
     )
+    # Common scheduling fields for all "granted" responses
+    sched_fields = dict(
+        interview_date=candidate.interview_date,
+        interview_timezone=candidate.interview_timezone,
+        joining_flexibility=candidate.joining_flexibility,
+        allow_joining_early=getattr(candidate, "allow_joining_early", False),
+    )
+
     if active_session:
         return VerifyAccessResponse(
             access="granted",
@@ -245,6 +253,7 @@ def verify_access(
             can_resume=True,
             session_status=active_session.status.value,
             message="Welcome back! You can resume your interview.",
+            **sched_fields,
         )
 
     # 5. Candidate is invited but has no session yet — create one
@@ -273,6 +282,7 @@ def verify_access(
         candidate_id=candidate.id,
         can_resume=False,
         message="Access verified. Ready to start your interview.",
+        **sched_fields,
     )
 
 

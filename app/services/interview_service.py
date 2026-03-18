@@ -120,9 +120,20 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
     )
     date_str = _format_interview_date(candidate)
 
-    # Build interview URL: prefer candidate.interview_link, fall back to job token
-    interview_url = candidate.interview_link or ""
-    if not interview_url and job:
+    # Build interview URL: prefer candidate.interview_link (set by frontend during scheduling),
+    # fall back to building from job token + last CORS origin (production URL)
+    from urllib.parse import quote
+    interview_url = ""
+    base_link = candidate.interview_link or ""
+
+    if base_link:
+        # Append candidate email param if not already present
+        if "?candidate=" not in base_link and "&candidate=" not in base_link:
+            sep = "&" if "?" in base_link else "?"
+            interview_url = f"{base_link}{sep}candidate={quote(candidate.email)}"
+        else:
+            interview_url = base_link
+    elif job:
         from app.models.interview import InterviewToken
         token_row = (
             db.query(InterviewToken)
@@ -130,10 +141,9 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
             .first()
         )
         if token_row:
-            # Derive frontend base from first CORS origin (localhost or production)
+            # Use last CORS origin (production URL) instead of first (localhost)
             origins = settings.cors_origins_list
-            frontend_base = origins[0] if origins else "http://localhost:3000"
-            from urllib.parse import quote
+            frontend_base = origins[-1] if origins else "http://localhost:3000"
             interview_url = f"{frontend_base}/interview/{token_row.token}?candidate={quote(candidate.email)}"
 
     extra_heading = template.get("extra_heading") or ""
@@ -178,7 +188,7 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
                 <table cellpadding="0" cellspacing="0" border="0" width="100%">
                   <tr>
                     <td width="36" valign="top" style="padding-right:12px;">
-                      <img src="https://img.icons8.com/fluency-systems-regular/48/3B82F6/link.png" width="24" height="24" alt="link" style="display:block;" />
+                      <span style="font-size:20px;color:#3B82F6;">&#128279;</span>
                     </td>
                     <td>
                       <div style="font-size:11px;font-weight:700;color:#3B82F6;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Interview Link</div>
@@ -209,7 +219,7 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
           <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
             <tr><td align="center" style="padding-bottom:12px;">
               <div style="width:48px;height:48px;background-color:rgba(255,255,255,0.2);border-radius:50%;display:inline-block;line-height:48px;text-align:center;">
-                <img src="https://img.icons8.com/fluency-systems-regular/48/FFFFFF/new-post.png" width="24" height="24" alt="email" style="vertical-align:middle;" />
+                <span style="font-size:24px;color:#FFFFFF;">&#9993;</span>
               </div>
             </td></tr>
             <tr><td>
@@ -236,7 +246,7 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
                 <table cellpadding="0" cellspacing="0" border="0" width="100%">
                   <tr>
                     <td width="36" valign="top" style="padding-right:12px;">
-                      <img src="https://img.icons8.com/fluency-systems-regular/48/3B82F6/calendar.png" width="24" height="24" alt="calendar" style="display:block;" />
+                      <span style="font-size:20px;color:#3B82F6;">&#128197;</span>
                     </td>
                     <td>
                       <div style="font-size:11px;font-weight:700;color:#3B82F6;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">When</div>
