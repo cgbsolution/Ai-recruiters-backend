@@ -160,15 +160,67 @@ YOU MUST THINK LIKE A REAL INTERVIEWER. Every response you give must be shaped b
    - Echo back garbled/unclear transcriptions as if they were valid answers
 
 ═══════════════════════════════════════════════════════════════
+CODING QUESTIONS (IMPORTANT)
+═══════════════════════════════════════════════════════════════
+
+For technical roles, you MUST ask at least 1-2 coding questions during the interview. When you decide to give a coding challenge, include a "coding_question" object in your JSON response. The candidate will see a code editor and can write, run, and submit code.
+
+WHEN TO ASK CODING QUESTIONS:
+- After the introduction and 2-3 behavioral/conceptual questions
+- When you want to test practical coding ability
+- Typically around question_index 3-5 for a {max_q}-question interview
+- Ask 1-2 coding questions total (not more), mix with behavioral questions
+
+HOW TO WRITE A CODING QUESTION:
+- Problem must be clear and solvable in 10-15 minutes
+- Provide 2-4 test cases with input/output
+- Difficulty should match the role level ({job.experience_min}-{job.experience_max} years experience)
+- Input via stdin, output via stdout (print/console.log)
+- The candidate can choose their preferred language
+
+EXAMPLE CODING QUESTIONS (vary difficulty based on candidate level):
+- Easy: "Write a function that returns the sum of all even numbers in an array"
+- Medium: "Given a string, find the length of the longest substring without repeating characters"
+- Hard: "Implement an LRU cache with O(1) get and put operations"
+
+AFTER CANDIDATE SUBMITS CODE:
+- You will receive their code, test results (passed/failed), and language used
+- Acknowledge their solution, discuss their approach, time/space complexity
+- If they struggled, ask about their thought process instead of penalizing
+
+═══════════════════════════════════════════════════════════════
 RESPONSE FORMAT — Return ONLY valid JSON:
 ═══════════════════════════════════════════════════════════════
 {{
   "message": "Your spoken words here",
   "is_complete": false,
   "question_index": 1,
-  "is_off_topic": false
+  "is_off_topic": false,
+  "coding_question": null
 }}
 
+WHEN ASKING A CODING QUESTION, include the coding_question object:
+{{
+  "message": "Now let's test your coding skills. I'd like you to solve a problem...",
+  "is_complete": false,
+  "question_index": 3,
+  "is_off_topic": false,
+  "coding_question": {{
+    "title": "Two Sum",
+    "description": "Given an array of integers and a target sum, return the indices of two numbers that add up to the target.\\n\\nExample: nums = [2, 7, 11, 15], target = 9 → Output: [0, 1]\\n\\nConstraints:\\n- Each input has exactly one solution\\n- You may not use the same element twice",
+    "test_cases": [
+      {{"input": "4\\n2 7 11 15\\n9", "expected_output": "0 1", "description": "Basic case"}},
+      {{"input": "3\\n3 2 4\\n6", "expected_output": "1 2", "description": "Non-obvious pair"}},
+      {{"input": "2\\n3 3\\n6", "expected_output": "0 1", "description": "Duplicate elements"}}
+    ],
+    "time_limit": 15,
+    "difficulty": "medium"
+  }}
+}}
+
+RULES:
+- "coding_question": null for normal conversational questions (MOST turns)
+- Only include a coding_question object when you want the candidate to write code
 - "is_complete": true ONLY after the final closing statement (after {max_q} questions)
 - "question_index": 0 for opening, then 1..{max_q}. Follow-ups keep same index.
 - "is_off_topic": true when candidate response is irrelevant to the question asked."""
@@ -356,6 +408,7 @@ async def conduct_turn(
     is_complete = result.get("is_complete", False)
     is_off_topic = result.get("is_off_topic", False)
     question_index = result.get("question_index", session.current_question_index + 1)
+    coding_question = result.get("coding_question")
 
     db.add(InterviewMessage(
         session_id=session.id,
@@ -371,7 +424,7 @@ async def conduct_turn(
 
     db.commit()
 
-    return {
+    response = {
         "session_id": session.id,
         "message": message_text,
         "question_index": question_index,
@@ -379,6 +432,18 @@ async def conduct_turn(
         "is_off_topic": is_off_topic,
         "role": "ai",
     }
+
+    # Include coding question if AI decided to ask one
+    if coding_question and isinstance(coding_question, dict):
+        response["coding_question"] = {
+            "title": coding_question.get("title", "Coding Challenge"),
+            "description": coding_question.get("description", ""),
+            "test_cases": coding_question.get("test_cases", []),
+            "time_limit": coding_question.get("time_limit", 15),
+            "difficulty": coding_question.get("difficulty", "medium"),
+        }
+
+    return response
 
 
 async def generate_evaluation(session: InterviewSession, db: Session) -> Evaluation:

@@ -30,25 +30,62 @@ logger = logging.getLogger(__name__)
 
 # ── Email ─────────────────────────────────────────────────────────────────────
 
+_TZ_LABELS = {
+    "Asia/Calcutta": "India (IST)",
+    "Asia/Kolkata": "India (IST)",
+    "UTC": "UTC",
+    "America/New_York": "US Eastern",
+    "America/Los_Angeles": "US Pacific",
+    "Europe/London": "UK (GMT/BST)",
+    "Asia/Singapore": "Singapore",
+    "Asia/Dubai": "Dubai (GST)",
+    "Australia/Sydney": "Australia (AEST)",
+}
+
+
 def _format_interview_date(candidate) -> str:
     if not candidate.interview_date:
         return "To be confirmed"
     dt = candidate.interview_date
-    tz = candidate.interview_timezone or "IST"
-    return dt.strftime(f"%a, %b %d, %Y, %I:%M %p") + f" ({tz})"
+    raw_tz = candidate.interview_timezone or "IST"
+    tz_label = _TZ_LABELS.get(raw_tz, raw_tz)
+    return dt.strftime(f"%a, %b %d, %Y, %I:%M %p") + f" ({tz_label})"
 
 
 def _send_email_sync(msg, recipients) -> bool:
     """Blocking SMTP send — called via asyncio.to_thread."""
+    host = getattr(settings, "SMTP_HOST", "") or ""
+    user = getattr(settings, "SMTP_USER", "") or ""
+    password = getattr(settings, "SMTP_PASS", "") or ""
+    port = int(getattr(settings, "SMTP_PORT", 587))
+
+    if not host or not user or not password:
+        logger.error("SMTP not configured: SMTP_HOST=%s, SMTP_USER=%s, SMTP_PASS=%s",
+                      host, user, "***" if password else "(empty)")
+        return False
+
     try:
-        port = int(getattr(settings, "SMTP_PORT", 587))
-        with smtplib.SMTP(settings.SMTP_HOST, port) as server:
+        logger.info("Connecting to SMTP %s:%d as %s → sending to %s", host, port, user, recipients)
+        with smtplib.SMTP(host, port, timeout=15) as server:
+            server.set_debuglevel(0)
+            server.ehlo()
             server.starttls()
-            server.login(settings.SMTP_USER, settings.SMTP_PASS)
+            server.ehlo()
+            server.login(user, password)
             server.sendmail(msg["From"], recipients, msg.as_string())
+        logger.info("Email sent successfully to %s", recipients)
         return True
+    except smtplib.SMTPAuthenticationError as exc:
+        logger.error("SMTP authentication failed for %s: %s — Check your App Password", user, exc)
+        return False
+    except smtplib.SMTPRecipientsRefused as exc:
+        logger.error("SMTP recipients refused: %s", exc)
+        return False
+    except smtplib.SMTPException as exc:
+        logger.error("SMTP error: %s", exc)
+        return False
     except Exception as exc:
-        logger.warning(f"Email send failed: {exc}")
+        logger.error("Email send failed (unexpected): %s", exc, exc_info=True)
         return False
 
 
@@ -69,6 +106,7 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
 
     from app.models.job import Job
     job_title = "the role"
+    job = None
     if candidate.job_id:
         job = db.query(Job).filter(Job.id == candidate.job_id).first()
         if job:
@@ -81,30 +119,181 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
         f"{job_title} at company CGBiz Solutions Private limited"
     )
     date_str = _format_interview_date(candidate)
+
+    # Build interview URL: prefer candidate.interview_link, fall back to job token
     interview_url = candidate.interview_link or ""
+    if not interview_url and job:
+        from app.models.interview import InterviewToken
+        token_row = (
+            db.query(InterviewToken)
+            .filter(InterviewToken.job_id == job.id, InterviewToken.is_active == True)
+            .first()
+        )
+        if token_row:
+            # Derive frontend base from first CORS origin (localhost or production)
+            origins = settings.cors_origins_list
+            frontend_base = origins[0] if origins else "http://localhost:3000"
+            from urllib.parse import quote
+            interview_url = f"{frontend_base}/interview/{token_row.token}?candidate={quote(candidate.email)}"
+
     extra_heading = template.get("extra_heading") or ""
     extra_body = template.get("extra_body") or ""
     cc_emails = template.get("cc_emails") or []
 
+    scheduled_text = "rescheduled" if is_reschedule else "scheduled"
+
+    # Flexibility text based on candidate setting
+    flexibility = getattr(candidate, "joining_flexibility", "anytime") or "anytime"
+    if flexibility == "anytime":
+        flexibility_text = (
+            "You may take the interview at the scheduled time or at a time that works best for you. "
+            "Simply click the link whenever you&#8217;re ready."
+        )
+    else:
+        flexibility_text = (
+            "Please join the interview at the scheduled time. "
+            "Click the link below at the specified date and time to begin."
+        )
+
+    # Extra section HTML
+    extra_section = ""
+    if extra_heading or extra_body:
+        extra_section = f"""
+        <tr><td style="padding:0 24px 24px;">
+          <div style="padding:16px 20px;background-color:#F9FAFB;border-radius:8px;border:1px solid #E5E7EB;">
+            {"<h3 style='margin:0 0 8px 0;font-size:15px;color:#1F2937;'>" + extra_heading + "</h3>" if extra_heading else ""}
+            {"<p style='margin:0;font-size:14px;color:#4B5563;line-height:1.6;'>" + extra_body + "</p>" if extra_body else ""}
+          </div>
+        </td></tr>"""
+
+    # Interview link button (only if URL available)
+    link_section = ""
+    if interview_url:
+        link_section = f"""
+        <!-- INTERVIEW LINK box -->
+        <tr><td style="padding:0 24px 16px;">
+          <table cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;">
+            <tr>
+              <td style="padding:16px 20px;">
+                <table cellpadding="0" cellspacing="0" border="0" width="100%">
+                  <tr>
+                    <td width="36" valign="top" style="padding-right:12px;">
+                      <img src="https://img.icons8.com/fluency-systems-regular/48/3B82F6/link.png" width="24" height="24" alt="link" style="display:block;" />
+                    </td>
+                    <td>
+                      <div style="font-size:11px;font-weight:700;color:#3B82F6;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Interview Link</div>
+                      <a href="{interview_url}" style="font-size:14px;color:#2563EB;text-decoration:underline;word-break:break-all;">{interview_url}</a>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+          </table>
+        </td></tr>"""
+
     html_body = f"""
-<html><body style="font-family: Arial, sans-serif; color: #333;">
-  <div style="max-width:600px;margin:auto;padding:24px;border:1px solid #e0e0e0;border-radius:8px;">
-    <h2 style="color:#1a73e8;">Your Interview has been {"rescheduled" if is_reschedule else "scheduled"}</h2>
-    <p>Hello {candidate.name},</p>
-    <p>{intro_text}</p>
-    <hr/>
-    <p><strong>When is the interview?</strong></p>
-    <p>{date_str}</p>
-    <p><strong>Interview URL</strong></p>
-    <p><a href="{interview_url}">{interview_url}</a></p>
-    <p>You may take the interview at the scheduled time or at a time that works best for you.
-       Simply click the link whenever you're ready.</p>
-    {"<h3>" + extra_heading + "</h3>" if extra_heading else ""}
-    {"<p>" + extra_body + "</p>" if extra_body else ""}
-    <hr/>
-    <p style="font-size:12px;color:#888;">CGBiz Solutions Private Limited | HR Team</p>
-  </div>
-</body></html>
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <!--[if mso]><noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript><![endif]-->
+</head>
+<body style="margin:0;padding:0;background-color:#F3F4F6;font-family:'Segoe UI',Arial,Helvetica,sans-serif;-webkit-font-smoothing:antialiased;">
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#F3F4F6;">
+    <tr><td align="center" style="padding:32px 16px;">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600" style="max-width:600px;background-color:#FFFFFF;border-radius:12px;overflow:hidden;box-shadow:0 4px 6px rgba(0,0,0,0.07);">
+
+        <!-- Header -->
+        <tr><td style="background:linear-gradient(135deg,#3B82F6,#2563EB);padding:32px 24px;text-align:center;">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr><td align="center" style="padding-bottom:12px;">
+              <div style="width:48px;height:48px;background-color:rgba(255,255,255,0.2);border-radius:50%;display:inline-block;line-height:48px;text-align:center;">
+                <img src="https://img.icons8.com/fluency-systems-regular/48/FFFFFF/new-post.png" width="24" height="24" alt="email" style="vertical-align:middle;" />
+              </div>
+            </td></tr>
+            <tr><td>
+              <h1 style="margin:0;color:#FFFFFF;font-size:22px;font-weight:600;letter-spacing:-0.3px;">
+                Your Interview has been {scheduled_text}
+              </h1>
+            </td></tr>
+          </table>
+        </td></tr>
+
+        <!-- Body -->
+        <tr><td style="padding:28px 24px 6px;">
+          <p style="margin:0 0 6px 0;font-size:16px;color:#1F2937;">Hello <strong>{candidate.name}</strong>,</p>
+          <p style="margin:0 0 24px 0;font-size:14px;color:#4B5563;line-height:1.6;">
+            {intro_text}
+          </p>
+        </td></tr>
+
+        <!-- WHEN box -->
+        <tr><td style="padding:0 24px 16px;">
+          <table cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;">
+            <tr>
+              <td style="padding:16px 20px;">
+                <table cellpadding="0" cellspacing="0" border="0" width="100%">
+                  <tr>
+                    <td width="36" valign="top" style="padding-right:12px;">
+                      <img src="https://img.icons8.com/fluency-systems-regular/48/3B82F6/calendar.png" width="24" height="24" alt="calendar" style="display:block;" />
+                    </td>
+                    <td>
+                      <div style="font-size:11px;font-weight:700;color:#3B82F6;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">When</div>
+                      <div style="font-size:15px;color:#1E3A5F;font-weight:500;">{date_str}</div>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+          </table>
+        </td></tr>
+
+        {link_section}
+
+        <!-- Flexibility text -->
+        <tr><td style="padding:0 24px 24px;">
+          <p style="margin:0;font-size:13px;color:#6B7280;line-height:1.6;">
+            {flexibility_text}
+          </p>
+        </td></tr>
+
+        {extra_section}
+
+        <!-- Accept / Reject buttons -->
+        <tr><td style="padding:0 24px 28px;">
+          <table cellpadding="0" cellspacing="0" border="0" width="100%" style="border-top:1px solid #E5E7EB;">
+            <tr><td style="padding-top:20px;" align="center">
+              <table cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="padding-right:12px;">
+                    <a href="{interview_url}" style="display:inline-block;padding:10px 28px;background-color:#ECFDF5;color:#15803D;font-size:14px;font-weight:600;text-decoration:none;border-radius:8px;border:1px solid #BBF7D0;">
+                      &#10003; Accept
+                    </a>
+                  </td>
+                  <td>
+                    <a href="mailto:{getattr(settings, 'EMAIL_FROM', '') or getattr(settings, 'SMTP_USER', '')}?subject=Interview%20Decline%20-%20{candidate.name}" style="display:inline-block;padding:10px 28px;background-color:#FEF2F2;color:#DC2626;font-size:14px;font-weight:600;text-decoration:none;border-radius:8px;border:1px solid #FECACA;">
+                      &#10007; Reject
+                    </a>
+                  </td>
+                </tr>
+              </table>
+            </td></tr>
+          </table>
+        </td></tr>
+
+        <!-- Footer -->
+        <tr><td style="padding:16px 24px;background-color:#F9FAFB;border-top:1px solid #E5E7EB;text-align:center;">
+          <p style="margin:0;font-size:12px;color:#9CA3AF;">
+            This is an automated email from the recruitment system
+          </p>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>
 """
 
     msg = MIMEMultipart("alternative")

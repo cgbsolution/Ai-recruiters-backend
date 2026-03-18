@@ -55,11 +55,18 @@ class CandidateUpdate(BaseModel):
     mail_contact_history: Optional[bool] = None
 
 
+class LinkExpiry(BaseModel):
+    value: int = 7
+    unit: str = "days"  # "hours" | "days"
+
+
 class ScheduleInterviewRequest(BaseModel):
     interview_date: datetime
     interview_timezone: str = "Asia/Calcutta"
     joining_flexibility: str = "anytime"  # "scheduled_time" | "anytime"
     allow_candidate_reschedule: bool = False
+    allow_joining_early: bool = False
+    link_expiry: Optional[LinkExpiry] = None
     email_subject: Optional[str] = None
     email_intro_text: Optional[str] = None
     email_extra_heading: Optional[str] = None

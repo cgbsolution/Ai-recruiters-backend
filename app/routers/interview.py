@@ -69,6 +69,9 @@ def _get_token_or_404(token: str, db: Session) -> InterviewToken:
     ).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Interview link not found or no longer active")
+    # Check if token has expired
+    if obj.expires_at and obj.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=410, detail="This interview link has expired")
     return obj
 
 
@@ -1362,51 +1365,25 @@ _bg_logger = logging.getLogger("fit_score_bg")
 
 
 async def _compute_fit_score_bg(candidate_id: int, job_id: int) -> None:
-    """Background task: compute resume fit score after candidate registration."""
+    """Background task: compute resume fit score using smart scoring (no AI cost)."""
     db = SessionLocal()
     try:
-        from app.services.resume_service import extract_text, calculate_fit_score
-        from app.schemas.ai import FitScoreRequest
+        from app.services.smart_scoring_service import compute_fit_score_for_candidate
 
         candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-        job = db.query(Job).filter(Job.id == job_id).first()
-        if not candidate or not job or not candidate.resume_path:
-            _bg_logger.info(f"Fit score skip: candidate={candidate_id}, job={job_id}")
+        if not candidate:
+            _bg_logger.info(f"Fit score skip: candidate={candidate_id} not found")
             return
 
-        full_path = candidate.resume_path
-        if not full_path.startswith("/"):
-            full_path = full_path.lstrip("/")
-        if not os.path.exists(full_path):
-            _bg_logger.warning(f"Fit score skip: file not found at {full_path}")
+        result = compute_fit_score_for_candidate(db, candidate_id, job_id)
+        if not result:
+            _bg_logger.info(f"Fit score skip: no metadata for candidate={candidate_id}")
             return
-
-        resume_text = extract_text(full_path)
-        skills = [s.skill for s in job.skills] if job.skills else []
-        responsibilities = [r.description for r in job.responsibilities] if job.responsibilities else []
-
-        req = FitScoreRequest(
-            resume_text=resume_text,
-            job_title=job.title,
-            required_skills=skills,
-            responsibilities=responsibilities,
-            required_experience_min=job.experience_min,
-            required_experience_max=job.experience_max,
-        )
-        result = await calculate_fit_score(req)
 
         candidate.resume_fit_score = result.fit_level
-        candidate.fit_score_reasoning = json.dumps({
-            "summary": result.summary,
-            "breakdown": result.breakdown.model_dump() if result.breakdown else {},
-            "percentage": result.fit_percentage,
-            "key_matching_skills": result.key_matching_skills,
-            "relevant_experience_summary": result.relevant_experience_summary,
-            "missing_weak_areas": result.missing_weak_areas,
-        })
-        candidate.fit_score_details = json.dumps(result.reasoning_points)
+        candidate.fit_score_reasoning = json.dumps(result.to_dict())
         db.commit()
-        _bg_logger.info(f"Fit score computed: candidate={candidate_id}, level={result.fit_level}")
+        _bg_logger.info(f"Fit score computed: candidate={candidate_id}, level={result.fit_level} ({result.fit_percentage}%%)")
     except Exception as exc:
         _bg_logger.exception(f"Fit score failed for candidate={candidate_id}: {exc}")
         db.rollback()
@@ -1443,3 +1420,161 @@ def _format_evaluation(ev) -> EvaluationRead:
         meets_threshold=ev.meets_threshold or False,
         created_at=ev.created_at,
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CODE EXECUTION ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post(
+    "/sessions/{session_id}/run-code",
+    summary="Execute code against test cases during interview",
+    description="Run candidate's code in a sandboxed environment. Returns test case results.",
+)
+@limiter.limit("30/minute")
+async def run_code(
+    request: Request,
+    session_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    Execute code during an interview session.
+
+    Body:
+    {
+        "language": "python",
+        "code": "print(input())",
+        "test_cases": [{"input": "hello", "expected_output": "hello", "description": "Echo test"}]
+    }
+    """
+    body = await request.json()
+
+    session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.status not in (SessionStatus.in_progress, SessionStatus.pending):
+        raise HTTPException(status_code=400, detail="Interview is not active")
+
+    language = body.get("language", "python")
+    code = body.get("code", "")
+    test_cases = body.get("test_cases", [])
+
+    if not code.strip():
+        raise HTTPException(status_code=400, detail="Code cannot be empty")
+
+    from app.services.code_execution_service import run_test_cases, execute_code
+
+    if test_cases:
+        result = await run_test_cases(language, code, test_cases, timeout=10)
+    else:
+        # Just run the code without test cases (free run)
+        exec_result = await execute_code(language, code, stdin=body.get("stdin", ""), timeout=10)
+        result = {
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "results": [],
+            "output": exec_result,
+        }
+
+    return result
+
+
+@router.post(
+    "/sessions/{session_id}/submit-code",
+    summary="Submit final code solution for evaluation",
+    description="Submit the candidate's final code. Saves to transcript and returns test results.",
+)
+@limiter.limit("10/minute")
+async def submit_code(
+    request: Request,
+    session_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    Submit final code solution. Saves code + results to interview transcript.
+
+    Body:
+    {
+        "language": "python",
+        "code": "...",
+        "test_cases": [...],
+        "question_index": 3
+    }
+    """
+    body = await request.json()
+
+    session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.status not in (SessionStatus.in_progress, SessionStatus.pending):
+        raise HTTPException(status_code=400, detail="Interview is not active")
+
+    language = body.get("language", "python")
+    code = body.get("code", "")
+    test_cases = body.get("test_cases", [])
+    question_index = body.get("question_index", session.current_question_index)
+
+    if not code.strip():
+        raise HTTPException(status_code=400, detail="Code cannot be empty")
+
+    from app.services.code_execution_service import run_test_cases
+
+    # Run against test cases
+    test_result = await run_test_cases(language, code, test_cases, timeout=10)
+
+    # Save candidate's code submission as a message
+    code_submission_text = (
+        f"[CODE SUBMISSION]\n"
+        f"Language: {language}\n"
+        f"Test Results: {test_result['passed']}/{test_result['total']} passed\n"
+        f"```{language}\n{code}\n```"
+    )
+
+    db.add(InterviewMessage(
+        session_id=session.id,
+        role="candidate",
+        content=code_submission_text,
+        question_index=question_index,
+    ))
+    db.commit()
+
+    # Now get AI's response about the code
+    from app.services.avatar_interview_service import conduct_turn
+
+    # Send code context to AI for discussion
+    ai_context = (
+        f"The candidate submitted code for the coding challenge.\n"
+        f"Language: {language}\n"
+        f"Test Results: {test_result['passed']}/{test_result['total']} test cases passed\n"
+        f"Code:\n```{language}\n{code}\n```\n"
+        f"Please review their solution, discuss their approach, and then continue the interview."
+    )
+
+    ai_response = await conduct_turn(session, ai_context, db)
+
+    return {
+        "test_result": test_result,
+        "ai_response": ai_response,
+    }
+
+
+@router.get(
+    "/code/languages",
+    summary="Get supported programming languages",
+)
+async def get_languages():
+    """Return list of supported languages for the code editor."""
+    from app.services.code_execution_service import get_supported_languages
+    return {"languages": get_supported_languages()}
+
+
+@router.get(
+    "/code/starter/{language}",
+    summary="Get starter code template for a language",
+)
+async def get_starter_code(language: str):
+    """Return starter code template for a given language."""
+    from app.services.code_execution_service import get_starter_code as _get_starter
+    code = _get_starter(language)
+    return {"language": language, "code": code}

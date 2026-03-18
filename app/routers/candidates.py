@@ -50,8 +50,21 @@ _parse_queue: asyncio.Queue = asyncio.Queue()
 _worker_started = False
 
 
+def _sync_extract_text(file_path: str) -> str:
+    """Extract text from resume file — runs in thread pool."""
+    from app.services.fast_resume_parser import extract_text_from_file
+
+    text = extract_text_from_file(file_path)
+    if not text:
+        raise RuntimeError(f"Could not extract text from {file_path}")
+    return text
+
+
 async def _parse_worker():
-    """Process resume parse jobs one at a time using fast regex parser + LLM fit score."""
+    """
+    Process resume parse jobs one at a time.
+    Uses Claude AI for parsing (accurate names/details) + LLM fit score.
+    """
     while True:
         candidate_id, file_path, job_id = await _parse_queue.get()
         db = SessionLocal()
@@ -63,15 +76,43 @@ async def _parse_worker():
             candidate.parsing_status = "processing"
             db.commit()
 
-            from app.services.fast_resume_parser import extract_text_from_file, fast_parse_resume
             from app.models.job import Job, JobSkill, JobResponsibility
 
-            # ── Step 1: Extract text + fast regex parse (no AI) ───────────────
-            resume_text = extract_text_from_file(file_path)
-            if not resume_text:
-                raise RuntimeError(f"Could not extract text from {file_path}")
+            # ── Step 1: Extract text in thread pool ───────────────────────────
+            resume_text = await asyncio.to_thread(_sync_extract_text, file_path)
 
-            parsed = fast_parse_resume(resume_text)
+            # ── Step 2: AI parse for accurate name/details extraction ─────────
+            parsed = None
+            try:
+                from app.services.resume_service import parse_resume
+                from app.schemas.ai import ParseResumeRequest
+
+                req = ParseResumeRequest(resume_text=resume_text)
+                result = await parse_resume(req)
+                ai_data = result.parsed_data.model_dump()
+
+                # Map AI parser output to our expected format
+                parsed = {
+                    "candidate_name": ai_data.get("name"),
+                    "candidate_email": ai_data.get("email"),
+                    "phone": ai_data.get("phone"),
+                    "current_designation": ai_data.get("current_designation") or ai_data.get("current_role"),
+                    "experience_years": ai_data.get("experience_years"),
+                    "skills": ai_data.get("skills") or [],
+                    "education": ai_data.get("education") or [],
+                    "certifications": ai_data.get("certifications") or [],
+                    "work_experience": ai_data.get("work_experience") or [],
+                    "location": ai_data.get("location"),
+                    "personal_details": ai_data.get("personal_details") or {},
+                    "keywords": ai_data.get("keywords") or [],
+                    "summary": ai_data.get("summary"),
+                }
+                logger.info("AI parsed candidate %s: name=%s, email=%s", candidate_id, parsed.get("candidate_name"), parsed.get("candidate_email"))
+            except Exception as ai_exc:
+                logger.warning("AI parse failed for candidate %s, falling back to regex: %s", candidate_id, ai_exc)
+                # Fallback to fast regex parser
+                from app.services.fast_resume_parser import fast_parse_resume
+                parsed = await asyncio.to_thread(fast_parse_resume, resume_text)
 
             # Update candidate with parsed data
             parsed_email = parsed.get("candidate_email") or candidate.email
@@ -130,38 +171,22 @@ async def _parse_worker():
 
             candidate.resume_metadata_id = meta.id
 
-            # ── Step 2: Compute fit score via LLM if job_id present ───────────
-            if job_id and resume_text:
+            # ── Step 3: Compute fit score from metadata comparison ─────────
+            if job_id:
                 try:
-                    from app.services.resume_service import calculate_fit_score
-                    from app.schemas.ai import FitScoreRequest
+                    from app.services.smart_scoring_service import compute_fit_score_for_candidate
 
-                    job = db.query(Job).filter(Job.id == job_id).first()
-                    if job:
-                        skills = [s.skill for s in db.query(JobSkill).filter(JobSkill.job_id == job_id).all() if s.skill]
-                        responsibilities = [r.description for r in db.query(JobResponsibility).filter(JobResponsibility.job_id == job_id).all()]
-                        fit_req = FitScoreRequest(
-                            resume_text=resume_text,
-                            job_title=job.title,
-                            required_experience_min=job.experience_min,
-                            required_experience_max=job.experience_max,
-                            required_skills=skills,
-                            responsibilities=responsibilities,
-                        )
-                        fit_result = await calculate_fit_score(fit_req)
-                        candidate.resume_fit_score = fit_result.fit_level
-                        candidate.fit_score_reasoning = json.dumps({
-                            "summary": fit_result.summary,
-                            "breakdown": fit_result.breakdown.model_dump(),
-                            "percentage": fit_result.fit_percentage,
-                            "key_matching_skills": fit_result.key_matching_skills,
-                            "relevant_experience_summary": fit_result.relevant_experience_summary,
-                            "missing_weak_areas": fit_result.missing_weak_areas,
-                        })
-                        candidate.fit_score_details = json.dumps(fit_result.reasoning_points)
+                    logger.info("Computing fit score for candidate %s against job %s", candidate_id, job_id)
+                    score_result = compute_fit_score_for_candidate(db, candidate_id, job_id)
+
+                    if score_result:
+                        candidate.resume_fit_score = score_result.fit_level
+                        candidate.fit_score_reasoning = json.dumps(score_result.to_dict())
+                        logger.info("Fit score for candidate %s: %s (%s%%)", candidate_id, score_result.fit_level, score_result.fit_percentage)
+                    else:
+                        logger.warning("Could not compute fit score for candidate %s — missing metadata", candidate_id)
                 except Exception as fit_exc:
-                    logger.warning("Fit score computation failed for candidate %s: %s", candidate_id, fit_exc)
-                    # Parsing still succeeds even if fit score fails
+                    logger.error("Fit score computation FAILED for candidate %s (job %s): %s", candidate_id, job_id, fit_exc, exc_info=True)
 
             candidate.parsing_status = "completed"
             db.commit()
@@ -217,7 +242,22 @@ def list_candidates(
     summary="Create candidate manually",
 )
 def create_candidate(payload: CandidateCreate, db: Session = Depends(get_db)):
-    return candidate_service.create_candidate(db, payload)
+    candidate = candidate_service.create_candidate(db, payload)
+
+    # Auto-compute fit score if candidate is linked to a job
+    if candidate.job_id:
+        try:
+            from app.services.smart_scoring_service import compute_fit_score_for_candidate
+            result = compute_fit_score_for_candidate(db, candidate.id, candidate.job_id)
+            if result:
+                candidate.resume_fit_score = result.fit_level
+                candidate.fit_score_reasoning = json.dumps(result.to_dict())
+                db.commit()
+                db.refresh(candidate)
+        except Exception:
+            pass  # fit score is best-effort on manual add
+
+    return candidate
 
 
 @router.get(
@@ -516,47 +556,21 @@ async def upload_resumes(
     description="Re-runs Claude LLM fit-score calculation for an existing candidate against their linked job. Requires resume file on disk and a linked `job_id`.",
 )
 async def compute_fit_score(candidate_id: int, db: Session = Depends(get_db)):
-    """Re-compute the LLM fit score for an existing candidate against their linked job."""
-    from app.services.resume_service import extract_text, calculate_fit_score
-    from app.schemas.ai import FitScoreRequest
-    from app.models.job import Job, JobSkill, JobResponsibility
-
+    """Re-compute fit score using smart scoring (ML → Algorithm). No AI cost."""
     candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
-    if not candidate.resume_path or not os.path.exists(candidate.resume_path):
-        raise HTTPException(status_code=400, detail="No resume file found for this candidate")
     if not candidate.job_id:
         raise HTTPException(status_code=400, detail="Candidate is not linked to a job")
 
-    job = db.query(Job).filter(Job.id == candidate.job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Linked job not found")
+    from app.services.smart_scoring_service import compute_fit_score_for_candidate
+    result = compute_fit_score_for_candidate(db, candidate_id, candidate.job_id)
 
-    resume_text = extract_text(candidate.resume_path)
-    skills = [s.skill for s in db.query(JobSkill).filter(JobSkill.job_id == job.id).all() if s.skill]
-    responsibilities = [r.description for r in db.query(JobResponsibility).filter(JobResponsibility.job_id == job.id).all()]
+    if not result:
+        raise HTTPException(status_code=400, detail="Could not compute score — missing resume metadata")
 
-    fit_req = FitScoreRequest(
-        resume_text=resume_text,
-        job_title=job.title,
-        required_experience_min=job.experience_min,
-        required_experience_max=job.experience_max,
-        required_skills=skills,
-        responsibilities=responsibilities,
-    )
-    fit_result = await calculate_fit_score(fit_req)
-
-    candidate.resume_fit_score = fit_result.fit_level
-    candidate.fit_score_reasoning = json.dumps({
-        "summary": fit_result.summary,
-        "breakdown": fit_result.breakdown.model_dump(),
-        "percentage": fit_result.fit_percentage,
-        "key_matching_skills": fit_result.key_matching_skills,
-        "relevant_experience_summary": fit_result.relevant_experience_summary,
-        "missing_weak_areas": fit_result.missing_weak_areas,
-    })
-    candidate.fit_score_details = json.dumps(fit_result.reasoning_points)
+    candidate.resume_fit_score = result.fit_level
+    candidate.fit_score_reasoning = json.dumps(result.to_dict())
     db.commit()
     db.refresh(candidate)
     return candidate
@@ -566,7 +580,6 @@ async def compute_fit_score(candidate_id: int, db: Session = Depends(get_db)):
 
 @router.post(
     "/{candidate_id}/schedule-interview",
-    response_model=CandidateRead,
     summary="Schedule / reschedule interview",
     description=(
         "Set the interview date/time for a candidate and trigger notifications.\n\n"
@@ -609,6 +622,21 @@ async def schedule_interview(
     candidate.allow_candidate_reschedule = payload.allow_candidate_reschedule
     candidate.interview_status = "Scheduled"
 
+    # Update token expiry if set
+    if payload.link_expiry and candidate.job_id:
+        from app.models.interview import InterviewToken
+        from datetime import timedelta
+        token_row = (
+            db.query(InterviewToken)
+            .filter(InterviewToken.job_id == candidate.job_id, InterviewToken.is_active == True)
+            .first()
+        )
+        if token_row:
+            if payload.link_expiry.unit == "hours":
+                token_row.expires_at = datetime.utcnow() + timedelta(hours=payload.link_expiry.value)
+            else:
+                token_row.expires_at = datetime.utcnow() + timedelta(days=payload.link_expiry.value)
+
     template_data = {
         "subject": payload.email_subject,
         "intro_text": payload.email_intro_text,
@@ -620,8 +648,13 @@ async def schedule_interview(
     db.commit()
     db.refresh(candidate)
 
+    email_sent = False
+    whatsapp_sent = False
+
     try:
-        await send_schedule_email(candidate, db, is_reschedule=is_reschedule)
+        email_sent = await send_schedule_email(candidate, db, is_reschedule=is_reschedule)
+        if not email_sent:
+            logger.warning("Email send returned False for candidate %s", candidate.id)
     except Exception:
         logger.warning("Failed to send schedule email for candidate %s", candidate.id, exc_info=True)
 
@@ -632,10 +665,16 @@ async def schedule_interview(
             job_title = job.title if job else "the role"
             msg = _build_whatsapp_message(candidate, job_title, is_reschedule=is_reschedule)
             await send_whatsapp_message(candidate.phone, msg)
+            whatsapp_sent = True
         except Exception:
             logger.warning("Failed to send WhatsApp to candidate %s", candidate.id, exc_info=True)
 
-    return candidate
+    # Return candidate data + notification status
+    result = CandidateRead.model_validate(candidate)
+    response_dict = result.model_dump()
+    response_dict["email_sent"] = email_sent
+    response_dict["whatsapp_sent"] = whatsapp_sent
+    return response_dict
 
 
 # ── Cancel Interview ─────────────────────────────────────────────────────────

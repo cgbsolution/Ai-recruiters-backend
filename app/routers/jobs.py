@@ -50,11 +50,63 @@ def _create_token(db: Session, job_id: int) -> str:
 
 @router.get("/", response_model=List[JobListItem])
 def list_jobs(db: Session = Depends(get_db)):
+    from app.models.candidate import Candidate
+    from sqlalchemy import func, case
+
     jobs = job_service.get_jobs_list(db)
+
+    # Compute real stats per job in a single query
+    COMPLETED_STATUSES = ("Completed", "Terminated Prematurely", "Terminated – Cheating Detected",
+                          "Ended by Candidate", "Candidate Terminated Prematurely")
+    stats_q = (
+        db.query(
+            Candidate.job_id,
+            func.count(Candidate.id).label("applications"),
+            func.count(case(
+                (Candidate.interview_status.in_(COMPLETED_STATUSES), 1),
+            )).label("interviews"),
+            func.count(case(
+                (Candidate.fit_score_details.isnot(None), 1),
+            )).label("scored_count"),
+        )
+        .filter(Candidate.job_id.isnot(None))
+        .group_by(Candidate.job_id)
+        .all()
+    )
+    stats_map: dict[int, dict] = {}
+    for row in stats_q:
+        stats_map[row.job_id] = {
+            "applications": row.applications,
+            "interviews": row.interviews,
+        }
+
+    # Top candidates: fit_score >= 60% — need to check JSON details
+    # Simpler: count candidates with resume_fit_score = 'high' or fit_score percentage >= 60
+    top_q = (
+        db.query(Candidate.job_id, func.count(Candidate.id).label("top"))
+        .filter(
+            Candidate.job_id.isnot(None),
+            Candidate.resume_fit_score.in_(["high", "medium"]),
+        )
+        .group_by(Candidate.job_id)
+        .all()
+    )
+    for row in top_q:
+        if row.job_id in stats_map:
+            stats_map[row.job_id]["candidates"] = row.top
+        else:
+            stats_map[row.job_id] = {"applications": 0, "interviews": 0, "candidates": row.top}
+
     result = []
     for job in jobs:
         item = JobListItem.model_validate(job)
-        result.append(item.model_copy(update={"interview_token": _get_active_token(db, job.id)}))
+        s = stats_map.get(job.id, {})
+        result.append(item.model_copy(update={
+            "interview_token": _get_active_token(db, job.id),
+            "applications": s.get("applications", 0),
+            "interviews": s.get("interviews", 0),
+            "candidates": s.get("candidates", 0),
+        }))
     return result
 
 
@@ -368,34 +420,92 @@ def download_jd(job_id: int, db: Session = Depends(get_db)):
 
 @router.post(
     "/{job_id}/match-candidates",
-    summary="Match candidates from resume database against this job",
+    summary="Start matching candidates from resume database (async)",
     description=(
-        "Compares all parsed resumes in the central resume_metadata table "
-        "against this job's skills, keywords, title, and experience range.\n\n"
-        "Pure keyword/skill matching — NO AI calls — instant even with 50k+ resumes.\n\n"
-        "Query param `threshold` controls minimum fit score (default 60)."
+        "Starts a background task that matches all parsed resumes against this job.\n\n"
+        "Returns a task_id immediately. Poll GET /jobs/{job_id}/match-status/{task_id} "
+        "for progress and results.\n\n"
+        "Optimized for 100K+ resumes with SQL pre-filtering and batch processing."
     ),
     tags=["Jobs"],
 )
 def match_candidates(
     job_id: int,
-    threshold: int = 60,
+    threshold: int = 30,
     db: Session = Depends(get_db),
 ):
-    from app.services.matching_service import match_candidates_for_job
+    from app.services.matching_service import start_match_task
 
     job = job_service.get_job_by_id(db, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    result = match_candidates_for_job(db, job_id, threshold=threshold)
+    task_id = start_match_task(job_id, threshold=threshold)
 
     return {
+        "task_id": task_id,
         "job_id": job_id,
-        "total_in_database": result["total_scanned"],
-        "matched_count": result["matched_count"],
-        "candidates": result["candidates"],
+        "status": "running",
     }
+
+
+@router.get(
+    "/{job_id}/match-status/{task_id}",
+    summary="Get matching task progress and results",
+    description=(
+        "Poll this endpoint to get progress of a match-candidates task.\n\n"
+        "Returns status, progress percentage, and paginated results when complete.\n\n"
+        "Query params: page (default 1), page_size (default 50, max 200)."
+    ),
+    tags=["Jobs"],
+)
+def match_status(
+    job_id: int,
+    task_id: str,
+    page: int = 1,
+    page_size: int = 50,
+):
+    from app.services.matching_service import get_task
+
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found or expired")
+    if task.job_id != job_id:
+        raise HTTPException(status_code=404, detail="Task not found for this job")
+
+    page_size = min(page_size, 200)
+    denom = task.filtered_count if task.filtered_count else task.total_resumes
+    progress_pct = int((task.processed / max(denom, 1)) * 100) if denom else 0
+
+    response = {
+        "task_id": task_id,
+        "status": task.status,
+        "total_in_database": task.total_resumes,
+        "filtered_count": task.filtered_count,
+        "processed": task.processed,
+        "progress_percent": min(progress_pct, 100),
+        "matched_count": task.matched_count,
+        "eta_seconds": round(task.eta_seconds, 1),
+    }
+
+    if task.status == "failed":
+        response["error"] = task.error
+
+    if task.status == "completed":
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_candidates = task.candidates[start:end]
+        response["candidates"] = page_candidates
+        response["total_pages"] = max(1, -(-len(task.candidates) // page_size))
+        response["page"] = page
+        response["page_size"] = page_size
+    elif task.status == "running":
+        # While running, return top results found so far (limited)
+        response["candidates"] = sorted(
+            task.candidates, key=lambda x: x["fit_score"], reverse=True
+        )[:20]
+
+    return response
 
 
 @router.post(
@@ -465,19 +575,25 @@ async def add_matched_candidates(
             parsing_status="completed",
         )
         db.add(candidate)
+        db.flush()
+
+        # Compute fit score immediately from metadata (no AI call needed)
+        try:
+            from app.services.smart_scoring_service import compute_fit_score_for_metadata
+            from app.models.job_metadata import JobMetadata
+            import json
+
+            jm = db.query(JobMetadata).filter(JobMetadata.job_id == job_id).first()
+            result = compute_fit_score_for_metadata(db, meta, job, jm)
+            candidate.resume_fit_score = result.fit_level
+            candidate.fit_score_reasoning = json.dumps(result.to_dict())
+        except Exception:
+            pass
+
         db.commit()
         db.refresh(candidate)
         added += 1
         details.append({"email": email, "status": "added", "candidate_id": candidate.id})
-
-        # Queue background fit-score computation
-        from app.routers.candidates import _parse_queue, _ensure_worker
-        _ensure_worker()
-        # Re-use the parse worker — it will skip re-parsing since metadata exists
-        # but will compute fit score for this job
-        if meta.resume_file_path:
-            import asyncio
-            await _parse_queue.put((candidate.id, meta.resume_file_path, job_id))
 
     return {
         "added": added,

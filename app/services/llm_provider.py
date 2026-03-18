@@ -139,8 +139,11 @@ async def _gemini_ask(prompt: str, model: str, max_tokens: int, retries: int) ->
             )
             return response.text
         except Exception as exc:
+            logger.warning("Gemini API attempt %d/%d failed: %s", attempt + 1, retries, exc)
             if attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)
+                # Longer backoff for rate limits
+                wait = (2 ** attempt) * 2  # 2s, 4s, 8s
+                await asyncio.sleep(wait)
                 continue
             raise
 
@@ -171,8 +174,10 @@ async def _gemini_ask_with_system(
             )
             return response.text
         except Exception as exc:
+            logger.warning("Gemini API (system) attempt %d/%d failed: %s", attempt + 1, retries, exc)
             if attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)
+                wait = (2 ** attempt) * 2
+                await asyncio.sleep(wait)
                 continue
             raise
 

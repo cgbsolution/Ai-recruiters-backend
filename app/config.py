@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     # ── AI Provider ─────────────────────────────────────────────────────────
     # Set AI_PROVIDER to: "anthropic", "gemini", or "openai"
     # Then set the corresponding API key below
-    AI_PROVIDER: str = "gemini"
+    AI_PROVIDER: str = "anthropic"
     ANTHROPIC_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
     OPENAI_API_KEY: str = ""

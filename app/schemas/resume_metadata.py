@@ -28,6 +28,16 @@ class ResumeMetadataRead(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ResumeMetadataUpdate(BaseModel):
+    candidate_name: Optional[str] = None
+    phone: Optional[str] = None
+    current_designation: Optional[str] = None
+    experience_years: Optional[float] = None
+    skills: Optional[List[str]] = None
+    location: Optional[str] = None
+    annual_package: Optional[float] = None
+
+
 class DuplicateCheckResponse(BaseModel):
     exists: bool
     candidate_email: Optional[str] = None

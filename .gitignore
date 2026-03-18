@@ -5,6 +5,9 @@ __pycache__/
 .env
 uploads/jd/*
 !uploads/jd/.gitkeep
+uploads/resumes/
+uploads/recordings/
+resume_export.json
 *.egg-info/
 dist/
 build/

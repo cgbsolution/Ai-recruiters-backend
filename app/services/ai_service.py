@@ -1,4 +1,5 @@
 import json
+from typing import Any
 
 from app.services.llm_provider import ask as _llm_ask, ask_with_system as _llm_ask_with_system, get_model
 from app.schemas.ai import (
@@ -45,7 +46,7 @@ async def _ask_with_system(
     )
 
 
-def _parse_json(raw: str) -> any:
+def _parse_json(raw: str) -> Any:
     raw = raw.strip()
     if raw.startswith("```"):
         lines = raw.split("\n")

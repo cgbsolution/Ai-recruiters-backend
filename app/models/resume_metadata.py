@@ -35,6 +35,7 @@ class ResumeMetadata(Base):
 
     # ── Personal / Location ───────────────────────────────────────────────────
     location = Column(String(255), nullable=True)
+    annual_package = Column(Float, nullable=True)    # Annual package / CTC in LPA
     personal_details = Column(Text, nullable=True)  # JSON: {dob, gender, languages, ...}
 
     # ── Search / Matching ─────────────────────────────────────────────────────
