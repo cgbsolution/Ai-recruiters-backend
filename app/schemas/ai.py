@@ -125,3 +125,7 @@ class FitScoreResponse(BaseModel):
     missing_weak_areas: List[str] = []   # skills/areas missing or weak vs JD
     breakdown: FitScoreBreakdown
     reasoning_points: List[str]
+    # Advanced scoring fields
+    score_breakdown: Optional[Dict[str, Any]] = None  # 6-dimension numeric scores
+    strength_mapping: Optional[Dict[str, Any]] = None  # strong/partial/gap mapping
+    verdict: Optional[str] = None                      # one-line hiring recommendation

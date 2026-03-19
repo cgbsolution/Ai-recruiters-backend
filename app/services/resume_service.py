@@ -148,16 +148,41 @@ Rules:
 # ── LLM-backed Fit Score Calculation ─────────────────────────────────────────
 
 async def calculate_fit_score(req: FitScoreRequest) -> FitScoreResponse:
-    """Use Claude to compare a resume against a job description and produce a fit score."""
+    """
+    Advanced AI Resume-to-JD semantic matching engine.
+    Uses a 6-dimension weighted scoring model with skill normalization,
+    semantic matching, and contextual understanding — NOT keyword matching.
+    """
     from app.services.ai_service import _ask, _parse_json, SONNET
 
     skills_str = ", ".join(req.required_skills) if req.required_skills else "Not specified"
     responsibilities_str = "\n".join(f"- {r}" for r in req.responsibilities) if req.responsibilities else "Not specified"
     exp_range = f"{req.required_experience_min}-{req.required_experience_max} years" if req.required_experience_min is not None else "Not specified"
 
-    prompt = f"""You are an expert AI technical recruiter performing a semantic resume-to-JD match analysis.
-Compare the candidate's resume against the job description and return a structured analysis.
-Return ONLY valid JSON — no markdown fences, no extra text.
+    # Include full JD text if available for deeper semantic matching
+    jd_text_section = ""
+    if req.job_description:
+        jd_text_section = f"""
+Full Job Description:
+\"\"\"
+{req.job_description[:4000]}
+\"\"\"
+"""
+
+    prompt = f"""You are an advanced AI Resume Parsing and JD Matching Engine. Think like a SENIOR HIRING MANAGER.
+
+Your job is to perform DEEP SEMANTIC MATCHING between a candidate's resume and the job description.
+Use contextual understanding — NOT simple keyword matching.
+
+CRITICAL RULES:
+- Match EQUIVALENT skills even if wording differs (e.g. "ITGC" == "IS Auditing", "Gap analysis" == "Risk Management")
+- DO NOT penalize for missing exact keywords if equivalent experience is demonstrated
+- DO reward equivalent/transferable experience inferred from context
+- DO NOT mark a skill as missing if it can be reasonably inferred from the candidate's projects/experience
+- Penalize ONLY if a required competency is truly absent
+- Be strict but FAIR — realistic scoring: 70-85 for good candidates, not artificially low
+
+---
 
 JOB DESCRIPTION:
 - Title: {req.job_title}
@@ -165,54 +190,101 @@ JOB DESCRIPTION:
 - Required Skills: {skills_str}
 - Key Responsibilities:
 {responsibilities_str}
+{jd_text_section}
 
 CANDIDATE RESUME:
 \"\"\"
-{req.resume_text[:5000]}
+{req.resume_text[:6000]}
 \"\"\"
 
-Perform a deep semantic comparison and return JSON in EXACTLY this format:
+---
+
+SCORING MODEL (6 dimensions, total 100):
+
+1. Core Skills Match (40 points):
+   - % of required skills matched via SEMANTIC comparison
+   - Map raw skills to normalized categories (e.g. "Nessus, Qualys" → "Vulnerability Management")
+   - Include skills found in experience/projects sections, not just listed skills
+
+2. Experience Fit (15 points):
+   - Years of experience match
+   - Domain/industry relevance
+   - Seniority level alignment
+
+3. Responsibility Match (15 points):
+   - How well past roles align with JD responsibilities
+   - End-to-end ownership signals
+   - Project complexity alignment
+
+4. Tools & Technology (10 points):
+   - Specific tools, platforms, frameworks match
+   - Adjacent/equivalent tool experience counts
+
+5. Leadership & Ownership (10 points):
+   - Team management, mentoring, stakeholder management
+   - Project ownership and initiative signals
+   - Cross-functional collaboration
+
+6. Compliance & Domain Coverage (10 points):
+   - Regulatory frameworks (GDPR, SOX, HIPAA, PCI-DSS, etc.)
+   - Industry-specific domain knowledge
+   - Certifications relevance
+
+---
+
+Return ONLY valid JSON — no markdown fences, no extra text:
 {{
   "fit_level": "high" | "medium" | "low",
   "fit_percentage": <integer 0-100>,
-  "summary": "1-2 sentence overall fit summary",
+  "summary": "2-3 sentence overall fit assessment written like a senior recruiter's verdict",
+
+  "strength_mapping": {{
+    "strong_matches": [
+      "Skill/area with high alignment — brief evidence from resume"
+    ],
+    "partial_matches": [
+      "Skill/area with partial coverage — what's present and what's weak"
+    ],
+    "gaps": [
+      "Required skill/area that is truly absent from the resume"
+    ]
+  }},
+
+  "score_breakdown": {{
+    "core_skills": <0-40>,
+    "experience_fit": <0-15>,
+    "responsibility_match": <0-15>,
+    "tools_technology": <0-10>,
+    "leadership_ownership": <0-10>,
+    "compliance_domain": <0-10>
+  }},
+
   "key_matching_skills": [
-    "Skill or technology from resume that directly matches JD requirement",
-    "Another matching skill",
-    "..."
+    "Matched skill with evidence (3-10 items)"
   ],
-  "relevant_experience_summary": "A concise 3-5 sentence paragraph summarizing ONLY the candidate's experience, roles, and achievements that are directly relevant to this specific JD. Do NOT repeat the full resume — synthesize only what matters for this role.",
+  "relevant_experience_summary": "Concise 3-5 sentence paragraph synthesizing ONLY the candidate's experience directly relevant to this JD. Do NOT copy-paste resume text.",
   "missing_weak_areas": [
-    "Skill or requirement from JD that is absent or under-represented in the resume",
-    "Another gap or weak area"
+    "JD requirement NOT clearly evidenced in resume (2-6 items)"
   ],
   "breakdown": {{
-    "experience_match": "How well candidate's years/type of experience matches the JD requirement",
-    "skills_match": "How well candidate's skills overlap with required skills",
-    "tech_stack_alignment": "Degree of overlap between candidate's tech stack and JD tech stack",
-    "role_alignment": "How closely candidate's past roles/responsibilities align with this JD"
+    "experience_match": "Detailed assessment of experience years + domain fit",
+    "skills_match": "Detailed assessment of skills overlap (semantic, not keyword)",
+    "tech_stack_alignment": "Specific tools/tech overlap analysis",
+    "role_alignment": "How past roles map to this JD's responsibilities"
   }},
   "reasoning_points": [
-    "Key positive or negative observation 1",
-    "Key observation 2",
-    "Key observation 3",
-    "Key observation 4"
-  ]
+    "Key positive or negative observation (4-6 items)"
+  ],
+  "verdict": "One-line hiring recommendation (e.g. 'Strong fit for Senior role, slightly junior for Lead position')"
 }}
 
-Scoring criteria:
-- high   (fit_percentage 75-100): Strong match — experience within range, most required skills present, direct role alignment
-- medium (fit_percentage 40-74): Partial match — slightly outside experience range OR missing some key skills
-- low    (fit_percentage 0-39):  Poor match — significantly outside range AND/OR missing critical required skills
-
-Rules:
-- fit_percentage must reflect ACTUAL content comparison (e.g. 82 for strong match, 55 for partial, 25 for poor)
-- key_matching_skills: list only skills explicitly found in BOTH the resume AND the JD (3-8 items)
-- missing_weak_areas: list only JD requirements NOT clearly evidenced in the resume (2-5 items)
-- relevant_experience_summary: synthesize, do NOT copy-paste resume text
+Scoring bands:
+- high   (75-100): Strong match — experience aligns, most core skills present, clear role fit
+- medium (45-74):  Partial match — some gaps but transferable skills present
+- low    (0-44):   Poor match — critical requirements missing
 """
 
-    raw = await _ask(prompt, model=SONNET, max_tokens=1500)
+    raw = await _ask(prompt, model=SONNET, max_tokens=2500)
     data = _parse_json(raw)
 
     raw_pct = data.get("fit_percentage", 0)
@@ -236,6 +308,10 @@ Rules:
             role_alignment=breakdown_data.get("role_alignment", ""),
         ),
         reasoning_points=data.get("reasoning_points", []),
+        # New advanced fields
+        score_breakdown=data.get("score_breakdown"),
+        strength_mapping=data.get("strength_mapping"),
+        verdict=data.get("verdict"),
     )
 
 
