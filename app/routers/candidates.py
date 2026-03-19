@@ -171,22 +171,17 @@ async def _parse_worker():
 
             candidate.resume_metadata_id = meta.id
 
-            # ── Step 3: Compute fit score from metadata comparison ─────────
+            # ── Step 3: Compute fit score using AI semantic analysis ──────
             if job_id:
                 try:
-                    from app.services.smart_scoring_service import compute_fit_score_for_candidate
-
-                    logger.info("Computing fit score for candidate %s against job %s", candidate_id, job_id)
-                    score_result = compute_fit_score_for_candidate(db, candidate_id, job_id)
-
-                    if score_result:
-                        candidate.resume_fit_score = score_result.fit_level
-                        candidate.fit_score_reasoning = json.dumps(score_result.to_dict())
-                        logger.info("Fit score for candidate %s: %s (%s%%)", candidate_id, score_result.fit_level, score_result.fit_percentage)
+                    logger.info("Computing AI fit score for candidate %s against job %s", candidate_id, job_id)
+                    score_data = await _ai_fit_score_for_candidate(candidate, db)
+                    if score_data:
+                        logger.info("AI fit score for candidate %s: %s%% (%s)", candidate_id, score_data.get("fit_percentage"), score_data.get("fit_level"))
                     else:
-                        logger.warning("Could not compute fit score for candidate %s — missing metadata", candidate_id)
+                        logger.warning("Could not compute AI fit score for candidate %s — missing data", candidate_id)
                 except Exception as fit_exc:
-                    logger.error("Fit score computation FAILED for candidate %s (job %s): %s", candidate_id, job_id, fit_exc, exc_info=True)
+                    logger.error("AI fit score FAILED for candidate %s (job %s): %s", candidate_id, job_id, fit_exc, exc_info=True)
 
             candidate.parsing_status = "completed"
             db.commit()
@@ -552,28 +547,163 @@ async def upload_resumes(
 @router.post(
     "/{candidate_id}/compute-fit-score",
     response_model=CandidateRead,
-    summary="Recompute resume fit score",
-    description="Re-runs Claude LLM fit-score calculation for an existing candidate against their linked job. Requires resume file on disk and a linked `job_id`.",
+    summary="Recompute resume fit score using AI",
+    description="Re-runs AI LLM fit-score with 6-dimension semantic scoring for an existing candidate against their linked job.",
 )
 async def compute_fit_score(candidate_id: int, db: Session = Depends(get_db)):
-    """Re-compute fit score using smart scoring (ML → Algorithm). No AI cost."""
+    """Re-compute fit score using AI semantic analysis (6-dimension model)."""
     candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
     if not candidate.job_id:
         raise HTTPException(status_code=400, detail="Candidate is not linked to a job")
 
-    from app.services.smart_scoring_service import compute_fit_score_for_candidate
-    result = compute_fit_score_for_candidate(db, candidate_id, candidate.job_id)
-
+    result = await _ai_fit_score_for_candidate(candidate, db)
     if not result:
-        raise HTTPException(status_code=400, detail="Could not compute score — missing resume metadata")
+        raise HTTPException(status_code=400, detail="Could not compute score — missing resume text or job data")
 
-    candidate.resume_fit_score = result.fit_level
-    candidate.fit_score_reasoning = json.dumps(result.to_dict())
+    return candidate
+
+
+@router.post(
+    "/batch-recompute-scores",
+    summary="Recompute fit scores for all candidates in a job",
+    description="Re-runs AI semantic fit-score for all candidates linked to the given job_id. Returns progress summary.",
+)
+async def batch_recompute_scores(
+    job_id: int,
+    db: Session = Depends(get_db),
+):
+    """Batch recompute AI fit scores for all candidates in a job opening."""
+    from app.models.job import Job
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    candidates = db.query(Candidate).filter(Candidate.job_id == job_id).all()
+    if not candidates:
+        return {"total": 0, "updated": 0, "failed": 0, "message": "No candidates found"}
+
+    updated = 0
+    failed = 0
+    results = []
+
+    for candidate in candidates:
+        try:
+            result = await _ai_fit_score_for_candidate(candidate, db)
+            if result:
+                updated += 1
+                results.append({
+                    "id": candidate.id,
+                    "name": candidate.name,
+                    "fit_score": result.get("fit_percentage"),
+                    "fit_level": result.get("fit_level"),
+                })
+            else:
+                failed += 1
+        except Exception as e:
+            logger.warning("Batch recompute failed for candidate %s: %s", candidate.id, e)
+            failed += 1
+
+    return {
+        "total": len(candidates),
+        "updated": updated,
+        "failed": failed,
+        "results": results,
+    }
+
+
+async def _ai_fit_score_for_candidate(candidate: Candidate, db: Session) -> dict | None:
+    """
+    Run AI semantic fit-score for a single candidate.
+    Returns the score dict or None if missing data.
+    """
+    from app.models.job import Job
+    from app.services.resume_service import calculate_fit_score, extract_text
+    from app.schemas.ai import FitScoreRequest
+
+    # Get resume text
+    resume_text = None
+    meta = None
+    if candidate.email:
+        meta = db.query(ResumeMetadata).filter(
+            ResumeMetadata.candidate_email == candidate.email
+        ).first()
+    if meta and meta.raw_text:
+        resume_text = meta.raw_text
+    elif candidate.resume and os.path.exists(candidate.resume):
+        try:
+            resume_text = extract_text(candidate.resume)
+        except Exception:
+            pass
+
+    if not resume_text:
+        return None
+
+    # Get job data
+    job = db.query(Job).filter(Job.id == candidate.job_id).first()
+    if not job:
+        return None
+
+    # Build JD text from responsibilities
+    responsibilities = [r.description for r in job.responsibilities] if job.responsibilities else []
+    required_skills = []
+    if job.skills:
+        for s in job.skills:
+            if s.skill:
+                required_skills.append(s.skill)
+            elif s.name:
+                required_skills.append(s.name)
+
+    # Build full JD text from uploaded JD file if available
+    jd_text = None
+    if job.upload_jd and os.path.exists(job.upload_jd):
+        try:
+            jd_text = extract_text(job.upload_jd)
+        except Exception:
+            pass
+
+    req = FitScoreRequest(
+        resume_text=resume_text,
+        job_title=job.title,
+        job_description=jd_text,
+        required_experience_min=job.experience_min,
+        required_experience_max=job.experience_max,
+        required_skills=required_skills,
+        responsibilities=responsibilities,
+    )
+
+    result = await calculate_fit_score(req)
+
+    # Save to candidate
+    score_data = {
+        "fit_level": result.fit_level,
+        "fit_percentage": result.fit_percentage,
+        "summary": result.summary,
+        "key_matching_skills": result.key_matching_skills,
+        "relevant_experience_summary": result.relevant_experience_summary,
+        "missing_weak_areas": result.missing_weak_areas,
+        "reasoning_points": result.reasoning_points,
+        "verdict": result.verdict,
+    }
+    details_data = {
+        "score_breakdown": result.score_breakdown,
+        "strength_mapping": result.strength_mapping,
+        "breakdown": {
+            "experience_match": result.breakdown.experience_match,
+            "skills_match": result.breakdown.skills_match,
+            "tech_stack_alignment": result.breakdown.tech_stack_alignment,
+            "role_alignment": result.breakdown.role_alignment,
+        },
+    }
+
+    candidate.resume_fit_score = f"{result.fit_percentage}%"
+    candidate.fit_score_reasoning = json.dumps(score_data)
+    candidate.fit_score_details = json.dumps(details_data)
     db.commit()
     db.refresh(candidate)
-    return candidate
+
+    return score_data
 
 
 # ── Interview Scheduling ──────────────────────────────────────────────────────
