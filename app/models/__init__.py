@@ -4,7 +4,6 @@ from app.models.job import (
     JobSkill,
     InterviewSettings,
     JobQuestion,
-    JobPreInterviewField,
 )
 from app.models.question import Question
 from app.models.candidate import Candidate

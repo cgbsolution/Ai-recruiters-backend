@@ -39,7 +39,6 @@ from app.schemas.interview import (
     InterviewMessageResponse,
     JobConfig,
     MeetingSlotRead,
-    PreInterviewFieldConfig,
     RecordingUploadResponse,
     ResumeSessionResponse,
     ScheduleMeetingRequest,
@@ -105,15 +104,6 @@ def get_interview_config(token: str, db: Session = Depends(get_db)):
 
     settings_obj = job.interview_settings
     skills = [s.skill for s in job.skills] if job.skills else []
-    pre_fields = [
-        PreInterviewFieldConfig(
-            field_id=f.field_id,
-            label=f.label,
-            type=f.type,
-            is_default=f.is_default,
-        )
-        for f in (job.pre_interview_fields or [])
-    ]
 
     return JobConfig(
         job_id=job.id,
@@ -129,9 +119,13 @@ def get_interview_config(token: str, db: Session = Depends(get_db)):
         webcam_required=settings_obj.webcam_required if settings_obj else True,
         face_match=settings_obj.face_match if settings_obj else False,
         resume_based=settings_obj.resume_based if settings_obj else True,
+        code_editor_required=settings_obj.code_editor_required if settings_obj else True,
+        allow_mobile=settings_obj.allow_mobile if settings_obj else False,
+        secondary_cam=settings_obj.secondary_cam if settings_obj else False,
+        manual_interview=settings_obj.manual_interview if settings_obj else False,
         special_instructions=settings_obj.special_instructions if settings_obj else None,
+        auto_skip_timeout=settings_obj.auto_skip_timeout if settings_obj else 0,
         skills=skills,
-        pre_interview_fields=pre_fields,
     )
 
 
@@ -507,7 +501,6 @@ def register_candidate(
     existing = db.query(Candidate).filter(or_(*filters)).first()
 
     is_existing = bool(existing)
-    extra_json = json.dumps(payload.extra_fields) if payload.extra_fields else None
 
     if existing:
         candidate = existing
@@ -549,7 +542,6 @@ def register_candidate(
             if phone_str:
                 candidate.phone = phone_str
             candidate.resume_path = payload.resume_path
-            candidate.pre_interview_responses = extra_json
             db.commit()
             return CandidateRegisterResponse(
                 session_id=active_session.id,
@@ -586,7 +578,6 @@ def register_candidate(
         if phone_str:
             candidate.phone = phone_str
         candidate.resume_path = payload.resume_path
-        candidate.pre_interview_responses = extra_json
         db.flush()
     else:
         # Create new candidate — use try/except for race condition protection
@@ -598,7 +589,6 @@ def register_candidate(
             job_id=tok.job_id,
             resume_path=payload.resume_path,
             interview_status="Scheduled",
-            pre_interview_responses=extra_json,
         )
         db.add(candidate)
         try:

@@ -1,4 +1,7 @@
-from fastapi import APIRouter, HTTPException, Request
+import os
+import uuid
+
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -35,6 +38,55 @@ async def generate_jd(request: Request, payload: GenerateJDRequest):
         return await ai_service.generate_jd(payload)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI generation failed: {str(e)}")
+
+
+ALLOWED_JD_EXTENSIONS = {".pdf", ".doc", ".docx"}
+
+
+@router.post(
+    "/parse-jd-file",
+    response_model=GenerateJDResponse,
+    summary="Parse uploaded JD file into structured data",
+    description="Accepts a PDF/DOC/DOCX file, extracts text, and uses AI to parse it into the same structured format as generate-jd.",
+)
+@limiter.limit("5/minute")
+async def parse_jd_file(request: Request, file: UploadFile = File(...)):
+    from app.config import settings
+    from app.services.resume_service import extract_text
+
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_JD_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Only PDF, DOC, and DOCX files are accepted")
+
+    content = await file.read()
+    max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    if len(content) > max_bytes:
+        raise HTTPException(status_code=400, detail=f"File exceeds {settings.MAX_UPLOAD_SIZE_MB}MB limit")
+
+    # Save to temp location for text extraction
+    _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+    upload_dir = "/tmp/uploads/jd" if _is_serverless else settings.UPLOAD_DIR
+    os.makedirs(upload_dir, exist_ok=True)
+    filename = f"{uuid.uuid4()}{ext}"
+    path = os.path.join(upload_dir, filename)
+
+    try:
+        with open(path, "wb") as f:
+            f.write(content)
+
+        jd_text = extract_text(path)
+        if not jd_text.strip():
+            raise HTTPException(status_code=422, detail="Could not extract any text from the uploaded file")
+
+        return await ai_service.parse_jd_text(jd_text)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"JD parsing failed: {str(e)}")
+    finally:
+        # Clean up temp file
+        if os.path.exists(path):
+            os.remove(path)
 
 
 @router.post(

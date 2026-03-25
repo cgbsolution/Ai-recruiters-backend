@@ -34,20 +34,25 @@ def _build_system_prompt(job: Job, candidate: Candidate, settings_obj: Optional[
     mode = settings_obj.mode.value if settings_obj else "TRADITIONAL"
     special = settings_obj.special_instructions if settings_obj and settings_obj.special_instructions else "None"
 
+    resume_based = settings_obj.resume_based if settings_obj else True
+
     resume_context = ""
     if candidate:
         resume_context = f"""
 Candidate Background:
 - Name: {candidate.name}
 - Role Applied For: {candidate.role or job.title}
-- Resume Fit Score: {candidate.resume_fit_score or "not computed"}
 """
-        if candidate.fit_score_reasoning:
-            try:
-                reasoning = json.loads(candidate.fit_score_reasoning)
-                resume_context += f"- Resume Summary: {reasoning.get('summary', '')}\n"
-            except Exception:
-                pass
+        if resume_based:
+            resume_context += f"- Resume Fit Score: {candidate.resume_fit_score or 'not computed'}\n"
+            if candidate.fit_score_reasoning:
+                try:
+                    reasoning = json.loads(candidate.fit_score_reasoning)
+                    resume_context += f"- Resume Summary: {reasoning.get('summary', '')}\n"
+                except Exception:
+                    pass
+        else:
+            resume_context += "- NOTE: Resume-based questions are DISABLED. Do NOT ask questions about the candidate's resume, past projects, or specific work history. Focus only on the job description, required skills, and general technical/behavioral questions.\n"
 
     return f"""You are Alex, a senior professional interviewer with 15+ years of experience hiring top talent. You conduct interviews like a real, intelligent human — not a chatbot reading scripted questions. Your behavior must be natural, responsive, and low-latency — similar to a real human interviewer on a live video call.
 
@@ -59,6 +64,12 @@ Interview Mode: {mode}
 Max Questions: {max_q}
 Special Instructions: {special}
 {resume_context}
+
+═══════════════════════════════════════════════════════════════
+INTERVIEW MODE INSTRUCTIONS (CRITICAL — shapes ALL your questions)
+═══════════════════════════════════════════════════════════════
+
+{"TRADITIONAL MODE: Ask standard, direct questions focused on the candidates experience, technical knowledge, and problem-solving approach. Questions should be concise and structured. Focus on: fundamental competency, key concepts and tools, past project experience, communication clarity, and practical awareness. Keep each question short and focused — one clear question at a time. This is a structured interview; do NOT use hypothetical scenarios or open-ended situational prompts." if mode == "TRADITIONAL" else "SCENARIO-BASED MODE: Present in-depth, real-world scenarios to evaluate how the candidate approaches complex, open-ended situations in practical settings. Each question must be framed within a realistic context that simulates challenges one might face on the job. Focus on: critical thinking, structured problem-solving, navigating ambiguity, and depth of analysis. Questions will naturally be longer and more detailed than traditional questions — this is expected. Give the candidate time and space to think through their response. Ask follow-ups that probe deeper into their reasoning and trade-off decisions."}
 
 ═══════════════════════════════════════════════════════════════
 REAL-TIME CONVERSATIONAL RULES (CRITICAL)
@@ -464,11 +475,59 @@ async def generate_evaluation(session: InterviewSession, db: Session) -> Evaluat
 
     skills = ", ".join([s.skill for s in job.skills]) if job and job.skills else "general"
 
+    # ── Resolve scoring leniency & custom instructions ──
+    interview_settings = job.interview_settings if job else None
+    scoring_mode = (interview_settings.scoring if interview_settings and interview_settings.scoring else None) or (job.evaluation_scoring if job else None) or "Standard Evaluation"
+
+    # Determine if scoring field contains custom instructions (longer text) vs a mode label
+    known_modes = {"Standard Evaluation", "Lenient", "Strict"}
+    if scoring_mode in known_modes:
+        custom_instructions = ""
+    else:
+        # Custom instructions were stored in the scoring field
+        custom_instructions = scoring_mode
+        scoring_mode = job.evaluation_scoring if job and job.evaluation_scoring in known_modes else "Standard Evaluation"
+
+    scoring_guidance = {
+        "Lenient": (
+            "SCORING MODE: LENIENT\n"
+            "- Be more forgiving in your evaluation.\n"
+            "- Reward effort, intent, and partial correctness generously.\n"
+            "- Do not heavily penalize minor mistakes, incomplete answers, or slight inaccuracies.\n"
+            "- This is suitable for fresher or junior-level candidates.\n"
+            "- Scores should trend higher — give credit for demonstrating understanding even if details are missing.\n"
+            "- Recommendation thresholds: Strong Hire >= 70, Hire >= 55, Maybe >= 40, No Hire < 40"
+        ),
+        "Strict": (
+            "SCORING MODE: STRICT\n"
+            "- Apply a highly critical evaluation approach.\n"
+            "- Require precise, complete, and well-structured answers.\n"
+            "- Penalize missing details, vague explanations, and weak reasoning.\n"
+            "- This is suitable for senior or expert-level roles.\n"
+            "- Scores should be lower unless the answer is near-perfect.\n"
+            "- Recommendation thresholds: Strong Hire >= 90, Hire >= 75, Maybe >= 60, No Hire < 60"
+        ),
+        "Standard Evaluation": (
+            "SCORING MODE: STANDARD\n"
+            "- Use a balanced evaluation approach.\n"
+            "- Consider correctness, clarity, and overall understanding.\n"
+            "- Allow minor mistakes but apply reasonable deductions.\n"
+            "- Provide fair and moderate scoring.\n"
+            "- Recommendation thresholds: Strong Hire >= 80, Hire >= 65, Maybe >= 50, No Hire < 50"
+        ),
+    }.get(scoring_mode, "SCORING MODE: STANDARD\n- Use a balanced evaluation approach.\n- Recommendation thresholds: Strong Hire >= 80, Hire >= 65, Maybe >= 50, No Hire < 50")
+
+    custom_section = ""
+    if custom_instructions:
+        custom_section = f"\n\nADDITIONAL EVALUATION INSTRUCTIONS (from recruiter):\n{custom_instructions}\nIncorporate these instructions into your evaluation and adjust scoring focus accordingly."
+
     prompt = f"""You are a senior technical evaluator. Analyse the following interview transcript and produce a structured evaluation.
 
 Position: {job.title if job else 'Unknown'}
 Required Skills: {skills}
 Candidate: {candidate.name if candidate else 'Unknown'}
+
+{scoring_guidance}{custom_section}
 
 TRANSCRIPT:
 {transcript}
@@ -486,17 +545,15 @@ Also evaluate these ADDITIONAL dimensions (score 0-100):
 8. conciseness_score: Ability to give focused, to-the-point answers without rambling
 9. clarity_score: Logical flow and ease of understanding in responses
 
+IMPORTANT: You MUST strictly follow the scoring mode guidelines above. The same answer should produce higher scores in Lenient mode, moderate scores in Standard mode, and lower scores in Strict mode.
+
 Then provide:
 - overall_score: Weighted average (technical 40%, communication 25%, problem_solving 25%, confidence 10%)
-- recommendation: One of "Strong Hire", "Hire", "Maybe", "No Hire"
-  - "Strong Hire": overall >= 80
-  - "Hire": overall >= 65
-  - "Maybe": overall >= 50
-  - "No Hire": overall < 50
+- recommendation: One of "Strong Hire", "Hire", "Maybe", "No Hire" — use the thresholds specified in the scoring mode above
 - summary: 2-3 sentence executive summary
 - strengths: List of 3-5 specific strengths observed
 - weaknesses: List of 2-4 specific areas for improvement
-- detailed_feedback: 1-2 paragraphs of detailed assessment
+- detailed_feedback: 1-2 paragraphs of detailed assessment including how the scoring mode influenced the evaluation
 
 Return ONLY valid JSON:
 {{
@@ -549,7 +606,7 @@ Return ONLY valid JSON:
         strengths=json.dumps(data.get("strengths", [])),
         weaknesses=json.dumps(data.get("weaknesses", [])),
         detailed_feedback=data.get("detailed_feedback", ""),
-        meets_threshold=overall >= 65,
+        meets_threshold=overall >= {"Lenient": 55, "Strict": 75}.get(scoring_mode, 65),
     )
     db.add(evaluation)
 

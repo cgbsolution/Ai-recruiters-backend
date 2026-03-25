@@ -38,12 +38,6 @@ class QuestionIn(BaseModel):
     difficulty: str = "medium"
 
 
-class PreInterviewFieldIn(BaseModel):
-    id: str
-    label: str
-    type: str
-    is_default: bool = False
-
 
 # ── Request Schemas ──────────────────────────────────────────────────────────
 
@@ -69,7 +63,6 @@ class JobCreate(BaseModel):
     mix_of_questions: str = "MIX"
     questions: List[QuestionIn] = []
     allow_to_contact: bool = False
-    pre_interview_fields: List[PreInterviewFieldIn] = []
     upload_jd: Optional[str] = ""
 
 
@@ -119,14 +112,6 @@ class QuestionOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class PreInterviewFieldOut(BaseModel):
-    id: int
-    field_id: str
-    label: str
-    type: str
-    is_default: bool
-    model_config = {"from_attributes": True}
-
 
 class JobRead(BaseModel):
     id: int
@@ -157,7 +142,6 @@ class JobRead(BaseModel):
     skills: List[SkillOut] = []
     interview_settings: Optional[InterviewSettingsOut] = None
     questions: List[QuestionOut] = []
-    pre_interview_fields: List[PreInterviewFieldOut] = []
     interview_token: Optional[str] = None
     summary: Optional[str] = None
     model_config = {"from_attributes": True}

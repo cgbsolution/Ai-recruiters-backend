@@ -7,7 +7,6 @@ from app.models.candidate import Candidate
 from app.models.job import (
     InterviewSettings,
     Job,
-    JobPreInterviewField,
     JobQuestion,
     JobResponsibility,
     JobSkill,
@@ -52,15 +51,6 @@ def _insert_children(db: Session, job: Job, data: JobCreate) -> None:
             text=q.text,
             category=q.category,
             difficulty=q.difficulty,
-        ))
-
-    for f in data.pre_interview_fields:
-        db.add(JobPreInterviewField(
-            job_id=job.id,
-            field_id=f.id,
-            label=f.label,
-            type=f.type,
-            is_default=f.is_default,
         ))
 
 
@@ -129,7 +119,6 @@ def update_job(db: Session, job_id: int, data: JobUpdate) -> Optional[Job]:
     db.query(JobSkill).filter_by(job_id=job_id).delete()
     db.query(InterviewSettings).filter_by(job_id=job_id).delete()
     db.query(JobQuestion).filter_by(job_id=job_id).delete()
-    db.query(JobPreInterviewField).filter_by(job_id=job_id).delete()
     db.flush()
 
     _insert_children(db, job, data)
@@ -164,7 +153,6 @@ def delete_job(db: Session, job_id: int) -> bool:
     db.query(JobSkill).filter(JobSkill.job_id == job_id).delete(synchronize_session="fetch")
     db.query(JobResponsibility).filter(JobResponsibility.job_id == job_id).delete(synchronize_session="fetch")
     db.query(JobQuestion).filter(JobQuestion.job_id == job_id).delete(synchronize_session="fetch")
-    db.query(JobPreInterviewField).filter(JobPreInterviewField.job_id == job_id).delete(synchronize_session="fetch")
     db.query(InterviewSettings).filter(InterviewSettings.job_id == job_id).delete(synchronize_session="fetch")
 
     # Job metadata
@@ -186,9 +174,10 @@ def get_stats(db: Session) -> List[Dict[str, Any]]:
 
     active_jobs = db.query(func.count(Job.id)).filter(Job.status == JobStatus.open).scalar() or 0
     finished_jobs = db.query(func.count(Job.id)).filter(Job.status == JobStatus.inactive).scalar() or 0
-    interview_count = db.query(func.count(Candidate.id)).filter(Candidate.status == CandidateStatus.interview).scalar() or 0
-    offered_count = db.query(func.count(Candidate.id)).filter(Candidate.status == CandidateStatus.offered).scalar() or 0
-    waiting_count = db.query(func.count(Candidate.id)).filter(Candidate.status == CandidateStatus.applied).scalar() or 0
+    # Only count candidates that belong to an existing job
+    interview_count = db.query(func.count(Candidate.id)).filter(Candidate.status == CandidateStatus.interview, Candidate.job_id.isnot(None)).scalar() or 0
+    offered_count = db.query(func.count(Candidate.id)).filter(Candidate.status == CandidateStatus.offered, Candidate.job_id.isnot(None)).scalar() or 0
+    waiting_count = db.query(func.count(Candidate.id)).filter(Candidate.status == CandidateStatus.applied, Candidate.job_id.isnot(None)).scalar() or 0
 
     return [
         {

@@ -33,9 +33,6 @@ JOB_PAYLOAD = {
     "mix_of_questions": "MIX",
     "questions": [{"text": "Explain async/await", "category": "Python", "difficulty": "intermediate"}],
     "allow_to_contact": True,
-    "pre_interview_fields": [
-        {"id": "full_name", "label": "Full Name", "type": "text", "is_default": True}
-    ],
     "upload_jd": "",
 }
 

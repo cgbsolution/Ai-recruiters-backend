@@ -76,9 +76,6 @@ class Job(Base):
     questions = relationship(
         "JobQuestion", back_populates="job", cascade="all, delete-orphan"
     )
-    pre_interview_fields = relationship(
-        "JobPreInterviewField", back_populates="job", cascade="all, delete-orphan"
-    )
 
 
 class JobResponsibility(Base):
@@ -137,14 +134,3 @@ class JobQuestion(Base):
     job = relationship("Job", back_populates="questions")
 
 
-class JobPreInterviewField(Base):
-    __tablename__ = "job_pre_interview_fields"
-
-    id = Column(Integer, primary_key=True, index=True)
-    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
-    field_id = Column(String(100))
-    label = Column(String(255))
-    type = Column(String(50))
-    is_default = Column(Boolean, default=False)
-
-    job = relationship("Job", back_populates="pre_interview_fields")

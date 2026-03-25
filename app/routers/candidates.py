@@ -126,8 +126,51 @@ async def _parse_worker():
                     Candidate.id != candidate.id,
                 ).first()
                 if existing:
-                    # Duplicate — update existing, delete this placeholder
+                    # Duplicate — update existing candidate with new resume data, delete placeholder
                     existing.resume_path = file_path
+                    existing.name = parsed.get("candidate_name") or existing.name
+                    existing.phone = parsed.get("phone") or existing.phone
+                    existing.location = parsed.get("location") or existing.location
+                    existing.role = parsed.get("current_designation") or existing.role
+                    existing.parsing_status = "processing"
+
+                    # Update ResumeMetadata for existing candidate
+                    ex_meta = db.query(ResumeMetadata).filter(
+                        ResumeMetadata.candidate_email == real_email
+                    ).first()
+                    if not ex_meta:
+                        ex_meta = ResumeMetadata(candidate_email=real_email)
+                        db.add(ex_meta)
+                    ex_meta.candidate_name = parsed.get("candidate_name")
+                    ex_meta.phone = parsed.get("phone")
+                    ex_meta.current_designation = parsed.get("current_designation")
+                    ex_meta.experience_years = parsed.get("experience_years")
+                    ex_meta.skills = json.dumps(parsed.get("skills", []))
+                    ex_meta.education = json.dumps(parsed.get("education", []))
+                    ex_meta.certifications = json.dumps(parsed.get("certifications", []))
+                    ex_meta.work_experience = json.dumps(parsed.get("work_experience", []))
+                    ex_meta.location = parsed.get("location")
+                    ex_meta.personal_details = json.dumps(parsed.get("personal_details") or {})
+                    ex_meta.keywords = json.dumps(parsed.get("keywords", []))
+                    ex_meta.summary = parsed.get("summary")
+                    ex_meta.resume_file_path = file_path
+                    ex_meta.raw_text = resume_text
+                    ex_meta.parsing_status = "completed"
+                    ex_meta.parsed_at = datetime.utcnow()
+                    db.flush()
+
+                    existing.resume_metadata_id = ex_meta.id
+
+                    # Compute fit score for existing candidate
+                    if job_id:
+                        try:
+                            logger.info("Computing AI fit score for duplicate candidate %s against job %s", existing.id, job_id)
+                            score_data = await _ai_fit_score_for_candidate(existing, db, resume_text=resume_text)
+                            if score_data:
+                                logger.info("AI fit score for candidate %s: %s%% (%s)", existing.id, score_data.get("fit_percentage"), score_data.get("fit_level"))
+                        except Exception as fit_exc:
+                            logger.error("AI fit score FAILED for candidate %s: %s", existing.id, fit_exc, exc_info=True)
+
                     existing.parsing_status = "completed"
                     db.delete(candidate)
                     db.commit()
@@ -175,7 +218,7 @@ async def _parse_worker():
             if job_id:
                 try:
                     logger.info("Computing AI fit score for candidate %s against job %s", candidate_id, job_id)
-                    score_data = await _ai_fit_score_for_candidate(candidate, db)
+                    score_data = await _ai_fit_score_for_candidate(candidate, db, resume_text=resume_text)
                     if score_data:
                         logger.info("AI fit score for candidate %s: %s%% (%s)", candidate_id, score_data.get("fit_percentage"), score_data.get("fit_level"))
                     else:
@@ -613,31 +656,33 @@ async def batch_recompute_scores(
     }
 
 
-async def _ai_fit_score_for_candidate(candidate: Candidate, db: Session) -> dict | None:
+async def _ai_fit_score_for_candidate(candidate: Candidate, db: Session, resume_text: str | None = None) -> dict | None:
     """
     Run AI semantic fit-score for a single candidate.
     Returns the score dict or None if missing data.
+    Accepts optional resume_text to skip re-extraction.
     """
     from app.models.job import Job
     from app.services.resume_service import calculate_fit_score, extract_text
     from app.schemas.ai import FitScoreRequest
 
-    # Get resume text
-    resume_text = None
-    meta = None
-    if candidate.email:
-        meta = db.query(ResumeMetadata).filter(
-            ResumeMetadata.candidate_email == candidate.email
-        ).first()
-    if meta and meta.raw_text:
-        resume_text = meta.raw_text
-    elif candidate.resume and os.path.exists(candidate.resume):
-        try:
-            resume_text = extract_text(candidate.resume)
-        except Exception:
-            pass
+    # Get resume text if not provided
+    if not resume_text:
+        meta = None
+        if candidate.email:
+            meta = db.query(ResumeMetadata).filter(
+                ResumeMetadata.candidate_email == candidate.email
+            ).first()
+        if meta and meta.raw_text:
+            resume_text = meta.raw_text
+        if not resume_text and candidate.resume_path and os.path.exists(candidate.resume_path):
+            try:
+                resume_text = extract_text(candidate.resume_path)
+            except Exception as e:
+                logger.warning("Failed to extract text from %s: %s", candidate.resume_path, e)
 
     if not resume_text:
+        logger.warning("No resume text found for candidate %s (email=%s, resume_path=%s)", candidate.id, candidate.email, candidate.resume_path)
         return None
 
     # Get job data
@@ -655,13 +700,27 @@ async def _ai_fit_score_for_candidate(candidate: Candidate, db: Session) -> dict
             elif s.name:
                 required_skills.append(s.name)
 
-    # Build full JD text from uploaded JD file if available
+    # Build full JD text from uploaded JD file or structured data
     jd_text = None
     if job.upload_jd and os.path.exists(job.upload_jd):
         try:
             jd_text = extract_text(job.upload_jd)
         except Exception:
             pass
+
+    # If no uploaded JD, synthesize from structured data so AI has full context
+    if not jd_text and (required_skills or responsibilities):
+        parts = [f"Job Title: {job.title}"]
+        if job.department:
+            parts.append(f"Department: {job.department}")
+        if job.experience_min is not None:
+            parts.append(f"Experience Required: {job.experience_min}-{job.experience_max} years")
+        if required_skills:
+            parts.append(f"Required Skills: {', '.join(required_skills)}")
+        if responsibilities:
+            parts.append("Key Responsibilities:")
+            parts.extend(f"- {r}" for r in responsibilities)
+        jd_text = "\n".join(parts)
 
     req = FitScoreRequest(
         resume_text=resume_text,

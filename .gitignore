@@ -3,10 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 .env
-uploads/jd/*
-!uploads/jd/.gitkeep
-uploads/resumes/
-uploads/recordings/
+uploads/
 resume_export.json
 *.egg-info/
 dist/

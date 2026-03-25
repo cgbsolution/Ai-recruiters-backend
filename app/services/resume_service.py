@@ -2,10 +2,14 @@
 Resume parsing and fit-score calculation.
 
 PDF text extraction uses pdfplumber; DOCX uses python-docx.
-LLM calls (Anthropic Claude) are delegated to ai_service helpers.
+LLM calls are delegated to ai_service helpers (provider-agnostic).
+
+Uses an enterprise-grade ATS engine prompt for deterministic,
+production-quality resume parsing and JD fit scoring.
 """
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Optional
@@ -18,6 +22,8 @@ from app.schemas.ai import (
     ParsedResumeData,
     FitScoreBreakdown,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ── Text Extraction ───────────────────────────────────────────────────────────
@@ -66,60 +72,115 @@ def extract_text(file_path: str) -> str:
 # ── LLM-backed Resume Parsing ─────────────────────────────────────────────────
 
 async def parse_resume(req: ParseResumeRequest) -> ParseResumeResponse:
-    """Use Claude to extract structured data from raw resume text."""
+    """
+    Enterprise-grade ATS resume parser.
+    Reads every word of the resume and extracts structured data deterministically.
+    """
     from app.services.ai_service import _ask, _parse_json, SONNET
 
-    prompt = f"""You are an expert HR assistant that extracts structured information from resumes.
-Given the following resume text, extract all relevant information.
+    resume_text = req.resume_text[:10000]
+
+    prompt = f"""You are an enterprise-grade ATS (Applicant Tracking System) resume parser.
+Your job is to extract ALL structured information from the resume with maximum accuracy.
+You must behave as a deterministic system, not a chatbot.
+
+RESUME TEXT:
+\"\"\"
+{resume_text}
+\"\"\"
+
 Return ONLY valid JSON — no markdown fences, no extra text.
 
-Resume Text:
-\"\"\"
-{req.resume_text[:6000]}
-\"\"\"
-
-Return JSON in EXACTLY this format:
 {{
-  "name": "Full name of the candidate or null",
+  "name": "Full name or null",
   "email": "Email address or null",
   "phone": "Phone number or null",
   "location": "City, Country or null",
-  "experience_years": <number or null>,
+  "experience_years": null,
   "current_role": "Most recent job title or null",
-  "current_designation": "Current or most recent designation/title or null",
-  "skills": ["skill1", "skill2", ...],
-  "education": ["Degree, Institution, Year", ...],
-  "certifications": ["Certification name", ...],
-  "work_experience": [
-    {{
-      "title": "Job title",
-      "company": "Company name",
-      "duration": "Start - End",
-      "description": "Brief description"
-    }}
-  ],
-  "personal_details": {{
-    "date_of_birth": "DOB or null",
-    "gender": "Gender or null",
-    "languages": ["Language1", "Language2"],
-    "nationality": "Nationality or null",
-    "marital_status": "Status or null"
-  }},
-  "keywords": ["keyword1", "keyword2", ...],
-  "summary": "2-3 sentence professional summary of the candidate"
+  "current_designation": "Current designation/title or null",
+  "skills": [],
+  "education": [],
+  "certifications": [],
+  "work_experience": [],
+  "personal_details": {{}},
+  "keywords": [],
+  "summary": ""
 }}
 
-Rules:
-- experience_years should be a number (e.g. 4.5 for 4 years 6 months)
-- skills should be a flat list of individual technologies/tools/soft skills
-- certifications should list any professional certifications (AWS, PMP, etc.)
-- keywords should be 10-20 important terms from the resume useful for search/matching (job titles, domains, technologies, industries)
-- personal_details: extract whatever personal info is available; use null for missing fields
-- If a field cannot be determined, use null
-- For empty arrays use []
+SKILLS EXTRACTION (CRITICAL — THIS IS THE MOST IMPORTANT PART):
+
+Many resumes do NOT have a separate "Skills" section. You MUST extract skills from EVERY section:
+- Professional summary / objective
+- Work experience bullet points and descriptions
+- Project descriptions
+- Achievement statements
+- Certifications and education
+
+SKILL NORMALIZATION RULES:
+- React.js / ReactJS / React JS → "React"
+- Node.js / NodeJS → "Node.js"
+- Next.js → "Next.js" (keep as is)
+- PostgreSQL / Postgres → "PostgreSQL"
+- MongoDB / Mongo → "MongoDB"
+- Amazon Web Services → "AWS"
+- Google Cloud Platform → "GCP"
+- Microsoft Azure → "Azure"
+- Kubernetes / K8s → "Kubernetes"
+- CI/CD / CICD → "CI/CD"
+
+DOMAIN SKILL EXTRACTION — extract from CONTEXT, not just keywords:
+- "conducted IS audits" → "IS Auditing"
+- "PCI-DSS compliance assessments" → "PCI-DSS"
+- "managed team of 5" → "Team Leadership"
+- "performed vulnerability assessments" → "Vulnerability Assessment"
+- "risk assessment and gap analysis" → "Risk Assessment", "Gap Analysis"
+- "ITGC testing" → "ITGC", "IT Controls"
+- "SOX compliance" → "SOX"
+- "ISO 27001 audits" → "ISO 27001"
+- "GDPR implementation" → "GDPR"
+- "stakeholder management" → "Stakeholder Management"
+- "project management" → "Project Management"
+- "developed security policies" → "Security Policy Development"
+
+RULES:
+- Remove duplicate skills (after normalization)
+- Keep ONLY technical + domain skills (ignore generic soft skills like "hardworking", "team player")
+- BUT keep measurable/professional skills: "Team Leadership", "Stakeholder Management", "Project Management"
+- Be EXHAUSTIVE — extract 20-60 skills for experienced candidates
+- Each skill = SHORT label (1-4 words)
+
+EXPERIENCE EXTRACTION:
+- Extract ALL positions — most recent first
+- Each entry: {{"title": "", "company": "", "duration": "Start - End", "description": "responsibilities and achievements"}}
+- If company missing → discard entry
+- If role unclear → DO NOT guess
+- Calculate experience_years from work history (e.g. 4.5 for 4 years 6 months). Round to 1 decimal.
+
+EDUCATION:
+- Format: ["Degree, Institution, Year"]
+- Only extract if clearly present
+
+CERTIFICATIONS:
+- Extract ALL: CISA, CISSP, AWS SAA, PMP, ISO Lead Auditor, CEH, OSCP, etc.
+
+KEYWORDS:
+- 15-25 terms useful for search/matching (job titles, domains, technologies, industries, certifications)
+
+SUMMARY:
+- 2-3 sentence professional summary
+
+PERSONAL DETAILS:
+- {{"date_of_birth": null, "gender": null, "languages": [], "nationality": null, "marital_status": null}}
+- Extract whatever is available, null for missing
+
+STRICT RULES:
+- NEVER hallucinate data — if not present, return null or empty
+- NEVER guess missing information
+- Output MUST be valid JSON only
 """
 
-    raw = await _ask(prompt, model=SONNET, max_tokens=2048)
+    raw = await _ask(prompt, model=SONNET, max_tokens=3500)
     data = _parse_json(raw)
 
     parsed = ParsedResumeData(
@@ -149,142 +210,187 @@ Rules:
 
 async def calculate_fit_score(req: FitScoreRequest) -> FitScoreResponse:
     """
-    Advanced AI Resume-to-JD semantic matching engine.
-    Uses a 6-dimension weighted scoring model with skill normalization,
-    semantic matching, and contextual understanding — NOT keyword matching.
+    Enterprise-grade ATS fit score engine.
+    Deterministic resume-to-JD matching with weighted scoring model.
+    Behaves like a production ATS system — no hallucination, no inflation.
     """
     from app.services.ai_service import _ask, _parse_json, SONNET
 
-    skills_str = ", ".join(req.required_skills) if req.required_skills else "Not specified"
-    responsibilities_str = "\n".join(f"- {r}" for r in req.responsibilities) if req.responsibilities else "Not specified"
-    exp_range = f"{req.required_experience_min}-{req.required_experience_max} years" if req.required_experience_min is not None else "Not specified"
+    required_skills_list = req.required_skills if req.required_skills else []
+    responsibilities_list = req.responsibilities if req.responsibilities else []
 
-    # Include full JD text if available for deeper semantic matching
-    jd_text_section = ""
+    required_skills_str = json.dumps(required_skills_list)
+    responsibilities_str = json.dumps(responsibilities_list)
+
+    # Build JD context
+    jd_section = ""
     if req.job_description:
-        jd_text_section = f"""
-Full Job Description:
+        jd_section = f"""
+Full Job Description Text:
 \"\"\"
-{req.job_description[:4000]}
+{req.job_description[:5000]}
 \"\"\"
 """
 
-    prompt = f"""You are an advanced AI Resume Parsing and JD Matching Engine. Think like a SENIOR HIRING MANAGER.
+    exp_min = req.required_experience_min if req.required_experience_min is not None else 0
+    exp_max = req.required_experience_max if req.required_experience_max is not None else 0
 
-Your job is to perform DEEP SEMANTIC MATCHING between a candidate's resume and the job description.
-Use contextual understanding — NOT simple keyword matching.
+    resume_text = req.resume_text[:10000]
 
-CRITICAL RULES:
-- Match EQUIVALENT skills even if wording differs (e.g. "ITGC" == "IS Auditing", "Gap analysis" == "Risk Management")
-- DO NOT penalize for missing exact keywords if equivalent experience is demonstrated
-- DO reward equivalent/transferable experience inferred from context
-- DO NOT mark a skill as missing if it can be reasonably inferred from the candidate's projects/experience
-- Penalize ONLY if a required competency is truly absent
-- Be strict but FAIR — realistic scoring: 70-85 for good candidates, not artificially low
+    prompt = f"""You are an enterprise-grade ATS (Applicant Tracking System) engine.
+Your job is to calculate a precise FIT SCORE between a candidate's resume and a job description.
+You must behave as a deterministic system, not a chatbot.
 
 ---
 
-JOB DESCRIPTION:
+INPUT:
+
+Job Description:
 - Title: {req.job_title}
-- Experience Required: {exp_range}
-- Required Skills: {skills_str}
-- Key Responsibilities:
-{responsibilities_str}
-{jd_text_section}
+- Required Experience: {exp_min}-{exp_max} years
+- Required Skills: {required_skills_str}
+- Key Responsibilities: {responsibilities_str}
+{jd_section}
 
-CANDIDATE RESUME:
+Candidate Resume:
 \"\"\"
-{req.resume_text[:6000]}
+{resume_text}
 \"\"\"
 
 ---
 
-SCORING MODEL (6 dimensions, total 100):
+STEP 1: PARSE THE RESUME
 
-1. Core Skills Match (40 points):
-   - % of required skills matched via SEMANTIC comparison
-   - Map raw skills to normalized categories (e.g. "Nessus, Qualys" → "Vulnerability Management")
-   - Include skills found in experience/projects sections, not just listed skills
+Read EVERY WORD of the resume. Extract:
+- All skills (from ALL sections — summary, experience, projects, certifications, NOT just a skills section)
+- All work experience with roles, companies, durations
+- Total experience in years
+- Education and certifications
 
-2. Experience Fit (15 points):
-   - Years of experience match
-   - Domain/industry relevance
-   - Seniority level alignment
+SKILL NORMALIZATION — apply before matching:
+- React.js / ReactJS → React
+- Node.js / NodeJS → Node.js
+- Next.js → Next.js (keep)
+- Remove duplicates
+- Keep only technical + domain skills (ignore "team player", "hardworking")
+- BUT keep professional skills: "Team Leadership", "Stakeholder Management", "Project Management"
 
-3. Responsibility Match (15 points):
-   - How well past roles align with JD responsibilities
-   - End-to-end ownership signals
-   - Project complexity alignment
+DOMAIN SKILL EXTRACTION — extract from context:
+- "conducted IS audits" → "IS Auditing"
+- "PCI-DSS compliance" → "PCI-DSS"
+- "managed team" → "Team Leadership"
+- "vulnerability assessments" → "Vulnerability Assessment"
+- "risk assessment" → "Risk Assessment"
+- "ITGC testing" → "ITGC"
+- "SOX compliance" → "SOX"
+- "ISO 27001" → "ISO 27001"
+- "GDPR" → "GDPR"
+- "NIST CSF" → "NIST CSF"
+- "COBIT" → "COBIT"
 
-4. Tools & Technology (10 points):
-   - Specific tools, platforms, frameworks match
-   - Adjacent/equivalent tool experience counts
-
-5. Leadership & Ownership (10 points):
-   - Team management, mentoring, stakeholder management
-   - Project ownership and initiative signals
-   - Cross-functional collaboration
-
-6. Compliance & Domain Coverage (10 points):
-   - Regulatory frameworks (GDPR, SOX, HIPAA, PCI-DSS, etc.)
-   - Industry-specific domain knowledge
-   - Certifications relevance
+ROLE NORMALIZATION:
+- SDE / Developer / Software Dev → Software Engineer
+- Frontend Dev → Frontend Developer
+- IS Auditor / IT Auditor → Information Systems Auditor
 
 ---
+
+STEP 2: FIT SCORE CALCULATION (Total = 100 points)
+
+1. SKILLS MATCH (40 points):
+   - Required skills matching = 30 points
+   - Preferred/additional skills = 10 points
+   - Use SEMANTIC matching: React == React.js, ITGC == IT General Controls
+   - "Gap analysis" ≈ "Risk Assessment" (related domain)
+   - If resume says "conducted PCI-DSS audits" → PCI-DSS is matched
+   - Score = (matched_required / total_required) * 30 + (matched_preferred / total_preferred) * 10
+
+2. EXPERIENCE MATCH (30 points):
+   - Compare candidate total experience vs required {exp_min}-{exp_max} years
+   - If equal or higher → full 30 points
+   - If lower → proportional (e.g. 3 years for 5-year req → 3/5 * 30 = 18)
+   - Also evaluate RELEVANCE of experience to the JD roles/domain
+
+3. ROLE MATCH (20 points):
+   - Match resume job titles/roles against JD title and responsibilities
+   - Frontend Developer ≈ React Developer (high match)
+   - IS Auditor ≈ Project Leader IS Audit (high match)
+   - Software Engineer ≈ Backend Developer if skills align
+
+4. EDUCATION MATCH (10 points):
+   - If JD explicitly requires specific education → score based on match
+   - If JD has no education requirements → give full 10 points
+
+---
+
+STEP 3: GENERATE OUTPUT
 
 Return ONLY valid JSON — no markdown fences, no extra text:
-{{
-  "fit_level": "high" | "medium" | "low",
-  "fit_percentage": <integer 0-100>,
-  "summary": "2-3 sentence overall fit assessment written like a senior recruiter's verdict",
 
-  "strength_mapping": {{
-    "strong_matches": [
-      "Skill/area with high alignment — brief evidence from resume"
-    ],
-    "partial_matches": [
-      "Skill/area with partial coverage — what's present and what's weak"
-    ],
-    "gaps": [
-      "Required skill/area that is truly absent from the resume"
-    ]
-  }},
+{{
+  "fit_level": "high or medium or low",
+  "fit_percentage": 0,
+  "summary": "2-3 sentence overall fit assessment like a senior recruiter verdict",
 
   "score_breakdown": {{
-    "core_skills": <0-40>,
-    "experience_fit": <0-15>,
-    "responsibility_match": <0-15>,
-    "tools_technology": <0-10>,
-    "leadership_ownership": <0-10>,
-    "compliance_domain": <0-10>
+    "core_skills": 0,
+    "experience_fit": 0,
+    "responsibility_match": 0,
+    "tools_technology": 0,
+    "leadership_ownership": 0,
+    "compliance_domain": 0
   }},
 
-  "key_matching_skills": [
-    "Matched skill with evidence (3-10 items)"
-  ],
-  "relevant_experience_summary": "Concise 3-5 sentence paragraph synthesizing ONLY the candidate's experience directly relevant to this JD. Do NOT copy-paste resume text.",
-  "missing_weak_areas": [
-    "JD requirement NOT clearly evidenced in resume (2-6 items)"
-  ],
-  "breakdown": {{
-    "experience_match": "Detailed assessment of experience years + domain fit",
-    "skills_match": "Detailed assessment of skills overlap (semantic, not keyword)",
-    "tech_stack_alignment": "Specific tools/tech overlap analysis",
-    "role_alignment": "How past roles map to this JD's responsibilities"
+  "strength_mapping": {{
+    "strong_matches": ["Skill/area with high alignment — evidence from resume"],
+    "partial_matches": ["Skill/area with partial coverage — what is present and weak"],
+    "gaps": ["Required skill/area truly absent from resume"]
   }},
-  "reasoning_points": [
-    "Key positive or negative observation (4-6 items)"
-  ],
-  "verdict": "One-line hiring recommendation (e.g. 'Strong fit for Senior role, slightly junior for Lead position')"
+
+  "key_matching_skills": ["Matched skill 1", "Matched skill 2"],
+  "missing_weak_areas": ["Missing requirement 1", "Missing requirement 2"],
+
+  "relevant_experience_summary": "3-5 sentence paragraph of candidate experience relevant to this JD",
+
+  "breakdown": {{
+    "experience_match": "Assessment of experience years + domain fit",
+    "skills_match": "Assessment of skills overlap using semantic matching",
+    "tech_stack_alignment": "Specific tools/tech overlap analysis",
+    "role_alignment": "How past roles map to JD responsibilities"
+  }},
+
+  "reasoning_points": ["Key observation 1", "Key observation 2"],
+  "verdict": "One-line hiring recommendation"
 }}
 
-Scoring bands:
-- high   (75-100): Strong match — experience aligns, most core skills present, clear role fit
+---
+
+SCORING BANDS:
+- high   (75-100): Strong match — most required skills present, experience aligns, clear role fit
 - medium (45-74):  Partial match — some gaps but transferable skills present
 - low    (0-44):   Poor match — critical requirements missing
+
+---
+
+CRITICAL RULES:
+- NEVER hallucinate — only report what is IN the resume
+- NEVER inflate scores — be strict but FAIR
+- Match EQUIVALENT skills even if wording differs (semantic matching)
+- DO NOT penalize for missing exact keywords if equivalent experience is demonstrated
+- DO reward transferable/equivalent experience inferred from context
+- DO NOT mark a skill as missing if it can be reasonably inferred from projects/experience
+- Penalize ONLY if a required competency is truly absent
+- If experience says "performed ITGC audits, SOX testing, PCI-DSS reviews" → those ARE matched skills
+- fit_percentage = sum of all dimension scores (must equal the total)
+- Output MUST be valid JSON only
+
+IMPORTANT: The fit_percentage MUST equal the sum of score_breakdown values.
+Map the 4-dimension model (Skills 40 + Experience 30 + Role 20 + Education 10 = 100)
+to the 6-dimension output by splitting Skills into core_skills + tools_technology + compliance_domain,
+and Experience into experience_fit + responsibility_match + leadership_ownership.
 """
 
-    raw = await _ask(prompt, model=SONNET, max_tokens=2500)
+    raw = await _ask(prompt, model=SONNET, max_tokens=3000)
     data = _parse_json(raw)
 
     raw_pct = data.get("fit_percentage", 0)
@@ -308,7 +414,6 @@ Scoring bands:
             role_alignment=breakdown_data.get("role_alignment", ""),
         ),
         reasoning_points=data.get("reasoning_points", []),
-        # New advanced fields
         score_breakdown=data.get("score_breakdown"),
         strength_mapping=data.get("strength_mapping"),
         verdict=data.get("verdict"),

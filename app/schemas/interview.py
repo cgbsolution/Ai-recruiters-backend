@@ -14,13 +14,6 @@ class InterviewTokenRead(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class PreInterviewFieldConfig(BaseModel):
-    field_id: str
-    label: str
-    type: str           # "text" | "email" | "phone" | "textarea" | "select" | "checkbox"
-    is_default: bool = False
-
-
 class JobConfig(BaseModel):
     job_id: int
     title: str
@@ -35,9 +28,13 @@ class JobConfig(BaseModel):
     webcam_required: bool
     face_match: bool
     resume_based: bool
+    code_editor_required: bool
+    allow_mobile: bool
+    secondary_cam: bool
+    manual_interview: bool
     special_instructions: Optional[str]
+    auto_skip_timeout: int
     skills: List[str]
-    pre_interview_fields: List[PreInterviewFieldConfig] = []
 
 
 # ── Registration ──────────────────────────────────────────────────────────────
@@ -47,7 +44,6 @@ class CandidateRegisterRequest(BaseModel):
     email: EmailStr
     phone: Optional[str] = None
     resume_path: str                    # required — candidate cannot register without a resume
-    extra_fields: Optional[Dict[str, Any]] = None  # dynamic pre-interview field responses
 
 
 class CandidateRegisterResponse(BaseModel):

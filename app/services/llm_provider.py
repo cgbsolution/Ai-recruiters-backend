@@ -125,6 +125,7 @@ def _get_gemini_client():
 
 
 async def _gemini_ask(prompt: str, model: str, max_tokens: int, retries: int) -> str:
+    from google.genai import types
     client = _get_gemini_client()
     for attempt in range(retries):
         try:
@@ -132,16 +133,16 @@ async def _gemini_ask(prompt: str, model: str, max_tokens: int, retries: int) ->
                 client.models.generate_content,
                 model=model,
                 contents=prompt,
-                config={
-                    "max_output_tokens": max_tokens,
-                    "temperature": 0.7,
-                },
+                config=types.GenerateContentConfig(
+                    max_output_tokens=max_tokens,
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                ),
             )
             return response.text
         except Exception as exc:
             logger.warning("Gemini API attempt %d/%d failed: %s", attempt + 1, retries, exc)
             if attempt < retries - 1:
-                # Longer backoff for rate limits
                 wait = (2 ** attempt) * 2  # 2s, 4s, 8s
                 await asyncio.sleep(wait)
                 continue
@@ -152,6 +153,7 @@ async def _gemini_ask_with_system(
     system: str, messages: list, model: str, max_tokens: int,
     timeout_seconds: int, retries: int,
 ) -> str:
+    from google.genai import types
     client = _get_gemini_client()
 
     # Convert Anthropic-style messages to Gemini format
@@ -166,11 +168,11 @@ async def _gemini_ask_with_system(
                 client.models.generate_content,
                 model=model,
                 contents=contents,
-                config={
-                    "system_instruction": system,
-                    "max_output_tokens": max_tokens,
-                    "temperature": 0.7,
-                },
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    max_output_tokens=max_tokens,
+                    temperature=0.3,
+                ),
             )
             return response.text
         except Exception as exc:
