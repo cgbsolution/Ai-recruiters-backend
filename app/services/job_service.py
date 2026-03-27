@@ -135,7 +135,7 @@ def delete_job(db: Session, job_id: int) -> bool:
         MeetingSlot, MeetingSchedule,
     )
     from app.models.job_metadata import JobMetadata
-    from sqlalchemy import text
+    from sqlalchemy import text, inspect
     import logging
 
     logger = logging.getLogger("delete_job")
@@ -145,6 +145,10 @@ def delete_job(db: Session, job_id: int) -> bool:
         return False
 
     try:
+        # Check which tables exist in the database
+        inspector = inspect(db.bind)
+        existing_tables = set(inspector.get_table_names())
+
         # 1. Collect session IDs for this job
         session_ids = [
             s.id for s in
@@ -159,11 +163,11 @@ def delete_job(db: Session, job_id: int) -> bool:
             db.query(CandidateFeedback).filter(CandidateFeedback.session_id.in_(session_ids)).delete(synchronize_session="fetch")
             db.query(MeetingSchedule).filter(MeetingSchedule.session_id.in_(session_ids)).delete(synchronize_session="fetch")
 
-            # Delete per_question_evaluations if table exists
-            try:
-                db.execute(text("DELETE FROM per_question_evaluations WHERE session_id = ANY(:sids)"), {"sids": session_ids})
-            except Exception:
-                pass  # table may not exist
+            # Delete per_question_evaluations if the table exists
+            if "per_question_evaluations" in existing_tables:
+                placeholders = ",".join(f":sid{i}" for i in range(len(session_ids)))
+                params = {f"sid{i}": sid for i, sid in enumerate(session_ids)}
+                db.execute(text(f"DELETE FROM per_question_evaluations WHERE session_id IN ({placeholders})"), params)
 
             # 3. Delete sessions themselves
             db.query(InterviewSession).filter(InterviewSession.job_id == job_id).delete(synchronize_session="fetch")
@@ -186,12 +190,10 @@ def delete_job(db: Session, job_id: int) -> bool:
         # 7. Job metadata
         db.query(JobMetadata).filter(JobMetadata.job_id == job_id).delete(synchronize_session="fetch")
 
-        # 8. Tables without ORM models (safe — skip if they don't exist)
+        # 8. Tables without ORM models — only delete if they exist
         for tbl in ("job_pre_interview_fields", "scoring_training_data", "ai_credit_usage"):
-            try:
+            if tbl in existing_tables:
                 db.execute(text(f"DELETE FROM {tbl} WHERE job_id = :jid"), {"jid": job_id})
-            except Exception:
-                pass  # table may not exist on this server
 
         # 9. Nullify candidate FK
         db.query(Candidate).filter(Candidate.job_id == job_id).update(
