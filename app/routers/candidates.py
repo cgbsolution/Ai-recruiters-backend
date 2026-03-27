@@ -45,9 +45,8 @@ ALLOWED_RESUME_TYPES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 
-# ── Sequential background parse queue ────────────────────────────────────────
-_parse_queue: asyncio.Queue = asyncio.Queue()
-_worker_started = False
+# ── Concurrent background parse pool ─────────────────────────────────────────
+_parse_semaphore = asyncio.Semaphore(3)  # max 3 concurrent parses
 
 
 def _sync_extract_text(file_path: str) -> str:
@@ -60,18 +59,18 @@ def _sync_extract_text(file_path: str) -> str:
     return text
 
 
-async def _parse_worker():
+async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
     """
-    Process resume parse jobs one at a time.
-    Uses Claude AI for parsing (accurate names/details) + LLM fit score.
+    Parse a single resume concurrently (guarded by semaphore).
+    Uses Haiku (~1-2s) for parsing + smart scoring (~50ms) for fit score.
+    Total: ~3-5s per resume vs ~30-40s with old Sonnet approach.
     """
-    while True:
-        candidate_id, file_path, job_id = await _parse_queue.get()
+    async with _parse_semaphore:
         db = SessionLocal()
         try:
             candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
             if not candidate:
-                continue
+                return
 
             candidate.parsing_status = "processing"
             db.commit()
@@ -81,38 +80,36 @@ async def _parse_worker():
             # ── Step 1: Extract text in thread pool ───────────────────────────
             resume_text = await asyncio.to_thread(_sync_extract_text, file_path)
 
-            # ── Step 2: AI parse for accurate name/details extraction ─────────
+            # ── Step 2: Parse resume using Haiku (fast, ~1-2s) ─────────────
             parsed = None
+
+            # Primary: Haiku LLM parser (fast + accurate)
             try:
-                from app.services.resume_service import parse_resume
-                from app.schemas.ai import ParseResumeRequest
+                from app.services.llm_resume_parser import llm_parse_resume
+                parsed = await llm_parse_resume(resume_text)
+                if parsed and parsed.get("candidate_name"):
+                    logger.info("Haiku parsed candidate %s: name=%s", candidate_id, parsed.get("candidate_name"))
+                else:
+                    parsed = None  # Haiku returned empty — fall through
+            except Exception as haiku_exc:
+                logger.warning("Haiku parse failed for candidate %s: %s", candidate_id, haiku_exc)
 
-                req = ParseResumeRequest(resume_text=resume_text)
-                result = await parse_resume(req)
-                ai_data = result.parsed_data.model_dump()
+            # Fallback: fast regex parser (instant, no AI cost)
+            if not parsed:
+                try:
+                    from app.services.fast_resume_parser import fast_parse_resume
+                    parsed = await asyncio.to_thread(fast_parse_resume, resume_text)
+                    logger.info("Regex parsed candidate %s: name=%s", candidate_id, parsed.get("candidate_name"))
+                except Exception as regex_exc:
+                    logger.error("Regex parse also failed for candidate %s: %s", candidate_id, regex_exc)
+                    parsed = {}
 
-                # Map AI parser output to our expected format
-                parsed = {
-                    "candidate_name": ai_data.get("name"),
-                    "candidate_email": ai_data.get("email"),
-                    "phone": ai_data.get("phone"),
-                    "current_designation": ai_data.get("current_designation") or ai_data.get("current_role"),
-                    "experience_years": ai_data.get("experience_years"),
-                    "skills": ai_data.get("skills") or [],
-                    "education": ai_data.get("education") or [],
-                    "certifications": ai_data.get("certifications") or [],
-                    "work_experience": ai_data.get("work_experience") or [],
-                    "location": ai_data.get("location"),
-                    "personal_details": ai_data.get("personal_details") or {},
-                    "keywords": ai_data.get("keywords") or [],
-                    "summary": ai_data.get("summary"),
-                }
-                logger.info("AI parsed candidate %s: name=%s, email=%s", candidate_id, parsed.get("candidate_name"), parsed.get("candidate_email"))
-            except Exception as ai_exc:
-                logger.warning("AI parse failed for candidate %s, falling back to regex: %s", candidate_id, ai_exc)
-                # Fallback to fast regex parser
-                from app.services.fast_resume_parser import fast_parse_resume
-                parsed = await asyncio.to_thread(fast_parse_resume, resume_text)
+            # Extract email from resume text if parser didn't find it
+            if not parsed.get("candidate_email"):
+                import re as _re
+                email_match = _re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', resume_text or "")
+                if email_match:
+                    parsed["candidate_email"] = email_match.group(0)
 
             # Update candidate with parsed data
             parsed_email = parsed.get("candidate_email") or candidate.email
@@ -163,19 +160,12 @@ async def _parse_worker():
 
                     # Compute fit score for existing candidate
                     if job_id:
-                        try:
-                            logger.info("Computing AI fit score for duplicate candidate %s against job %s", existing.id, job_id)
-                            score_data = await _ai_fit_score_for_candidate(existing, db, resume_text=resume_text)
-                            if score_data:
-                                logger.info("AI fit score for candidate %s: %s%% (%s)", existing.id, score_data.get("fit_percentage"), score_data.get("fit_level"))
-                        except Exception as fit_exc:
-                            logger.error("AI fit score FAILED for candidate %s: %s", existing.id, fit_exc, exc_info=True)
+                        await _compute_fit_score_with_fallback(existing, db, job_id, resume_text)
 
                     existing.parsing_status = "completed"
                     db.delete(candidate)
                     db.commit()
-                    _parse_queue.task_done()
-                    continue
+                    return
 
             candidate.name = parsed.get("candidate_name") or candidate.name
             candidate.email = real_email or candidate.email
@@ -214,17 +204,9 @@ async def _parse_worker():
 
             candidate.resume_metadata_id = meta.id
 
-            # ── Step 3: Compute fit score using AI semantic analysis ──────
+            # ── Step 3: Compute fit score (smart scoring, instant) ────────────
             if job_id:
-                try:
-                    logger.info("Computing AI fit score for candidate %s against job %s", candidate_id, job_id)
-                    score_data = await _ai_fit_score_for_candidate(candidate, db, resume_text=resume_text)
-                    if score_data:
-                        logger.info("AI fit score for candidate %s: %s%% (%s)", candidate_id, score_data.get("fit_percentage"), score_data.get("fit_level"))
-                    else:
-                        logger.warning("Could not compute AI fit score for candidate %s — missing data", candidate_id)
-                except Exception as fit_exc:
-                    logger.error("AI fit score FAILED for candidate %s (job %s): %s", candidate_id, job_id, fit_exc, exc_info=True)
+                await _compute_fit_score_with_fallback(candidate, db, job_id, resume_text)
 
             candidate.parsing_status = "completed"
             db.commit()
@@ -240,15 +222,48 @@ async def _parse_worker():
                 pass
         finally:
             db.close()
-            _parse_queue.task_done()
 
 
-def _ensure_worker():
-    """Start the background parse worker if not already running."""
-    global _worker_started
-    if not _worker_started:
-        _worker_started = True
-        asyncio.get_event_loop().create_task(_parse_worker())
+async def _compute_fit_score_with_fallback(
+    candidate: Candidate, db: Session, job_id: int, resume_text: str | None = None
+):
+    """
+    Compute fit score using smart scoring (instant, same as database matches).
+    Falls back to AI semantic scoring only if smart scoring returns no result.
+    """
+    # Primary: Smart scoring — instant (<50ms), same engine as database matches
+    try:
+        from app.services.smart_scoring_service import compute_fit_score_for_candidate as smart_score
+        result = smart_score(db, candidate.id, job_id)
+        if result:
+            candidate.resume_fit_score = f"{result.fit_percentage}%"
+            candidate.fit_score_reasoning = json.dumps(result.to_dict())
+            candidate.fit_score_details = json.dumps({
+                "score_breakdown": {k: v["score"] for k, v in result.breakdown.items()} if result.breakdown else {},
+                "source": "smart_scoring",
+            })
+            db.commit()
+            db.refresh(candidate)
+            logger.info("Smart scoring for candidate %s: %s%% (%s)", candidate.id, result.fit_percentage, result.fit_level)
+            return
+    except Exception as smart_exc:
+        logger.warning("Smart scoring failed for candidate %s, trying AI fallback: %s", candidate.id, smart_exc)
+
+    # Fallback: AI semantic scoring (slower, ~15-20s, but works without metadata)
+    try:
+        logger.info("Computing AI fit score for candidate %s against job %s", candidate.id, job_id)
+        score_data = await _ai_fit_score_for_candidate(candidate, db, resume_text=resume_text)
+        if score_data:
+            logger.info("AI fit score for candidate %s: %s%% (%s)", candidate.id, score_data.get("fit_percentage"), score_data.get("fit_level"))
+        else:
+            logger.warning("Could not compute fit score for candidate %s — missing data", candidate.id)
+    except Exception as fit_exc:
+        logger.error("AI fit score also FAILED for candidate %s: %s", candidate.id, fit_exc, exc_info=True)
+
+
+def _launch_parse_task(candidate_id: int, file_path: str, job_id: int | None):
+    """Fire-and-forget a concurrent parse task (guarded by semaphore)."""
+    asyncio.get_event_loop().create_task(_parse_one(candidate_id, file_path, job_id))
 
 
 # ── Standard CRUD ─────────────────────────────────────────────────────────────
@@ -492,7 +507,13 @@ def check_duplicate(
 
 @router.get(
     "/{candidate_id}/parsing-status",
-    summary="Get resume parsing status for a candidate",
+    summary="Poll resume parsing status",
+    description=(
+        "Returns the current parsing status, name, email, and fit score for a candidate.\n\n"
+        "**Statuses:** `pending` → `processing` → `completed` | `failed`\n\n"
+        "Poll this endpoint every 2-3 seconds after uploading resumes to track progress. "
+        "Once `parsing_status` is `completed`, the `resume_fit_score` field will contain the fit percentage."
+    ),
 )
 def get_parsing_status(candidate_id: int, db: Session = Depends(get_db)):
     candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
@@ -514,13 +535,16 @@ def get_parsing_status(candidate_id: int, db: Session = Depends(get_db)):
     "/upload-resume",
     response_model=List[CandidateRead],
     status_code=status.HTTP_201_CREATED,
-    summary="Upload resumes (batch)",
+    summary="Upload resumes (batch, parallel)",
     description=(
         "Upload one or more PDF/DOC/DOCX resume files.\n\n"
         "Files are saved immediately and candidate records created with "
-        "`parsing_status='pending'`. Parsing runs **one at a time** in the "
-        "background to avoid overloading the AI. Poll "
-        "`GET /candidates/{id}/parsing-status` to track progress.\n\n"
+        "`parsing_status='pending'`. Parsing runs **concurrently** in the "
+        "background (up to 3 at a time) using Claude Haiku for fast extraction (~1-2s per resume).\n\n"
+        "**Fit Score** is computed automatically using the smart scoring engine "
+        "(same 12-dimension weighted model used by database matching). "
+        "If smart scoring fails, falls back to AI semantic scoring.\n\n"
+        "Poll `GET /candidates/{id}/parsing-status` to track progress per candidate.\n\n"
         "If `replace_existing=true` and a resume for the same email already "
         "exists in metadata, the old metadata is replaced.\n\n"
         "**Content-Type:** `multipart/form-data`"
@@ -536,10 +560,9 @@ async def upload_resumes(
 ):
     """
     Upload one or more resumes. Files are saved to disk, candidate records
-    created with parsing_status='pending', and parsing queued in background
-    (one-at-a-time to conserve AI resources).
+    created with parsing_status='pending', and parsing launched concurrently
+    in background (up to 3 at a time via semaphore).
     """
-    _ensure_worker()
     created_candidates = []
 
     for file in files:
@@ -558,10 +581,6 @@ async def upload_resumes(
         placeholder_name = Path(file.filename).stem
         placeholder_email = f"pending_{safe_name[:20]}@resume.local"
 
-        # If same email+job candidate exists, update their resume file & re-queue
-        # (We won't know the real email until parse, but for re-uploads from the
-        # duplicate-check flow the frontend can pass replace_existing=true)
-
         candidate = Candidate(
             name=placeholder_name,
             email=placeholder_email,
@@ -579,8 +598,8 @@ async def upload_resumes(
         db.refresh(candidate)
         created_candidates.append(candidate)
 
-        # Queue for background processing (one-at-a-time)
-        await _parse_queue.put((candidate.id, file_path, job_id))
+        # Launch concurrent background parse (semaphore limits to 3 at a time)
+        _launch_parse_task(candidate.id, file_path, job_id)
 
     return created_candidates
 
@@ -590,8 +609,14 @@ async def upload_resumes(
 @router.post(
     "/{candidate_id}/compute-fit-score",
     response_model=CandidateRead,
-    summary="Recompute resume fit score using AI",
-    description="Re-runs AI LLM fit-score with 6-dimension semantic scoring for an existing candidate against their linked job.",
+    summary="Recompute resume fit score using AI (deep analysis)",
+    description=(
+        "Re-runs the **full AI LLM fit-score** with 6-dimension semantic scoring "
+        "for an existing candidate against their linked job.\n\n"
+        "This uses Claude Sonnet for deep analysis (~15-20s) and is more accurate "
+        "than the fast smart scoring used during upload. Use this for individual "
+        "candidates when higher accuracy is needed."
+    ),
 )
 async def compute_fit_score(candidate_id: int, db: Session = Depends(get_db)):
     """Re-compute fit score using AI semantic analysis (6-dimension model)."""
@@ -610,8 +635,13 @@ async def compute_fit_score(candidate_id: int, db: Session = Depends(get_db)):
 
 @router.post(
     "/batch-recompute-scores",
-    summary="Recompute fit scores for all candidates in a job",
-    description="Re-runs AI semantic fit-score for all candidates linked to the given job_id. Returns progress summary.",
+    summary="Batch recompute fit scores for all candidates in a job",
+    description=(
+        "Re-runs the full AI semantic fit-score for **all** candidates linked to the given `job_id`.\n\n"
+        "Returns a progress summary with per-candidate scores. "
+        "This is a slow operation (~15-20s per candidate) and should be used for "
+        "re-scoring after job requirements change."
+    ),
 )
 async def batch_recompute_scores(
     job_id: int,
@@ -1024,7 +1054,8 @@ async def send_whatsapp(
 )
 def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
     """Return full evaluation data: resume analysis + scores + interview Q&A transcript."""
-    from app.models.interview import InterviewSession, InterviewMessage, SessionStatus, Evaluation
+    from app.models.interview import InterviewSession, InterviewMessage, SessionStatus, Evaluation, Violation
+    from app.models.job import Job
 
     candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
     if not candidate:
@@ -1047,27 +1078,58 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
     if candidate.resume_path and os.path.exists(candidate.resume_path):
         resume_url = f"/{candidate.resume_path.replace(os.sep, '/')}"
 
+    # ── Job details (experience range) ────────────────────────────────────────
+    job_info = None
+    if candidate.job_id:
+        job = db.query(Job).filter(Job.id == candidate.job_id).first()
+        if job:
+            job_info = {
+                "title": job.title,
+                "experience_min": job.experience_min,
+                "experience_max": job.experience_max,
+            }
+
     # ── Q&A transcript from latest completed session ──────────────────────────
     transcript = []
+    full_transcript = []  # All messages in order for chat-style view
     evaluation_detail = None
+    violations_list = []
+    session_info = None
 
     latest_session = (
         db.query(InterviewSession)
         .filter(
             InterviewSession.candidate_id == candidate_id,
-            InterviewSession.status == SessionStatus.completed,
+            InterviewSession.status.in_([SessionStatus.completed, SessionStatus.terminated]),
         )
         .order_by(InterviewSession.completed_at.desc())
         .first()
     )
 
     if latest_session:
+        session_info = {
+            "started_at": latest_session.started_at.isoformat() if latest_session.started_at else None,
+            "completed_at": latest_session.completed_at.isoformat() if latest_session.completed_at else None,
+            "violation_count": latest_session.violation_count or 0,
+            "status": latest_session.status.value,
+        }
+
         messages = (
             db.query(InterviewMessage)
             .filter(InterviewMessage.session_id == latest_session.id)
             .order_by(InterviewMessage.created_at)
             .all()
         )
+
+        # Full transcript for chat-style view
+        for msg in messages:
+            full_transcript.append({
+                "role": msg.role,
+                "content": msg.content,
+                "question_index": msg.question_index,
+                "timestamp": msg.created_at.isoformat() if msg.created_at else None,
+            })
+
         # Group by question_index into Q&A pairs
         qa_map: dict = {}
         for msg in messages:
@@ -1085,6 +1147,20 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
             if v["question"] and v["answer"]
         ]
 
+        # ── Violations for this session ───────────────────────────────────────
+        violations = (
+            db.query(Violation)
+            .filter(Violation.session_id == latest_session.id)
+            .order_by(Violation.occurred_at)
+            .all()
+        )
+        for v in violations:
+            violations_list.append({
+                "type": v.violation_type.value,
+                "details": v.details,
+                "occurred_at": v.occurred_at.isoformat() if v.occurred_at else None,
+            })
+
         # ── Latest AI evaluation for this session ─────────────────────────────
         ev = (
             db.query(Evaluation)
@@ -1100,6 +1176,14 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
                 weaknesses = json.loads(ev.weaknesses) if ev.weaknesses else []
             except Exception:
                 weaknesses = []
+            try:
+                per_question = json.loads(ev.per_question_evaluations) if ev.per_question_evaluations else []
+            except Exception:
+                per_question = []
+            try:
+                skills_ratings = json.loads(ev.skills_ratings) if ev.skills_ratings else []
+            except Exception:
+                skills_ratings = []
             evaluation_detail = {
                 "recommendation": ev.recommendation.value if ev.recommendation else None,
                 "summary": ev.summary,
@@ -1107,6 +1191,13 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
                 "weaknesses": weaknesses,
                 "detailed_feedback": ev.detailed_feedback,
                 "meets_threshold": ev.meets_threshold or False,
+                "technical_score": ev.technical_score,
+                "communication_score": ev.communication_score,
+                "problem_solving_score": ev.problem_solving_score,
+                "confidence_score": ev.confidence_score,
+                "overall_score": ev.overall_score,
+                "per_question_evaluations": per_question,
+                "skills_ratings": skills_ratings,
             }
 
     return {
@@ -1121,7 +1212,9 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
             "interview_status": candidate.interview_status,
             "interview_date": candidate.interview_date.isoformat() if candidate.interview_date else None,
             "interview_timezone": candidate.interview_timezone,
+            "image": candidate.image,
         },
+        "job": job_info,
         "resume": {
             "path": candidate.resume_path,
             "url": resume_url,
@@ -1147,8 +1240,381 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
             "duration": candidate.video_duration,
         },
         "transcript": transcript,
+        "full_transcript": full_transcript,
         "evaluation": evaluation_detail,
+        "violations": violations_list,
+        "session": session_info,
     }
+
+
+# ── Download Endpoints ────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/{candidate_id}/evaluation/download-pdf",
+    summary="Download evaluation report as PDF",
+)
+def download_evaluation_pdf(candidate_id: int, db: Session = Depends(get_db)):
+    """Generate and return a PDF evaluation report for the candidate."""
+    from io import BytesIO
+    from fastapi.responses import StreamingResponse
+    from app.models.interview import InterviewSession, InterviewMessage, SessionStatus, Evaluation
+
+    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        raise HTTPException(status_code=500, detail="fpdf2 package not installed")
+
+    latest_session = (
+        db.query(InterviewSession)
+        .filter(
+            InterviewSession.candidate_id == candidate_id,
+            InterviewSession.status.in_([SessionStatus.completed, SessionStatus.terminated]),
+        )
+        .order_by(InterviewSession.completed_at.desc())
+        .first()
+    )
+
+    ev = None
+    if latest_session:
+        ev = db.query(Evaluation).filter(Evaluation.session_id == latest_session.id).first()
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Title
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.cell(0, 12, "Interview Evaluation Report", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(5)
+
+    # Candidate Info
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 8, candidate.name or "Unknown", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, f"Role: {candidate.role or 'N/A'}  |  Email: {candidate.email}  |  Phone: {candidate.phone or 'N/A'}", new_x="LMARGIN", new_y="NEXT")
+    if candidate.interview_date:
+        pdf.cell(0, 6, f"Interview Date: {candidate.interview_date.strftime('%B %d, %Y, %I:%M %p')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, f"Status: {candidate.interview_status or 'N/A'}  |  Stage: {candidate.candidate_stage or 'N/A'}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(5)
+
+    # Scores
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 8, "Interview Scores", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    scores = [
+        ("Overall Score", candidate.score),
+        ("Confidence", candidate.confidence_score),
+        ("Clarity", candidate.clarity_score),
+        ("Grammar", candidate.grammar_score),
+        ("Enthusiasm", candidate.enthusiasm_score),
+        ("Pronunciation", candidate.pronunciation_score),
+        ("Conciseness", candidate.conciseness_score),
+        ("Trust Score", candidate.trust_score),
+        ("AI Cheating Score", candidate.ai_cheating_score),
+    ]
+    for label, val in scores:
+        pdf.cell(60, 6, label, new_x="RIGHT")
+        pdf.cell(0, 6, f"{val:.1f}" if val is not None else "N/A", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(5)
+
+    # Evaluation
+    if ev:
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.cell(0, 8, "AI Evaluation", new_x="LMARGIN", new_y="NEXT")
+
+        if ev.recommendation:
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.cell(0, 7, f"Recommendation: {ev.recommendation.value}", new_x="LMARGIN", new_y="NEXT")
+
+        if ev.summary:
+            pdf.set_font("Helvetica", "", 10)
+            pdf.multi_cell(0, 5, ev.summary)
+            pdf.ln(3)
+
+        try:
+            strengths = json.loads(ev.strengths) if ev.strengths else []
+        except Exception:
+            strengths = []
+        if strengths:
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.cell(0, 7, "Strengths:", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 10)
+            for s in strengths:
+                pdf.multi_cell(0, 5, f"  - {s}")
+
+        try:
+            weaknesses = json.loads(ev.weaknesses) if ev.weaknesses else []
+        except Exception:
+            weaknesses = []
+        if weaknesses:
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.cell(0, 7, "Areas to Improve:", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 10)
+            for w in weaknesses:
+                pdf.multi_cell(0, 5, f"  - {w}")
+
+        if ev.detailed_feedback:
+            pdf.ln(3)
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.cell(0, 7, "Detailed Feedback:", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 10)
+            pdf.multi_cell(0, 5, ev.detailed_feedback)
+
+    # Transcript
+    if latest_session:
+        messages = (
+            db.query(InterviewMessage)
+            .filter(InterviewMessage.session_id == latest_session.id)
+            .order_by(InterviewMessage.created_at)
+            .all()
+        )
+        qa_map: dict = {}
+        for msg in messages:
+            qi = msg.question_index or 0
+            if qi == 0:
+                continue
+            if qi not in qa_map:
+                qa_map[qi] = {"question": None, "answer": None, "index": qi}
+            if msg.role == "ai" and qa_map[qi]["question"] is None:
+                qa_map[qi]["question"] = msg.content
+            elif msg.role == "candidate" and qa_map[qi]["answer"] is None:
+                qa_map[qi]["answer"] = msg.content
+        transcript_pairs = [v for _, v in sorted(qa_map.items()) if v["question"] and v["answer"]]
+
+        if transcript_pairs:
+            pdf.add_page()
+            pdf.set_font("Helvetica", "B", 13)
+            pdf.cell(0, 8, "Interview Transcript", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(3)
+            for pair in transcript_pairs:
+                pdf.set_font("Helvetica", "B", 10)
+                pdf.multi_cell(0, 5, f"Q{pair['index']}: {pair['question']}")
+                pdf.set_font("Helvetica", "", 10)
+                pdf.multi_cell(0, 5, f"A: {pair['answer']}")
+                pdf.ln(3)
+
+    buf = BytesIO()
+    pdf.output(buf)
+    buf.seek(0)
+    safe_name = (candidate.name or "candidate").replace(" ", "_")
+    return StreamingResponse(
+        buf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}_Evaluation.pdf"'},
+    )
+
+
+@router.get(
+    "/{candidate_id}/evaluation/download-docx",
+    summary="Download evaluation report as DOCX",
+)
+def download_evaluation_docx(candidate_id: int, db: Session = Depends(get_db)):
+    """Generate and return a DOCX evaluation report for the candidate."""
+    from io import BytesIO
+    from fastapi.responses import StreamingResponse
+    from docx import Document
+    from docx.shared import Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from app.models.interview import InterviewSession, InterviewMessage, SessionStatus, Evaluation
+
+    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    latest_session = (
+        db.query(InterviewSession)
+        .filter(
+            InterviewSession.candidate_id == candidate_id,
+            InterviewSession.status.in_([SessionStatus.completed, SessionStatus.terminated]),
+        )
+        .order_by(InterviewSession.completed_at.desc())
+        .first()
+    )
+
+    ev = None
+    if latest_session:
+        ev = db.query(Evaluation).filter(Evaluation.session_id == latest_session.id).first()
+
+    doc = Document()
+
+    # Title
+    title = doc.add_heading("Interview Evaluation Report", level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # Candidate Info
+    doc.add_heading(candidate.name or "Unknown", level=1)
+    info_lines = [
+        f"Role: {candidate.role or 'N/A'}",
+        f"Email: {candidate.email}",
+        f"Phone: {candidate.phone or 'N/A'}",
+        f"Status: {candidate.interview_status or 'N/A'}  |  Stage: {candidate.candidate_stage or 'N/A'}",
+    ]
+    if candidate.interview_date:
+        info_lines.insert(3, f"Interview Date: {candidate.interview_date.strftime('%B %d, %Y, %I:%M %p')}")
+    for line in info_lines:
+        p = doc.add_paragraph(line)
+        p.style.font.size = Pt(10)
+
+    # Scores Table
+    doc.add_heading("Interview Scores", level=2)
+    score_items = [
+        ("Overall Score", candidate.score),
+        ("Confidence", candidate.confidence_score),
+        ("Clarity", candidate.clarity_score),
+        ("Grammar", candidate.grammar_score),
+        ("Enthusiasm", candidate.enthusiasm_score),
+        ("Pronunciation", candidate.pronunciation_score),
+        ("Conciseness", candidate.conciseness_score),
+        ("Trust Score", candidate.trust_score),
+        ("AI Cheating Score", candidate.ai_cheating_score),
+    ]
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Light Grid Accent 1"
+    hdr_cells = table.rows[0].cells
+    hdr_cells[0].text = "Metric"
+    hdr_cells[1].text = "Score"
+    for label, val in score_items:
+        row = table.add_row().cells
+        row[0].text = label
+        row[1].text = f"{val:.1f}" if val is not None else "N/A"
+
+    # Evaluation
+    if ev:
+        doc.add_heading("AI Evaluation", level=2)
+        if ev.recommendation:
+            p = doc.add_paragraph()
+            run = p.add_run(f"Recommendation: {ev.recommendation.value}")
+            run.bold = True
+            run.font.size = Pt(12)
+        if ev.summary:
+            doc.add_paragraph(ev.summary)
+
+        try:
+            strengths = json.loads(ev.strengths) if ev.strengths else []
+        except Exception:
+            strengths = []
+        if strengths:
+            doc.add_heading("Strengths", level=3)
+            for s in strengths:
+                doc.add_paragraph(s, style="List Bullet")
+
+        try:
+            weaknesses = json.loads(ev.weaknesses) if ev.weaknesses else []
+        except Exception:
+            weaknesses = []
+        if weaknesses:
+            doc.add_heading("Areas to Improve", level=3)
+            for w in weaknesses:
+                doc.add_paragraph(w, style="List Bullet")
+
+        if ev.detailed_feedback:
+            doc.add_heading("Detailed Feedback", level=3)
+            doc.add_paragraph(ev.detailed_feedback)
+
+    # Transcript
+    if latest_session:
+        messages = (
+            db.query(InterviewMessage)
+            .filter(InterviewMessage.session_id == latest_session.id)
+            .order_by(InterviewMessage.created_at)
+            .all()
+        )
+        qa_map: dict = {}
+        for msg in messages:
+            qi = msg.question_index or 0
+            if qi == 0:
+                continue
+            if qi not in qa_map:
+                qa_map[qi] = {"question": None, "answer": None, "index": qi}
+            if msg.role == "ai" and qa_map[qi]["question"] is None:
+                qa_map[qi]["question"] = msg.content
+            elif msg.role == "candidate" and qa_map[qi]["answer"] is None:
+                qa_map[qi]["answer"] = msg.content
+        transcript_pairs = [v for _, v in sorted(qa_map.items()) if v["question"] and v["answer"]]
+
+        if transcript_pairs:
+            doc.add_page_break()
+            doc.add_heading("Interview Transcript", level=2)
+            for pair in transcript_pairs:
+                p = doc.add_paragraph()
+                run = p.add_run(f"Q{pair['index']}: {pair['question']}")
+                run.bold = True
+                doc.add_paragraph(f"A: {pair['answer']}")
+                doc.add_paragraph("")  # spacer
+
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    safe_name = (candidate.name or "candidate").replace(" ", "_")
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}_Evaluation.docx"'},
+    )
+
+
+@router.get(
+    "/{candidate_id}/evaluation/download-transcript",
+    summary="Download interview transcript as text file",
+)
+def download_transcript(candidate_id: int, db: Session = Depends(get_db)):
+    """Generate and return a plain text interview transcript."""
+    from io import BytesIO
+    from fastapi.responses import StreamingResponse
+    from app.models.interview import InterviewSession, InterviewMessage, SessionStatus
+
+    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    latest_session = (
+        db.query(InterviewSession)
+        .filter(
+            InterviewSession.candidate_id == candidate_id,
+            InterviewSession.status.in_([SessionStatus.completed, SessionStatus.terminated]),
+        )
+        .order_by(InterviewSession.completed_at.desc())
+        .first()
+    )
+
+    if not latest_session:
+        raise HTTPException(status_code=404, detail="No completed interview found")
+
+    messages = (
+        db.query(InterviewMessage)
+        .filter(InterviewMessage.session_id == latest_session.id)
+        .order_by(InterviewMessage.created_at)
+        .all()
+    )
+
+    lines = [
+        f"Interview Transcript - {candidate.name}",
+        f"Role: {candidate.role or 'N/A'}",
+        f"Date: {candidate.interview_date.strftime('%B %d, %Y, %I:%M %p') if candidate.interview_date else 'N/A'}",
+        "=" * 60,
+        "",
+    ]
+
+    for msg in messages:
+        role_label = "AI Interviewer" if msg.role == "ai" else "Candidate"
+        timestamp = msg.created_at.strftime("%H:%M:%S") if msg.created_at else ""
+        lines.append(f"[{timestamp}] {role_label}:")
+        lines.append(msg.content)
+        lines.append("")
+
+    content = "\n".join(lines)
+    buf = BytesIO(content.encode("utf-8"))
+    safe_name = (candidate.name or "candidate").replace(" ", "_")
+    return StreamingResponse(
+        buf,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}_Transcript.txt"'},
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

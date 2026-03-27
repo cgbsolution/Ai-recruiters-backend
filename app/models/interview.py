@@ -117,6 +117,8 @@ class Evaluation(Base):
     strengths = Column(Text, nullable=True)     # JSON array of strings
     weaknesses = Column(Text, nullable=True)    # JSON array of strings
     detailed_feedback = Column(Text, nullable=True)
+    per_question_evaluations = Column(Text, nullable=True)  # JSON: [{index, score, positives:[], negatives:[]}]
+    skills_ratings = Column(Text, nullable=True)            # JSON: [{skill, rating, evaluation}]
     meets_threshold = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 

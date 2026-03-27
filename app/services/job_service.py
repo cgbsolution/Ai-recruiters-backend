@@ -1,6 +1,7 @@
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func
+from sqlalchemy import func, cast, Date
 from sqlalchemy.orm import Session
 
 from app.models.candidate import Candidate
@@ -158,6 +159,11 @@ def delete_job(db: Session, job_id: int) -> bool:
     # Job metadata
     db.query(JobMetadata).filter(JobMetadata.job_id == job_id).delete(synchronize_session="fetch")
 
+    # Pre-interview fields & scoring training data (no ORM model — use raw SQL)
+    from sqlalchemy import text
+    db.execute(text("DELETE FROM job_pre_interview_fields WHERE job_id = :jid"), {"jid": job_id})
+    db.execute(text("DELETE FROM scoring_training_data WHERE job_id = :jid"), {"jid": job_id})
+
     # Nullify candidate FK
     db.query(Candidate).filter(Candidate.job_id == job_id).update(
         {Candidate.job_id: None}, synchronize_session="fetch"
@@ -168,81 +174,158 @@ def delete_job(db: Session, job_id: int) -> bool:
     return True
 
 
+def _pct_change(current: int, previous: int) -> float:
+    """Percentage change, rounded to 1 decimal."""
+    if previous == 0:
+        return 0.0
+    return round(((current - previous) / previous) * 100, 1)
+
+
 def get_stats(db: Session) -> List[Dict[str, Any]]:
     from app.models.job import JobStatus
     from app.models.candidate import CandidateStatus
 
+    now = datetime.utcnow()
+
+    # ── Current totals ───────────────────────────────────────────────────
     active_jobs = db.query(func.count(Job.id)).filter(Job.status == JobStatus.open).scalar() or 0
     finished_jobs = db.query(func.count(Job.id)).filter(Job.status == JobStatus.inactive).scalar() or 0
-    # Only count candidates that belong to an existing job
-    interview_count = db.query(func.count(Candidate.id)).filter(Candidate.status == CandidateStatus.interview, Candidate.job_id.isnot(None)).scalar() or 0
-    offered_count = db.query(func.count(Candidate.id)).filter(Candidate.status == CandidateStatus.offered, Candidate.job_id.isnot(None)).scalar() or 0
-    waiting_count = db.query(func.count(Candidate.id)).filter(Candidate.status == CandidateStatus.applied, Candidate.job_id.isnot(None)).scalar() or 0
+    interview_count = db.query(func.count(Candidate.id)).filter(
+        Candidate.status == CandidateStatus.interview, Candidate.job_id.isnot(None)
+    ).scalar() or 0
+    offered_count = db.query(func.count(Candidate.id)).filter(
+        Candidate.status == CandidateStatus.offered, Candidate.job_id.isnot(None)
+    ).scalar() or 0
+    waiting_count = db.query(func.count(Candidate.id)).filter(
+        Candidate.status == CandidateStatus.applied, Candidate.job_id.isnot(None)
+    ).scalar() or 0
+
+    # ── Week boundaries ──────────────────────────────────────────────────
+    this_monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    last_monday = this_monday - timedelta(days=7)
+    last_friday_end = last_monday + timedelta(days=5)
+    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+
+    # ── Helper: daily chart data (Mon-Fri of current week) ───────────────
+    def _daily_chart_job(status):
+        """Count jobs created per day this week with a given status."""
+        day_col = cast(Job.created_at, Date).label("day")
+        rows = (
+            db.query(day_col, func.count(Job.id).label("cnt"))
+            .filter(
+                Job.status == status,
+                Job.created_at >= this_monday,
+                Job.created_at < this_monday + timedelta(days=5),
+            )
+            .group_by(day_col)
+            .all()
+        )
+        by_date = {r.day: int(r.cnt) for r in rows}
+        chart = []
+        for i in range(5):
+            d = (this_monday + timedelta(days=i)).date()
+            chart.append({"name": day_names[i], "value": by_date.get(d, 0)})
+        return chart
+
+    def _daily_chart_candidate(status):
+        """Count candidates updated to a given status per day this week."""
+        day_col = cast(Candidate.updated_at, Date).label("day")
+        rows = (
+            db.query(day_col, func.count(Candidate.id).label("cnt"))
+            .filter(
+                Candidate.status == status,
+                Candidate.job_id.isnot(None),
+                Candidate.updated_at >= this_monday,
+                Candidate.updated_at < this_monday + timedelta(days=5),
+            )
+            .group_by(day_col)
+            .all()
+        )
+        by_date = {r.day: int(r.cnt) for r in rows}
+        chart = []
+        for i in range(5):
+            d = (this_monday + timedelta(days=i)).date()
+            chart.append({"name": day_names[i], "value": by_date.get(d, 0)})
+        return chart
+
+    # ── Previous week totals (for trend %) ───────────────────────────────
+    prev_active = db.query(func.count(Job.id)).filter(
+        Job.status == JobStatus.open,
+        Job.created_at >= last_monday, Job.created_at < last_friday_end,
+    ).scalar() or 0
+    prev_finished = db.query(func.count(Job.id)).filter(
+        Job.status == JobStatus.inactive,
+        Job.updated_at >= last_monday, Job.updated_at < last_friday_end,
+    ).scalar() or 0
+    prev_interview = db.query(func.count(Candidate.id)).filter(
+        Candidate.status == CandidateStatus.interview, Candidate.job_id.isnot(None),
+        Candidate.updated_at >= last_monday, Candidate.updated_at < last_friday_end,
+    ).scalar() or 0
+    prev_offered = db.query(func.count(Candidate.id)).filter(
+        Candidate.status == CandidateStatus.offered, Candidate.job_id.isnot(None),
+        Candidate.updated_at >= last_monday, Candidate.updated_at < last_friday_end,
+    ).scalar() or 0
+    prev_waiting = db.query(func.count(Candidate.id)).filter(
+        Candidate.status == CandidateStatus.applied, Candidate.job_id.isnot(None),
+        Candidate.updated_at >= last_monday, Candidate.updated_at < last_friday_end,
+    ).scalar() or 0
+
+    # ── Current week totals (for trend comparison) ───────────────────────
+    curr_active = db.query(func.count(Job.id)).filter(
+        Job.status == JobStatus.open,
+        Job.created_at >= this_monday, Job.created_at < this_monday + timedelta(days=5),
+    ).scalar() or 0
+    curr_finished = db.query(func.count(Job.id)).filter(
+        Job.status == JobStatus.inactive,
+        Job.updated_at >= this_monday, Job.updated_at < this_monday + timedelta(days=5),
+    ).scalar() or 0
+    curr_interview = db.query(func.count(Candidate.id)).filter(
+        Candidate.status == CandidateStatus.interview, Candidate.job_id.isnot(None),
+        Candidate.updated_at >= this_monday, Candidate.updated_at < this_monday + timedelta(days=5),
+    ).scalar() or 0
+    curr_offered = db.query(func.count(Candidate.id)).filter(
+        Candidate.status == CandidateStatus.offered, Candidate.job_id.isnot(None),
+        Candidate.updated_at >= this_monday, Candidate.updated_at < this_monday + timedelta(days=5),
+    ).scalar() or 0
+    curr_waiting = db.query(func.count(Candidate.id)).filter(
+        Candidate.status == CandidateStatus.applied, Candidate.job_id.isnot(None),
+        Candidate.updated_at >= this_monday, Candidate.updated_at < this_monday + timedelta(days=5),
+    ).scalar() or 0
 
     return [
         {
             "label": "Active Jobs",
             "value": active_jobs,
-            "change": 0.0,
+            "change": _pct_change(curr_active, prev_active),
             "color": "brand",
-            "chartData": [
-                {"name": "Mon", "value": max(1, active_jobs // 5)},
-                {"name": "Tue", "value": max(1, active_jobs // 4)},
-                {"name": "Wed", "value": max(1, active_jobs // 3)},
-                {"name": "Thu", "value": max(1, active_jobs // 2)},
-                {"name": "Fri", "value": active_jobs},
-            ],
+            "chartData": _daily_chart_job(JobStatus.open),
         },
         {
             "label": "Finished Jobs",
             "value": finished_jobs,
-            "change": 0.0,
+            "change": _pct_change(curr_finished, prev_finished),
             "color": "success",
-            "chartData": [
-                {"name": "Mon", "value": max(1, finished_jobs // 5)},
-                {"name": "Tue", "value": max(1, finished_jobs // 4)},
-                {"name": "Wed", "value": max(1, finished_jobs // 3)},
-                {"name": "Thu", "value": max(1, finished_jobs // 2)},
-                {"name": "Fri", "value": finished_jobs},
-            ],
+            "chartData": _daily_chart_job(JobStatus.inactive),
         },
         {
             "label": "Interview Schedule",
             "value": interview_count,
-            "change": 0.0,
+            "change": _pct_change(curr_interview, prev_interview),
             "color": "success",
-            "chartData": [
-                {"name": "Mon", "value": max(1, interview_count // 5)},
-                {"name": "Tue", "value": max(1, interview_count // 4)},
-                {"name": "Wed", "value": max(1, interview_count // 3)},
-                {"name": "Thu", "value": max(1, interview_count // 2)},
-                {"name": "Fri", "value": interview_count},
-            ],
+            "chartData": _daily_chart_candidate(CandidateStatus.interview),
         },
         {
             "label": "Hire Rates",
             "value": offered_count,
-            "change": 0.0,
+            "change": _pct_change(curr_offered, prev_offered),
             "color": "brand",
-            "chartData": [
-                {"name": "Mon", "value": max(1, offered_count // 5)},
-                {"name": "Tue", "value": max(1, offered_count // 4)},
-                {"name": "Wed", "value": max(1, offered_count // 3)},
-                {"name": "Thu", "value": max(1, offered_count // 2)},
-                {"name": "Fri", "value": offered_count},
-            ],
+            "chartData": _daily_chart_candidate(CandidateStatus.offered),
         },
         {
             "label": "Waiting Response",
             "value": waiting_count,
-            "change": 0.0,
+            "change": _pct_change(curr_waiting, prev_waiting),
             "color": "warning",
-            "chartData": [
-                {"name": "Mon", "value": max(1, waiting_count // 5)},
-                {"name": "Tue", "value": max(1, waiting_count // 4)},
-                {"name": "Wed", "value": max(1, waiting_count // 3)},
-                {"name": "Thu", "value": max(1, waiting_count // 2)},
-                {"name": "Fri", "value": waiting_count},
-            ],
+            "chartData": _daily_chart_candidate(CandidateStatus.applied),
         },
     ]

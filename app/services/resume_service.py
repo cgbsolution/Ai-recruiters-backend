@@ -76,7 +76,8 @@ async def parse_resume(req: ParseResumeRequest) -> ParseResumeResponse:
     Enterprise-grade ATS resume parser.
     Reads every word of the resume and extracts structured data deterministically.
     """
-    from app.services.ai_service import _ask, _parse_json, SONNET
+    from app.services.ai_service import _ask_with_usage, _parse_json, SONNET
+    from app.services.credit_service import log_usage
 
     resume_text = req.resume_text[:10000]
 
@@ -180,8 +181,9 @@ STRICT RULES:
 - Output MUST be valid JSON only
 """
 
-    raw = await _ask(prompt, model=SONNET, max_tokens=3500)
-    data = _parse_json(raw)
+    result = await _ask_with_usage(prompt, model=SONNET, max_tokens=3500)
+    log_usage(result, feature="resume_parsing")
+    data = _parse_json(result.text)
 
     parsed = ParsedResumeData(
         name=data.get("name"),
@@ -214,7 +216,8 @@ async def calculate_fit_score(req: FitScoreRequest) -> FitScoreResponse:
     Deterministic resume-to-JD matching with weighted scoring model.
     Behaves like a production ATS system — no hallucination, no inflation.
     """
-    from app.services.ai_service import _ask, _parse_json, SONNET
+    from app.services.ai_service import _ask_with_usage, _parse_json, SONNET
+    from app.services.credit_service import log_usage
 
     required_skills_list = req.required_skills if req.required_skills else []
     responsibilities_list = req.responsibilities if req.responsibilities else []
@@ -390,8 +393,9 @@ to the 6-dimension output by splitting Skills into core_skills + tools_technolog
 and Experience into experience_fit + responsibility_match + leadership_ownership.
 """
 
-    raw = await _ask(prompt, model=SONNET, max_tokens=3000)
-    data = _parse_json(raw)
+    result = await _ask_with_usage(prompt, model=SONNET, max_tokens=3000)
+    log_usage(result, feature="fit_score")
+    data = _parse_json(result.text)
 
     raw_pct = data.get("fit_percentage", 0)
     try:

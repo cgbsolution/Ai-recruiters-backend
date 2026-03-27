@@ -23,6 +23,9 @@ openai>=1.50.0
 pdfplumber>=0.11.0
 python-docx>=1.1.0
 
+# ── Report Generation ──────────────────────────────────────────────────────
+fpdf2>=2.7.0
+
 # ── HTTP / WhatsApp Cloud API ───────────────────────────────────────────────
 requests>=2.32.0
 httpx>=0.27.0

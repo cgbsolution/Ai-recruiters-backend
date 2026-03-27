@@ -20,8 +20,10 @@ from app.services.ai_service import (
     SONNET,
     OPUS,
     _ask_with_system,
+    _ask_with_system_usage,
     _parse_json,
 )
+from app.services.credit_service import log_usage
 
 logger = logging.getLogger(__name__)
 
@@ -357,7 +359,9 @@ async def conduct_turn(
     raw = None
 
     try:
-        raw = await _ask_with_system(system_prompt, claude_messages, model=SONNET, max_tokens=512, timeout_seconds=25)
+        llm_result = await _ask_with_system_usage(system_prompt, claude_messages, model=SONNET, max_tokens=512, timeout_seconds=25)
+        log_usage(llm_result, feature="interview", session_id=session.id)
+        raw = llm_result.text
         result = _parse_json(raw)
     except Exception as e:
         logger.warning(f"Claude attempt 1 failed for session {session.id}: {e}")
@@ -365,7 +369,9 @@ async def conduct_turn(
     # ── Attempt 2: Retry once with shorter timeout ──
     if result is None:
         try:
-            raw = await _ask_with_system(system_prompt, claude_messages, model=SONNET, max_tokens=256, timeout_seconds=20)
+            llm_result = await _ask_with_system_usage(system_prompt, claude_messages, model=SONNET, max_tokens=256, timeout_seconds=20)
+            log_usage(llm_result, feature="interview", session_id=session.id)
+            raw = llm_result.text
             result = _parse_json(raw)
         except Exception as e:
             logger.warning(f"Claude attempt 2 failed for session {session.id}: {e}")
@@ -554,6 +560,8 @@ Then provide:
 - strengths: List of 3-5 specific strengths observed
 - weaknesses: List of 2-4 specific areas for improvement
 - detailed_feedback: 1-2 paragraphs of detailed assessment including how the scoring mode influenced the evaluation
+- per_question_evaluations: For EACH question in the transcript, provide an individual evaluation with score (0-100), list of positives, and list of negatives
+- skills_ratings: Rate the candidate on 3 key skill areas relevant to the position. For each skill provide: skill name, rating (1-5 stars), and a short evaluation paragraph
 
 Return ONLY valid JSON:
 {{
@@ -571,16 +579,25 @@ Return ONLY valid JSON:
   "summary": "...",
   "strengths": ["...", "..."],
   "weaknesses": ["...", "..."],
-  "detailed_feedback": "..."
+  "detailed_feedback": "...",
+  "per_question_evaluations": [
+    {{"index": 1, "score": 65, "positives": ["Good point 1", "Good point 2"], "negatives": ["Weak area 1"]}},
+    {{"index": 2, "score": 72, "positives": ["..."], "negatives": ["..."]}}
+  ],
+  "skills_ratings": [
+    {{"skill": "Relevant Skill Name", "rating": 3, "evaluation": "Short evaluation paragraph..."}},
+    {{"skill": "Another Skill", "rating": 4, "evaluation": "..."}}
+  ]
 }}"""
 
-    raw = await _ask_with_system(
+    llm_result = await _ask_with_system_usage(
         system="You are a senior technical evaluator. Return only valid JSON.",
         messages=[{"role": "user", "content": prompt}],
         model=OPUS,
-        max_tokens=2000,
+        max_tokens=4000,
     )
-    data = _parse_json(raw)
+    log_usage(llm_result, feature="interview", session_id=session.id)
+    data = _parse_json(llm_result.text)
 
     overall = float(data.get("overall_score", 0))
     rec_str = data.get("recommendation", "Maybe")
@@ -606,6 +623,8 @@ Return ONLY valid JSON:
         strengths=json.dumps(data.get("strengths", [])),
         weaknesses=json.dumps(data.get("weaknesses", [])),
         detailed_feedback=data.get("detailed_feedback", ""),
+        per_question_evaluations=json.dumps(data.get("per_question_evaluations", [])),
+        skills_ratings=json.dumps(data.get("skills_ratings", [])),
         meets_threshold=overall >= {"Lenient": 55, "Strict": 75}.get(scoring_mode, 65),
     )
     db.add(evaluation)

@@ -1,7 +1,15 @@
 import json
 from typing import Any
 
-from app.services.llm_provider import ask as _llm_ask, ask_with_system as _llm_ask_with_system, get_model
+from app.services.llm_provider import (
+    ask_with_usage as _llm_ask_usage,
+    ask_with_system_usage as _llm_ask_with_system_usage,
+    ask as _llm_ask,
+    ask_with_system as _llm_ask_with_system,
+    get_model,
+    LLMResult,
+)
+from app.services.credit_service import log_usage
 from app.schemas.ai import (
     EvaluateCandidateRequest,
     EvaluateCandidateResponse,
@@ -30,6 +38,12 @@ async def _ask(prompt: str, model: str = SONNET, max_tokens: int = 1024, retries
     return await _llm_ask(prompt, tier=tier, max_tokens=max_tokens, retries=retries)
 
 
+async def _ask_with_usage(prompt: str, model: str = SONNET, max_tokens: int = 1024, retries: int = 3) -> LLMResult:
+    """Like _ask but returns full LLMResult with token usage."""
+    tier = "advanced" if model in ("advanced", "claude-opus-4-6", "gpt-4o", "gemini-2.5-pro") else "fast"
+    return await _llm_ask_usage(prompt, tier=tier, max_tokens=max_tokens, retries=retries)
+
+
 async def _ask_with_system(
     system: str,
     messages: list,
@@ -41,6 +55,22 @@ async def _ask_with_system(
     """Backward-compatible wrapper. `model` param is treated as tier name."""
     tier = "advanced" if model in ("advanced", "claude-opus-4-6", "gpt-4o", "gemini-2.5-pro") else "fast"
     return await _llm_ask_with_system(
+        system, messages, tier=tier, max_tokens=max_tokens,
+        timeout_seconds=timeout_seconds, retries=retries,
+    )
+
+
+async def _ask_with_system_usage(
+    system: str,
+    messages: list,
+    model: str = SONNET,
+    max_tokens: int = 512,
+    timeout_seconds: int = 25,
+    retries: int = 3,
+) -> LLMResult:
+    """Like _ask_with_system but returns full LLMResult with token usage."""
+    tier = "advanced" if model in ("advanced", "claude-opus-4-6", "gpt-4o", "gemini-2.5-pro") else "fast"
+    return await _llm_ask_with_system_usage(
         system, messages, tier=tier, max_tokens=max_tokens,
         timeout_seconds=timeout_seconds, retries=retries,
     )
@@ -120,8 +150,9 @@ Generate 2–4 skill groups that logically cluster the required skills.
 Generate 4–6 responsibilities relevant to the role.
 coding_questions_count must be at least 1 for technical roles."""
 
-    raw = await _ask(prompt, model=SONNET, max_tokens=2048)
-    data = _parse_json(raw)
+    result = await _ask_with_usage(prompt, model=SONNET, max_tokens=2048)
+    log_usage(result, feature="jd_generation")
+    data = _parse_json(result.text)
     return GenerateJDResponse(**data)
 
 
@@ -177,8 +208,9 @@ Generate 2–4 skill groups that logically cluster the required skills.
 Extract all responsibilities mentioned in the JD.
 coding_questions_count must be at least 1 for technical roles."""
 
-    raw = await _ask(prompt, model=SONNET, max_tokens=2048)
-    data = _parse_json(raw)
+    result = await _ask_with_usage(prompt, model=SONNET, max_tokens=2048)
+    log_usage(result, feature="jd_parsing")
+    data = _parse_json(result.text)
     return GenerateJDResponse(**data)
 
 
@@ -195,8 +227,9 @@ Return ONLY a valid JSON array (no markdown fences):
   {{"text": "question text", "category": "skill category", "difficulty": "{req.difficulty}"}},
   ...
 ]"""
-    raw = await _ask(prompt, model=SONNET, max_tokens=2048)
-    questions = _parse_json(raw)
+    result = await _ask_with_usage(prompt, model=SONNET, max_tokens=2048)
+    log_usage(result, feature="question_generation")
+    questions = _parse_json(result.text)
     return GenerateQuestionsResponse(questions=questions)
 
 
@@ -234,8 +267,9 @@ Evaluate the answer and return ONLY valid JSON (no markdown fences):
   "feedback": "detailed evaluation feedback explaining strengths, weaknesses, and how the scoring mode influenced the score",
   "passed": <true|false based on the pass threshold above>
 }}"""
-    raw = await _ask(prompt, model=OPUS, max_tokens=512)
-    data = _parse_json(raw)
+    result = await _ask_with_usage(prompt, model=OPUS, max_tokens=512)
+    log_usage(result, feature="answer_evaluation")
+    data = _parse_json(result.text)
     return EvaluateCandidateResponse(
         score=data["score"],
         feedback=data["feedback"],
@@ -250,8 +284,9 @@ Difficulty: {req.difficulty}
 
 Return ONLY a valid JSON array of question strings (no markdown fences):
 ["question 1", "question 2", ...]"""
-    raw = await _ask(prompt, model=SONNET, max_tokens=1024)
-    questions = _parse_json(raw)
+    result = await _ask_with_usage(prompt, model=SONNET, max_tokens=1024)
+    log_usage(result, feature="question_suggestion")
+    questions = _parse_json(result.text)
     return SuggestQuestionsResponse(questions=questions)
 
 

@@ -13,6 +13,7 @@ no other file needs to change when switching providers.
 
 import asyncio
 import logging
+from dataclasses import dataclass, field
 from typing import Optional
 
 from app.config import settings
@@ -37,8 +38,36 @@ MODEL_MAP = {
     },
 }
 
+# Approximate cost per 1M tokens (USD) — used for estimated_cost
+COST_PER_1M = {
+    "claude-sonnet-4-6":  {"input": 3.0,  "output": 15.0},
+    "claude-opus-4-6":    {"input": 15.0, "output": 75.0},
+    "gemini-2.5-flash":   {"input": 0.15, "output": 0.60},
+    "gemini-2.5-pro":     {"input": 1.25, "output": 10.0},
+    "gpt-4o-mini":        {"input": 0.15, "output": 0.60},
+    "gpt-4o":             {"input": 2.50, "output": 10.0},
+}
+
 _provider: Optional[str] = None
 _client = None
+
+
+@dataclass
+class LLMResult:
+    """Container for LLM response text + token usage metadata."""
+    text: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    model: str = ""
+    provider: str = ""
+    tier: str = ""
+    estimated_cost: float = 0.0
+
+
+def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    rates = COST_PER_1M.get(model, {"input": 0, "output": 0})
+    return (input_tokens * rates["input"] + output_tokens * rates["output"]) / 1_000_000
 
 
 def get_provider() -> str:
@@ -73,7 +102,7 @@ def _get_anthropic_client():
     return _client
 
 
-async def _anthropic_ask(prompt: str, model: str, max_tokens: int, retries: int) -> str:
+async def _anthropic_ask(prompt: str, model: str, max_tokens: int, retries: int) -> LLMResult:
     import anthropic
     client = _get_anthropic_client()
     for attempt in range(retries):
@@ -83,7 +112,17 @@ async def _anthropic_ask(prompt: str, model: str, max_tokens: int, retries: int)
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return message.content[0].text
+            inp = getattr(message.usage, "input_tokens", 0) or 0
+            out = getattr(message.usage, "output_tokens", 0) or 0
+            return LLMResult(
+                text=message.content[0].text,
+                input_tokens=inp,
+                output_tokens=out,
+                total_tokens=inp + out,
+                model=model,
+                provider="anthropic",
+                estimated_cost=_estimate_cost(model, inp, out),
+            )
         except anthropic.APIStatusError as exc:
             if exc.status_code == 529 and attempt < retries - 1:
                 await asyncio.sleep(2 ** attempt)
@@ -94,7 +133,7 @@ async def _anthropic_ask(prompt: str, model: str, max_tokens: int, retries: int)
 async def _anthropic_ask_with_system(
     system: str, messages: list, model: str, max_tokens: int,
     timeout_seconds: int, retries: int,
-) -> str:
+) -> LLMResult:
     import anthropic
     client = _get_anthropic_client()
     for attempt in range(retries):
@@ -106,7 +145,17 @@ async def _anthropic_ask_with_system(
                 messages=messages,
                 timeout=timeout_seconds,
             )
-            return response.content[0].text
+            inp = getattr(response.usage, "input_tokens", 0) or 0
+            out = getattr(response.usage, "output_tokens", 0) or 0
+            return LLMResult(
+                text=response.content[0].text,
+                input_tokens=inp,
+                output_tokens=out,
+                total_tokens=inp + out,
+                model=model,
+                provider="anthropic",
+                estimated_cost=_estimate_cost(model, inp, out),
+            )
         except anthropic.APIStatusError as exc:
             if exc.status_code == 529 and attempt < retries - 1:
                 await asyncio.sleep(2 ** attempt)
@@ -124,7 +173,7 @@ def _get_gemini_client():
     return _client
 
 
-async def _gemini_ask(prompt: str, model: str, max_tokens: int, retries: int) -> str:
+async def _gemini_ask(prompt: str, model: str, max_tokens: int, retries: int) -> LLMResult:
     from google.genai import types
     client = _get_gemini_client()
     for attempt in range(retries):
@@ -139,7 +188,18 @@ async def _gemini_ask(prompt: str, model: str, max_tokens: int, retries: int) ->
                     response_mime_type="application/json",
                 ),
             )
-            return response.text
+            usage = getattr(response, "usage_metadata", None)
+            inp = getattr(usage, "prompt_token_count", 0) or 0 if usage else 0
+            out = getattr(usage, "candidates_token_count", 0) or 0 if usage else 0
+            return LLMResult(
+                text=response.text,
+                input_tokens=inp,
+                output_tokens=out,
+                total_tokens=inp + out,
+                model=model,
+                provider="gemini",
+                estimated_cost=_estimate_cost(model, inp, out),
+            )
         except Exception as exc:
             logger.warning("Gemini API attempt %d/%d failed: %s", attempt + 1, retries, exc)
             if attempt < retries - 1:
@@ -152,7 +212,7 @@ async def _gemini_ask(prompt: str, model: str, max_tokens: int, retries: int) ->
 async def _gemini_ask_with_system(
     system: str, messages: list, model: str, max_tokens: int,
     timeout_seconds: int, retries: int,
-) -> str:
+) -> LLMResult:
     from google.genai import types
     client = _get_gemini_client()
 
@@ -174,7 +234,18 @@ async def _gemini_ask_with_system(
                     temperature=0.3,
                 ),
             )
-            return response.text
+            usage = getattr(response, "usage_metadata", None)
+            inp = getattr(usage, "prompt_token_count", 0) or 0 if usage else 0
+            out = getattr(usage, "candidates_token_count", 0) or 0 if usage else 0
+            return LLMResult(
+                text=response.text,
+                input_tokens=inp,
+                output_tokens=out,
+                total_tokens=inp + out,
+                model=model,
+                provider="gemini",
+                estimated_cost=_estimate_cost(model, inp, out),
+            )
         except Exception as exc:
             logger.warning("Gemini API (system) attempt %d/%d failed: %s", attempt + 1, retries, exc)
             if attempt < retries - 1:
@@ -194,7 +265,7 @@ def _get_openai_client():
     return _client
 
 
-async def _openai_ask(prompt: str, model: str, max_tokens: int, retries: int) -> str:
+async def _openai_ask(prompt: str, model: str, max_tokens: int, retries: int) -> LLMResult:
     client = _get_openai_client()
     for attempt in range(retries):
         try:
@@ -203,7 +274,18 @@ async def _openai_ask(prompt: str, model: str, max_tokens: int, retries: int) ->
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return response.choices[0].message.content
+            usage = response.usage
+            inp = getattr(usage, "prompt_tokens", 0) or 0 if usage else 0
+            out = getattr(usage, "completion_tokens", 0) or 0 if usage else 0
+            return LLMResult(
+                text=response.choices[0].message.content,
+                input_tokens=inp,
+                output_tokens=out,
+                total_tokens=inp + out,
+                model=model,
+                provider="openai",
+                estimated_cost=_estimate_cost(model, inp, out),
+            )
         except Exception as exc:
             if attempt < retries - 1:
                 await asyncio.sleep(2 ** attempt)
@@ -214,7 +296,7 @@ async def _openai_ask(prompt: str, model: str, max_tokens: int, retries: int) ->
 async def _openai_ask_with_system(
     system: str, messages: list, model: str, max_tokens: int,
     timeout_seconds: int, retries: int,
-) -> str:
+) -> LLMResult:
     client = _get_openai_client()
 
     # Convert to OpenAI format
@@ -231,12 +313,69 @@ async def _openai_ask_with_system(
                 messages=oai_messages,
                 timeout=timeout_seconds,
             )
-            return response.choices[0].message.content
+            usage = response.usage
+            inp = getattr(usage, "prompt_tokens", 0) or 0 if usage else 0
+            out = getattr(usage, "completion_tokens", 0) or 0 if usage else 0
+            return LLMResult(
+                text=response.choices[0].message.content,
+                input_tokens=inp,
+                output_tokens=out,
+                total_tokens=inp + out,
+                model=model,
+                provider="openai",
+                estimated_cost=_estimate_cost(model, inp, out),
+            )
         except Exception as exc:
             if attempt < retries - 1:
                 await asyncio.sleep(2 ** attempt)
                 continue
             raise
+
+
+# ── Internal dispatchers (return full LLMResult) ─────────────────────────────
+
+async def _ask_full(
+    prompt: str,
+    tier: str = "fast",
+    max_tokens: int = 1024,
+    retries: int = 3,
+) -> LLMResult:
+    provider = get_provider()
+    model = get_model(tier)
+    dispatch = {
+        "anthropic": _anthropic_ask,
+        "gemini": _gemini_ask,
+        "openai": _openai_ask,
+    }
+    fn = dispatch.get(provider)
+    if fn is None:
+        raise ValueError(f"Unknown provider: {provider}")
+    result = await fn(prompt, model, max_tokens, retries)
+    result.tier = tier
+    return result
+
+
+async def _ask_with_system_full(
+    system: str,
+    messages: list,
+    tier: str = "fast",
+    max_tokens: int = 512,
+    timeout_seconds: int = 25,
+    retries: int = 3,
+) -> LLMResult:
+    provider = get_provider()
+    model = get_model(tier)
+    dispatch = {
+        "anthropic": _anthropic_ask_with_system,
+        "gemini": _gemini_ask_with_system,
+        "openai": _openai_ask_with_system,
+    }
+    fn = dispatch.get(provider)
+    if fn is None:
+        raise ValueError(f"Unknown provider: {provider}")
+    result = await fn(system, messages, model, max_tokens, timeout_seconds, retries)
+    result.tier = tier
+    return result
 
 
 # ── Public API (provider-agnostic) ──────────────────────────────────────────
@@ -249,18 +388,22 @@ async def ask(
 ) -> str:
     """
     Send a simple prompt to the LLM. tier = "fast" or "advanced".
+    Returns only the text (backward-compatible).
     """
-    provider = get_provider()
-    model = get_model(tier)
+    result = await _ask_full(prompt, tier, max_tokens, retries)
+    return result.text
 
-    if provider == "anthropic":
-        return await _anthropic_ask(prompt, model, max_tokens, retries)
-    elif provider == "gemini":
-        return await _gemini_ask(prompt, model, max_tokens, retries)
-    elif provider == "openai":
-        return await _openai_ask(prompt, model, max_tokens, retries)
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
+
+async def ask_with_usage(
+    prompt: str,
+    tier: str = "fast",
+    max_tokens: int = 1024,
+    retries: int = 3,
+) -> LLMResult:
+    """
+    Send a simple prompt to the LLM. Returns full LLMResult with token usage.
+    """
+    return await _ask_full(prompt, tier, max_tokens, retries)
 
 
 async def ask_with_system(
@@ -273,15 +416,21 @@ async def ask_with_system(
 ) -> str:
     """
     Send a system prompt + message history to the LLM. tier = "fast" or "advanced".
+    Returns only the text (backward-compatible).
     """
-    provider = get_provider()
-    model = get_model(tier)
+    result = await _ask_with_system_full(system, messages, tier, max_tokens, timeout_seconds, retries)
+    return result.text
 
-    if provider == "anthropic":
-        return await _anthropic_ask_with_system(system, messages, model, max_tokens, timeout_seconds, retries)
-    elif provider == "gemini":
-        return await _gemini_ask_with_system(system, messages, model, max_tokens, timeout_seconds, retries)
-    elif provider == "openai":
-        return await _openai_ask_with_system(system, messages, model, max_tokens, timeout_seconds, retries)
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
+
+async def ask_with_system_usage(
+    system: str,
+    messages: list,
+    tier: str = "fast",
+    max_tokens: int = 512,
+    timeout_seconds: int = 25,
+    retries: int = 3,
+) -> LLMResult:
+    """
+    Send a system prompt + message history to the LLM. Returns full LLMResult with token usage.
+    """
+    return await _ask_with_system_full(system, messages, tier, max_tokens, timeout_seconds, retries)

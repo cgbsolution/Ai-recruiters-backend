@@ -167,7 +167,24 @@ def update_job(job_id: int, payload: JobUpdate, background_tasks: BackgroundTask
     return result.model_copy(update={"interview_token": _get_active_token(db, job_id)})
 
 
-@router.delete("/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{job_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a job opening",
+    description=(
+        "Permanently deletes a job opening and **all** associated data:\n\n"
+        "- Skills, responsibilities, questions, interview settings\n"
+        "- Interview tokens, sessions (with messages, violations, evaluations)\n"
+        "- Meeting slots and schedules\n"
+        "- Job metadata, pre-interview fields, scoring training data\n"
+        "- Candidates are **not deleted** — their `job_id` is set to `null`\n\n"
+        "**This action cannot be undone.**"
+    ),
+    responses={
+        204: {"description": "Job and all related data deleted successfully"},
+        404: {"description": "Job not found"},
+    },
+)
 def delete_job(job_id: int, db: Session = Depends(get_db)):
     ok = job_service.delete_job(db, job_id)
     if not ok:

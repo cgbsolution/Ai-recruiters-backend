@@ -16,7 +16,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 from app.database import Base, engine
-from app.routers import ai, candidates, interview, jobs, questions, resume_database, uploads
+from app.routers import ai, candidates, credits, interview, jobs, questions, resume_database, uploads
 
 import app.models  # noqa: F401 — ensure all models are registered with Base
 
@@ -103,7 +103,7 @@ Full-stack recruitment platform with AI-powered features including a live AI Ava
 | Area | Description |
 |---|---|
 | **Jobs** | Create and manage job openings with skills, responsibilities, interview settings, and question banks |
-| **Candidates** | Add manually or upload resumes (PDF/DOCX) with auto-parsing and fit-score computation |
+| **Candidates** | Add manually or upload resumes (PDF/DOCX) with parallel auto-parsing (Haiku) and instant fit-score computation |
 | **AI Tools** | Generate JDs, interview questions, evaluate answers, parse resumes, compute fit scores |
 | **Scheduling** | Schedule interviews with email (SMTP) + WhatsApp (Meta Business API) notifications |
 | **Pipeline** | Stage progression: Candidates → AI Round → Panel Round → Offer-Made / Rejected |
@@ -156,11 +156,15 @@ Currently open (no auth). Add Bearer token middleware before production.
 
 ### File Uploads
 - JD files: `POST /uploads/jd` — PDF / DOC / DOCX ≤ 10 MB
-- Resume files: `POST /candidates/upload-resume` — multipart, multiple files
+- Resume files: `POST /candidates/upload-resume` — multipart, multiple files, parallel parsing (3 concurrent)
+- Bulk resumes: `POST /resume-database/upload` — batch upload to central database
 - Static files served at `/uploads/...`
 
 ### Models
-Claude `claude-sonnet-4-6` for interview turns · Claude `claude-opus-4-6` for evaluations
+- Claude `claude-haiku-4-5` for resume parsing (fast, ~1-2s)
+- Claude `claude-sonnet-4-6` for interview turns and fit-score deep analysis
+- Claude `claude-opus-4-6` for interview evaluations
+- Smart scoring engine (no AI) for instant fit-score during upload (~50ms)
 """
 
 app = FastAPI(
@@ -175,16 +179,25 @@ app = FastAPI(
             "name": "Jobs",
             "description": (
                 "CRUD for job openings and all nested data: skills, responsibilities, "
-                "interview settings, question banks, pre-interview fields. "
+                "interview settings, question banks, pre-interview fields.\n\n"
+                "**Delete** permanently removes the job and all associated data "
+                "(skills, responsibilities, questions, settings, tokens, sessions, "
+                "meeting slots, metadata, pre-interview fields, scoring training data). "
+                "Candidates are preserved with `job_id` set to `null`.\n\n"
                 "Also includes: generate interview URL, list interview sessions, add meeting slots."
             ),
         },
         {
             "name": "Candidates",
             "description": (
-                "Candidate management: create manually, upload & auto-parse resumes (PDF/DOCX), "
-                "compute LLM fit score, schedule interview (email + WhatsApp), "
-                "promote through hiring stages, view evaluation report."
+                "Candidate management: create manually, upload & auto-parse resumes (PDF/DOCX).\n\n"
+                "**Resume Upload** processes up to 3 resumes in parallel using Claude Haiku (~1-2s each). "
+                "Fit scores are computed instantly via the 12-dimension smart scoring engine. "
+                "Poll `GET /candidates/{id}/parsing-status` for progressive updates.\n\n"
+                "**Fit Score Recompute** (`POST /candidates/{id}/compute-fit-score`) uses full AI "
+                "semantic analysis for higher accuracy (~15-20s).\n\n"
+                "Also: schedule interview (email + WhatsApp), promote through hiring stages, "
+                "view evaluation report."
             ),
         },
         {
@@ -212,6 +225,22 @@ app = FastAPI(
         {
             "name": "Uploads",
             "description": "File upload endpoint for Job Description documents (PDF / DOC / DOCX ≤ 10 MB).",
+        },
+        {
+            "name": "Resume Database",
+            "description": (
+                "Central resume store — bulk upload, parse, and search resumes independently of jobs. "
+                "Supports batch upload with choice of fast (regex) or AI (Claude) parsing. "
+                "Use `POST /jobs/{job_id}/match-candidates` to match database resumes against a job."
+            ),
+        },
+        {
+            "name": "AI Credits",
+            "description": (
+                "AI credit usage analytics — monthly, weekly, and daily token consumption "
+                "broken down by feature (Interview, JD Generation, Resume Parsing, Fit Score, etc.). "
+                "Powers the admin dashboard usage chart."
+            ),
         },
         {
             "name": "Health",
@@ -248,6 +277,7 @@ app.include_router(ai.router, prefix="/ai", tags=["AI"])
 app.include_router(uploads.router, prefix="/uploads", tags=["Uploads"])
 app.include_router(interview.router, tags=["Interview"])
 app.include_router(resume_database.router, prefix="/resume-database", tags=["Resume Database"])
+app.include_router(credits.router, prefix="/credits", tags=["AI Credits"])
 
 
 @app.get("/health", tags=["Health"])
