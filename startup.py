@@ -1,6 +1,6 @@
 """
-Startup script: ensures all required DB columns exist,
-then runs alembic stamp + upgrade to stay in sync.
+Startup script: ensures all required DB tables/columns exist,
+then runs alembic upgrade to stay in sync.
 """
 import logging
 from sqlalchemy import text
@@ -34,6 +34,68 @@ REQUIRED_COLUMNS = [
     ("candidates", "allow_joining_early", "BOOLEAN", "FALSE"),
 ]
 
+# Tables that need to be created if they don't exist.
+# These use CREATE TABLE IF NOT EXISTS so they're safe to run repeatedly.
+REQUIRED_TABLES = [
+    # Migration: j0k1l2m3n4o5_add_per_question_evaluations
+    """
+    CREATE TABLE IF NOT EXISTS per_question_evaluations (
+        id SERIAL PRIMARY KEY,
+        session_id INTEGER NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
+        question_index INTEGER NOT NULL DEFAULT 0,
+        question_text TEXT NOT NULL,
+        answer_text TEXT,
+        score FLOAT DEFAULT 0,
+        feedback TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+    )
+    """,
+    # Migration: k1l2m3n4o5p6_add_ai_credit_usage
+    """
+    CREATE TABLE IF NOT EXISTS ai_credit_usage (
+        id SERIAL PRIMARY KEY,
+        feature VARCHAR(50) NOT NULL,
+        provider VARCHAR(20) NOT NULL,
+        model VARCHAR(60) NOT NULL,
+        tier VARCHAR(20) NOT NULL,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0,
+        estimated_cost FLOAT NOT NULL DEFAULT 0.0,
+        job_id INTEGER,
+        candidate_id INTEGER,
+        session_id INTEGER,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+    """,
+]
+
+# Indexes to create (safe with IF NOT EXISTS)
+REQUIRED_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS ix_ai_credit_usage_feature ON ai_credit_usage (feature)",
+    "CREATE INDEX IF NOT EXISTS ix_ai_credit_usage_created_at ON ai_credit_usage (created_at)",
+    "CREATE INDEX IF NOT EXISTS ix_ai_credit_usage_id ON ai_credit_usage (id)",
+    "CREATE INDEX IF NOT EXISTS ix_per_question_evaluations_session_id ON per_question_evaluations (session_id)",
+]
+
+
+def ensure_tables():
+    """Create any missing tables."""
+    with engine.connect() as conn:
+        for ddl in REQUIRED_TABLES:
+            try:
+                conn.execute(text(ddl))
+                logger.info("Ensured table from DDL")
+            except Exception as e:
+                logger.warning("Table creation: %s", e)
+        for idx in REQUIRED_INDEXES:
+            try:
+                conn.execute(text(idx))
+            except Exception as e:
+                logger.warning("Index creation: %s", e)
+        conn.commit()
+    logger.info("All required tables verified.")
+
 
 def ensure_columns():
     """Add any missing columns to the database."""
@@ -52,3 +114,4 @@ def ensure_columns():
 
 if __name__ == "__main__":
     ensure_columns()
+    ensure_tables()
