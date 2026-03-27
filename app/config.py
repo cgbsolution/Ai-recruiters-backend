@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
-    CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000,https://ai-recruiters-frontend.vercel.app"
+    CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000,https://ai-recruiters-frontend.vercel.app,https://myepfo.com,https://www.myepfo.com"
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod

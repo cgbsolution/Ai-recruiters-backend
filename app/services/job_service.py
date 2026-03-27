@@ -129,49 +129,84 @@ def update_job(db: Session, job_id: int, data: JobUpdate) -> Optional[Job]:
 
 
 def delete_job(db: Session, job_id: int) -> bool:
-    from app.models.interview import InterviewToken, InterviewSession, MeetingSlot, MeetingSchedule
+    from app.models.interview import (
+        InterviewToken, InterviewSession, InterviewMessage,
+        Violation, Evaluation, CandidateFeedback,
+        MeetingSlot, MeetingSchedule,
+    )
     from app.models.job_metadata import JobMetadata
+    from sqlalchemy import text
+    import logging
+
+    logger = logging.getLogger("delete_job")
 
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         return False
 
-    # Delete related records in correct order (child → parent)
+    try:
+        # 1. Collect session IDs for this job
+        session_ids = [
+            s.id for s in
+            db.query(InterviewSession.id).filter(InterviewSession.job_id == job_id).all()
+        ]
 
-    # Meeting schedules (linked via slot_id, not job_id)
-    slot_ids = [s.id for s in db.query(MeetingSlot.id).filter(MeetingSlot.job_id == job_id).all()]
-    if slot_ids:
-        db.query(MeetingSchedule).filter(MeetingSchedule.slot_id.in_(slot_ids)).delete(synchronize_session="fetch")
-    db.query(MeetingSlot).filter(MeetingSlot.job_id == job_id).delete(synchronize_session="fetch")
+        if session_ids:
+            # 2. Delete deepest children first (session-linked)
+            db.query(InterviewMessage).filter(InterviewMessage.session_id.in_(session_ids)).delete(synchronize_session="fetch")
+            db.query(Violation).filter(Violation.session_id.in_(session_ids)).delete(synchronize_session="fetch")
+            db.query(Evaluation).filter(Evaluation.session_id.in_(session_ids)).delete(synchronize_session="fetch")
+            db.query(CandidateFeedback).filter(CandidateFeedback.session_id.in_(session_ids)).delete(synchronize_session="fetch")
+            db.query(MeetingSchedule).filter(MeetingSchedule.session_id.in_(session_ids)).delete(synchronize_session="fetch")
 
-    # Interview sessions (via tokens) — DB cascade handles messages, violations, evaluations
-    token_ids = [t.id for t in db.query(InterviewToken.id).filter(InterviewToken.job_id == job_id).all()]
-    if token_ids:
-        db.query(InterviewSession).filter(InterviewSession.token_id.in_(token_ids)).delete(synchronize_session="fetch")
+            # Delete per_question_evaluations if table exists
+            try:
+                db.execute(text("DELETE FROM per_question_evaluations WHERE session_id = ANY(:sids)"), {"sids": session_ids})
+            except Exception:
+                pass  # table may not exist
+
+            # 3. Delete sessions themselves
+            db.query(InterviewSession).filter(InterviewSession.job_id == job_id).delete(synchronize_session="fetch")
+
+        # 4. Delete tokens
         db.query(InterviewToken).filter(InterviewToken.job_id == job_id).delete(synchronize_session="fetch")
 
-    # Job children
-    db.query(JobSkill).filter(JobSkill.job_id == job_id).delete(synchronize_session="fetch")
-    db.query(JobResponsibility).filter(JobResponsibility.job_id == job_id).delete(synchronize_session="fetch")
-    db.query(JobQuestion).filter(JobQuestion.job_id == job_id).delete(synchronize_session="fetch")
-    db.query(InterviewSettings).filter(InterviewSettings.job_id == job_id).delete(synchronize_session="fetch")
+        # 5. Meeting slots (not session-linked, but job-linked)
+        slot_ids = [s.id for s in db.query(MeetingSlot.id).filter(MeetingSlot.job_id == job_id).all()]
+        if slot_ids:
+            db.query(MeetingSchedule).filter(MeetingSchedule.slot_id.in_(slot_ids)).delete(synchronize_session="fetch")
+        db.query(MeetingSlot).filter(MeetingSlot.job_id == job_id).delete(synchronize_session="fetch")
 
-    # Job metadata
-    db.query(JobMetadata).filter(JobMetadata.job_id == job_id).delete(synchronize_session="fetch")
+        # 6. Job children
+        db.query(JobSkill).filter(JobSkill.job_id == job_id).delete(synchronize_session="fetch")
+        db.query(JobResponsibility).filter(JobResponsibility.job_id == job_id).delete(synchronize_session="fetch")
+        db.query(JobQuestion).filter(JobQuestion.job_id == job_id).delete(synchronize_session="fetch")
+        db.query(InterviewSettings).filter(InterviewSettings.job_id == job_id).delete(synchronize_session="fetch")
 
-    # Pre-interview fields & scoring training data (no ORM model — use raw SQL)
-    from sqlalchemy import text
-    db.execute(text("DELETE FROM job_pre_interview_fields WHERE job_id = :jid"), {"jid": job_id})
-    db.execute(text("DELETE FROM scoring_training_data WHERE job_id = :jid"), {"jid": job_id})
+        # 7. Job metadata
+        db.query(JobMetadata).filter(JobMetadata.job_id == job_id).delete(synchronize_session="fetch")
 
-    # Nullify candidate FK
-    db.query(Candidate).filter(Candidate.job_id == job_id).update(
-        {Candidate.job_id: None}, synchronize_session="fetch"
-    )
+        # 8. Tables without ORM models (safe — skip if they don't exist)
+        for tbl in ("job_pre_interview_fields", "scoring_training_data", "ai_credit_usage"):
+            try:
+                db.execute(text(f"DELETE FROM {tbl} WHERE job_id = :jid"), {"jid": job_id})
+            except Exception:
+                pass  # table may not exist on this server
 
-    db.delete(job)
-    db.commit()
-    return True
+        # 9. Nullify candidate FK
+        db.query(Candidate).filter(Candidate.job_id == job_id).update(
+            {Candidate.job_id: None}, synchronize_session="fetch"
+        )
+
+        # 10. Delete the job
+        db.delete(job)
+        db.commit()
+        return True
+
+    except Exception as e:
+        db.rollback()
+        logger.error("Failed to delete job %d: %s", job_id, e, exc_info=True)
+        raise
 
 
 def _pct_change(current: int, previous: int) -> float:
