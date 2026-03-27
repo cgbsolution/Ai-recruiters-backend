@@ -128,6 +128,15 @@ def update_job(db: Session, job_id: int, data: JobUpdate) -> Optional[Job]:
     return job
 
 
+def _safe_delete(db: Session, sql: str, params: dict, logger):
+    """Execute a DELETE inside a SAVEPOINT so failures don't poison the transaction."""
+    try:
+        with db.begin_nested():
+            db.execute(text(sql), params)
+    except Exception as e:
+        logger.warning("Skipped: %s — %s", sql[:60], e)
+
+
 def delete_job(db: Session, job_id: int) -> bool:
     from app.models.interview import (
         InterviewToken, InterviewSession, InterviewMessage,
@@ -135,7 +144,7 @@ def delete_job(db: Session, job_id: int) -> bool:
         MeetingSlot, MeetingSchedule,
     )
     from app.models.job_metadata import JobMetadata
-    from sqlalchemy import text, inspect
+    from sqlalchemy import text
     import logging
 
     logger = logging.getLogger("delete_job")
@@ -145,10 +154,6 @@ def delete_job(db: Session, job_id: int) -> bool:
         return False
 
     try:
-        # Check which tables exist in the database
-        inspector = inspect(db.bind)
-        existing_tables = set(inspector.get_table_names())
-
         # 1. Collect session IDs for this job
         session_ids = [
             s.id for s in
@@ -163,11 +168,10 @@ def delete_job(db: Session, job_id: int) -> bool:
             db.query(CandidateFeedback).filter(CandidateFeedback.session_id.in_(session_ids)).delete(synchronize_session="fetch")
             db.query(MeetingSchedule).filter(MeetingSchedule.session_id.in_(session_ids)).delete(synchronize_session="fetch")
 
-            # Delete per_question_evaluations if the table exists
-            if "per_question_evaluations" in existing_tables:
-                placeholders = ",".join(f":sid{i}" for i in range(len(session_ids)))
-                params = {f"sid{i}": sid for i, sid in enumerate(session_ids)}
-                db.execute(text(f"DELETE FROM per_question_evaluations WHERE session_id IN ({placeholders})"), params)
+            # Delete per_question_evaluations (table may not exist — use SAVEPOINT)
+            placeholders = ",".join(f":sid{i}" for i in range(len(session_ids)))
+            params = {f"sid{i}": sid for i, sid in enumerate(session_ids)}
+            _safe_delete(db, f"DELETE FROM per_question_evaluations WHERE session_id IN ({placeholders})", params, logger)
 
             # 3. Delete sessions themselves
             db.query(InterviewSession).filter(InterviewSession.job_id == job_id).delete(synchronize_session="fetch")
@@ -187,13 +191,16 @@ def delete_job(db: Session, job_id: int) -> bool:
         db.query(JobQuestion).filter(JobQuestion.job_id == job_id).delete(synchronize_session="fetch")
         db.query(InterviewSettings).filter(InterviewSettings.job_id == job_id).delete(synchronize_session="fetch")
 
-        # 7. Job metadata
-        db.query(JobMetadata).filter(JobMetadata.job_id == job_id).delete(synchronize_session="fetch")
+        # 7. Job metadata (table may not exist — use SAVEPOINT)
+        try:
+            with db.begin_nested():
+                db.query(JobMetadata).filter(JobMetadata.job_id == job_id).delete(synchronize_session="fetch")
+        except Exception as e:
+            logger.warning("Skipped job_metadata delete: %s", e)
 
-        # 8. Tables without ORM models — only delete if they exist
+        # 8. Tables without ORM models (may not exist — use SAVEPOINT for each)
         for tbl in ("job_pre_interview_fields", "scoring_training_data", "ai_credit_usage"):
-            if tbl in existing_tables:
-                db.execute(text(f"DELETE FROM {tbl} WHERE job_id = :jid"), {"jid": job_id})
+            _safe_delete(db, f"DELETE FROM {tbl} WHERE job_id = :jid", {"jid": job_id}, logger)
 
         # 9. Nullify candidate FK
         db.query(Candidate).filter(Candidate.job_id == job_id).update(
