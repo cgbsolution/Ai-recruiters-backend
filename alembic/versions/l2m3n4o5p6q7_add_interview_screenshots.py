@@ -15,29 +15,35 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.create_table(
-        "interview_screenshots",
-        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
-        sa.Column(
-            "session_id",
-            sa.Integer(),
-            sa.ForeignKey("interview_sessions.id", ondelete="CASCADE"),
-            nullable=False,
-            index=True,
-        ),
-        sa.Column("file_path", sa.String(500), nullable=False),
-        sa.Column(
-            "captured_at",
-            sa.DateTime(),
-            nullable=False,
-            server_default=sa.func.now(),
-        ),
-    )
-    op.create_index(
-        "ix_interview_screenshots_session_id",
-        "interview_screenshots",
-        ["session_id"],
-    )
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    if "interview_screenshots" not in inspector.get_table_names():
+        op.create_table(
+            "interview_screenshots",
+            sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
+            sa.Column(
+                "session_id",
+                sa.Integer(),
+                sa.ForeignKey("interview_sessions.id", ondelete="CASCADE"),
+                nullable=False,
+                index=True,
+            ),
+            sa.Column("file_path", sa.String(500), nullable=False),
+            sa.Column(
+                "captured_at",
+                sa.DateTime(),
+                nullable=False,
+                server_default=sa.func.now(),
+            ),
+        )
+    if "ix_interview_screenshots_session_id" not in [
+        idx["name"] for idx in inspector.get_indexes("interview_screenshots")
+    ]:
+        op.create_index(
+            "ix_interview_screenshots_session_id",
+            "interview_screenshots",
+            ["session_id"],
+        )
 
 
 def downgrade() -> None:

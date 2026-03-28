@@ -68,6 +68,15 @@ REQUIRED_TABLES = [
         created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
     """,
+    # Migration: l2m3n4o5p6q7_add_interview_screenshots
+    """
+    CREATE TABLE IF NOT EXISTS interview_screenshots (
+        id SERIAL PRIMARY KEY,
+        session_id INTEGER NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
+        file_path VARCHAR(500) NOT NULL,
+        captured_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+    """,
 ]
 
 # Indexes to create (safe with IF NOT EXISTS)
@@ -76,6 +85,7 @@ REQUIRED_INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_ai_credit_usage_created_at ON ai_credit_usage (created_at)",
     "CREATE INDEX IF NOT EXISTS ix_ai_credit_usage_id ON ai_credit_usage (id)",
     "CREATE INDEX IF NOT EXISTS ix_per_question_evaluations_session_id ON per_question_evaluations (session_id)",
+    "CREATE INDEX IF NOT EXISTS ix_interview_screenshots_session_id ON interview_screenshots (session_id)",
 ]
 
 
