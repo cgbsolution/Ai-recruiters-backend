@@ -171,10 +171,68 @@ def update_candidate(
     return candidate
 
 
+def _cleanup_candidate_files(db: Session, candidate: Candidate) -> None:
+    """Delete all files associated with a candidate: recordings, screenshots, resume."""
+    import os
+    import shutil
+    import logging
+
+    from app.models.interview import InterviewSession, InterviewScreenshot
+
+    logger = logging.getLogger("candidate_cleanup")
+    _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+    _upload_root = "/tmp/uploads" if _is_serverless else "uploads"
+
+    # 1. Delete recording file
+    if candidate.recording_link:
+        # recording_link is like "/uploads/recordings/123.webm"
+        rel = candidate.recording_link.lstrip("/")
+        if _is_serverless:
+            rel = rel.replace("uploads/", "tmp/uploads/", 1) if rel.startswith("uploads/") else rel
+        file_path = os.path.join(os.getcwd(), rel) if not _is_serverless else f"/{rel}"
+        try:
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+                logger.info("Deleted recording: %s", file_path)
+        except Exception as e:
+            logger.warning("Failed to delete recording %s: %s", file_path, e)
+
+    # 2. Delete screenshot directories for all sessions of this candidate
+    session_ids = [
+        s.id for s in
+        db.query(InterviewSession.id).filter(InterviewSession.candidate_id == candidate.id).all()
+    ]
+    for sid in session_ids:
+        screenshot_dir = f"{_upload_root}/screenshots/{sid}"
+        try:
+            if os.path.isdir(screenshot_dir):
+                shutil.rmtree(screenshot_dir)
+                logger.info("Deleted screenshot dir: %s", screenshot_dir)
+        except Exception as e:
+            logger.warning("Failed to delete screenshot dir %s: %s", screenshot_dir, e)
+
+    # 3. Delete resume file
+    if candidate.resume_path:
+        rel = candidate.resume_path.lstrip("/")
+        if _is_serverless:
+            rel = rel.replace("uploads/", "tmp/uploads/", 1) if rel.startswith("uploads/") else rel
+        file_path = os.path.join(os.getcwd(), rel) if not _is_serverless else f"/{rel}"
+        try:
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+                logger.info("Deleted resume: %s", file_path)
+        except Exception as e:
+            logger.warning("Failed to delete resume %s: %s", file_path, e)
+
+
 def delete_candidate(db: Session, candidate_id: int) -> bool:
     candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
     if not candidate:
         return False
+
+    # Clean up associated files before deleting the DB record
+    _cleanup_candidate_files(db, candidate)
+
     db.delete(candidate)
     db.commit()
     return True

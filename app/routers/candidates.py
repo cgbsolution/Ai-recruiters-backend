@@ -1106,10 +1106,13 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
         .first()
     )
 
+    screenshots_list = []
+
     if latest_session:
         session_info = {
-            "started_at": latest_session.started_at.isoformat() if latest_session.started_at else None,
-            "completed_at": latest_session.completed_at.isoformat() if latest_session.completed_at else None,
+            "id": latest_session.id,
+            "started_at": (latest_session.started_at.isoformat() + "Z") if latest_session.started_at else None,
+            "completed_at": (latest_session.completed_at.isoformat() + "Z") if latest_session.completed_at else None,
             "violation_count": latest_session.violation_count or 0,
             "status": latest_session.status.value,
         }
@@ -1127,11 +1130,35 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
                 "role": msg.role,
                 "content": msg.content,
                 "question_index": msg.question_index,
-                "timestamp": msg.created_at.isoformat() if msg.created_at else None,
+                "timestamp": (msg.created_at.isoformat() + "Z") if msg.created_at else None,
             })
 
         # Group by question_index into Q&A pairs
         qa_map: dict = {}
+
+        def _extract_question(text: str) -> str:
+            """Strip conversational preamble to isolate the actual question."""
+            import re as _re
+            # Common AI transition patterns before the question
+            # e.g., "Great, thanks! So let's get started. Can you explain..."
+            # Split on patterns like "Let's get started.", "Moving on,", "Next question —"
+            separators = [
+                r"(?:So |Now )?[Ll]et(?:'s| us) (?:get started|begin|move on|dive in)[.!]?\s*",
+                r"(?:Great|Good|Thanks|Thank you|Interesting|That's (?:great|good|fair|interesting))[^.?!]*[.!]\s*",
+                r"Moving on[,.]?\s*",
+                r"Next question[.:\s—–-]+",
+                r"Let me ask you[.:\s—–-]+",
+                r"Here's (?:the next|another|my next) question[.:\s—–-]+",
+            ]
+            # Try each separator — take the part AFTER the last preamble match
+            best = text
+            for sep in separators:
+                parts = _re.split(sep, text, maxsplit=1)
+                if len(parts) > 1 and len(parts[-1].strip()) > 20:
+                    best = parts[-1].strip()
+                    text = best  # chain — strip multiple preambles
+            return best
+
         for msg in messages:
             qi = msg.question_index or 0
             if qi == 0:
@@ -1139,12 +1166,13 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
             if qi not in qa_map:
                 qa_map[qi] = {"question": None, "answer": None, "index": qi}
             if msg.role == "ai" and qa_map[qi]["question"] is None:
-                qa_map[qi]["question"] = msg.content
+                qa_map[qi]["question"] = _extract_question(msg.content)
             elif msg.role == "candidate" and qa_map[qi]["answer"] is None:
                 qa_map[qi]["answer"] = msg.content
         transcript = [
-            v for _, v in sorted(qa_map.items())
-            if v["question"] and v["answer"]
+            {**v, "answer": v["answer"] or "[No answer provided — skipped]"}
+            for _, v in sorted(qa_map.items())
+            if v["question"]
         ]
 
         # ── Violations for this session ───────────────────────────────────────
@@ -1158,7 +1186,25 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
             violations_list.append({
                 "type": v.violation_type.value,
                 "details": v.details,
-                "occurred_at": v.occurred_at.isoformat() if v.occurred_at else None,
+                "occurred_at": (v.occurred_at.isoformat() + "Z") if v.occurred_at else None,
+            })
+
+        # ── Screenshots (face detection frames) for this session ──────────────
+        from app.models.interview import InterviewScreenshot
+        screenshots = (
+            db.query(InterviewScreenshot)
+            .filter(InterviewScreenshot.session_id == latest_session.id)
+            .order_by(InterviewScreenshot.captured_at)
+            .all()
+        )
+        for ss in screenshots:
+            # file_path is stored as "/uploads/screenshots/{session_id}/{filename}" — no extra slash needed
+            fp = ss.file_path.replace(os.sep, "/")
+            if not fp.startswith("/"):
+                fp = f"/{fp}"
+            screenshots_list.append({
+                "file_path": fp,
+                "captured_at": (ss.captured_at.isoformat() + "Z") if ss.captured_at else None,
             })
 
         # ── Latest AI evaluation for this session ─────────────────────────────
@@ -1243,6 +1289,7 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
         "full_transcript": full_transcript,
         "evaluation": evaluation_detail,
         "violations": violations_list,
+        "screenshots": screenshots_list,
         "session": session_info,
     }
 

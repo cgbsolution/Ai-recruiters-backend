@@ -140,7 +140,7 @@ def _safe_delete(db: Session, sql: str, params: dict, logger):
 def delete_job(db: Session, job_id: int) -> bool:
     from app.models.interview import (
         InterviewToken, InterviewSession, InterviewMessage,
-        Violation, Evaluation, CandidateFeedback,
+        InterviewScreenshot, Violation, Evaluation, CandidateFeedback,
         MeetingSlot, MeetingSchedule,
     )
     from app.models.job_metadata import JobMetadata
@@ -166,6 +166,7 @@ def delete_job(db: Session, job_id: int) -> bool:
             db.query(Violation).filter(Violation.session_id.in_(session_ids)).delete(synchronize_session="fetch")
             db.query(Evaluation).filter(Evaluation.session_id.in_(session_ids)).delete(synchronize_session="fetch")
             db.query(CandidateFeedback).filter(CandidateFeedback.session_id.in_(session_ids)).delete(synchronize_session="fetch")
+            db.query(InterviewScreenshot).filter(InterviewScreenshot.session_id.in_(session_ids)).delete(synchronize_session="fetch")
             db.query(MeetingSchedule).filter(MeetingSchedule.session_id.in_(session_ids)).delete(synchronize_session="fetch")
 
             # Delete per_question_evaluations (table may not exist — use SAVEPOINT)
@@ -202,10 +203,12 @@ def delete_job(db: Session, job_id: int) -> bool:
         for tbl in ("job_pre_interview_fields", "scoring_training_data", "ai_credit_usage"):
             _safe_delete(db, f"DELETE FROM {tbl} WHERE job_id = :jid", {"jid": job_id}, logger)
 
-        # 9. Nullify candidate FK
-        db.query(Candidate).filter(Candidate.job_id == job_id).update(
-            {Candidate.job_id: None}, synchronize_session="fetch"
-        )
+        # 9. Delete candidates and their associated files (recordings, screenshots, resumes)
+        from app.services.candidate_service import _cleanup_candidate_files
+        candidates = db.query(Candidate).filter(Candidate.job_id == job_id).all()
+        for cand in candidates:
+            _cleanup_candidate_files(db, cand)
+            db.delete(cand)
 
         # 10. Delete the job
         db.delete(job)

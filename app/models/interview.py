@@ -74,6 +74,7 @@ class InterviewSession(Base):
     evaluation = relationship("Evaluation", back_populates="session", uselist=False, cascade="all, delete-orphan")
     feedback = relationship("CandidateFeedback", back_populates="session", uselist=False, cascade="all, delete-orphan")
     meeting_schedule = relationship("MeetingSchedule", back_populates="session", uselist=False, cascade="all, delete-orphan")
+    screenshots = relationship("InterviewScreenshot", back_populates="session", cascade="all, delete-orphan", order_by="InterviewScreenshot.captured_at")
 
 
 class InterviewMessage(Base):
@@ -181,3 +182,15 @@ class InterviewStatusLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     candidate = relationship("Candidate")
+
+
+class InterviewScreenshot(Base):
+    """Periodic webcam snapshots captured every ~14 seconds for proctoring."""
+    __tablename__ = "interview_screenshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("interview_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    file_path = Column(String(500), nullable=False)   # relative path under uploads/
+    captured_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    session = relationship("InterviewSession", back_populates="screenshots")

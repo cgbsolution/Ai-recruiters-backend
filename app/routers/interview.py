@@ -15,6 +15,7 @@ from app.models.candidate import Candidate
 from app.models.interview import (
     CandidateFeedback,
     InterviewMessage,
+    InterviewScreenshot,
     InterviewSession,
     InterviewStatusLog,
     InterviewToken,
@@ -1126,16 +1127,16 @@ async def complete_interview(
     """
     session = _get_session_or_404(session_id, db)
 
-    # If session is already completed (AI set it via conduct_turn), return existing
-    # evaluation or generate one — never error
-    if session.status == SessionStatus.completed:
+    # If session is already completed or terminated, return or generate evaluation
+    if session.status in (SessionStatus.completed, SessionStatus.terminated):
         if session.evaluation:
             return _format_evaluation(session.evaluation)
+        # No evaluation yet — generate it now (also covers terminated/dropped sessions)
+        if not session.completed_at:
+            session.completed_at = datetime.utcnow()
+            db.flush()
         evaluation = await svc.generate_evaluation(session, db)
         return _format_evaluation(evaluation)
-
-    if session.status == SessionStatus.terminated:
-        raise HTTPException(status_code=400, detail="Session was terminated due to violations")
 
     session.status = SessionStatus.completed
     session.completed_at = datetime.utcnow()
@@ -1166,6 +1167,47 @@ async def complete_interview(
 
     evaluation = await svc.generate_evaluation(session, db)
     return _format_evaluation(evaluation)
+
+
+@router.post(
+    "/interview/sessions/{session_id}/drop",
+    status_code=200,
+    summary="Mark session as dropped (tab close / network disconnect)",
+    description=(
+        "Lightweight endpoint called via sendBeacon when the candidate closes the tab or disconnects.\n\n"
+        "Marks the session status as `terminated` and updates the candidate's interview_status to "
+        "`'Candidate Dropped Interview'`.\n\n"
+        "Does NOT generate an evaluation (fast — safe for use with navigator.sendBeacon).\n\n"
+        "Idempotent: silently succeeds if session is already completed or terminated."
+    ),
+    tags=["Interview"],
+)
+def drop_interview(session_id: int, db: Session = Depends(get_db)):
+    session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+    if not session:
+        return {"ok": False, "reason": "not_found"}
+
+    # Only act on active sessions
+    if session.status in (SessionStatus.pending, SessionStatus.in_progress):
+        session.status = SessionStatus.terminated
+        session.completed_at = datetime.utcnow()
+
+        candidate = db.query(Candidate).filter(Candidate.id == session.candidate_id).first()
+        if candidate:
+            new_status = "Candidate Dropped Interview"
+            log = InterviewStatusLog(
+                candidate_id=candidate.id,
+                previous_status=candidate.interview_status,
+                new_status=new_status,
+                changed_by="system",
+                reason="Tab closed or browser navigated away during interview",
+            )
+            db.add(log)
+            candidate.interview_status = new_status
+
+        db.commit()
+
+    return {"ok": True}
 
 
 @router.get(
@@ -1357,6 +1399,132 @@ async def upload_recording(
         video_duration=duration or "0:00",
         message="Recording saved successfully.",
     )
+
+
+@router.post(
+    "/interview/sessions/{session_id}/capture-photo",
+    status_code=200,
+    summary="Capture and save candidate profile photo",
+    description="Accepts a JPEG photo from the candidate's webcam during the pre-interview photo capture step.",
+    tags=["Interview"],
+)
+@limiter.limit("5/minute")
+async def capture_candidate_photo(
+    session_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+    if not session or not session.candidate_id:
+        raise HTTPException(status_code=404, detail="Session or candidate not found")
+
+    candidate = db.query(Candidate).filter(Candidate.id == session.candidate_id).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+    _upload_root = "/tmp/uploads" if _is_serverless else "uploads"
+    photo_dir = f"{_upload_root}/photos"
+    os.makedirs(photo_dir, exist_ok=True)
+
+    ext = ".jpg"
+    if file.filename and "." in file.filename:
+        ext = "." + file.filename.rsplit(".", 1)[-1].lower()
+    file_path = f"{photo_dir}/{candidate.id}{ext}"
+
+    MAX_PHOTO_SIZE = 5 * 1024 * 1024  # 5 MB
+    total_size = 0
+    with open(file_path, "wb") as f:
+        while chunk := await file.read(8192):
+            total_size += len(chunk)
+            if total_size > MAX_PHOTO_SIZE:
+                f.close()
+                os.remove(file_path)
+                raise HTTPException(status_code=413, detail="Photo too large (max 5 MB)")
+            f.write(chunk)
+
+    # Compress photo: resize to max 400x500, JPEG quality 80
+    try:
+        from PIL import Image
+        with Image.open(file_path) as img:
+            img.thumbnail((400, 500), Image.LANCZOS)
+            img.save(file_path, "JPEG", quality=80, optimize=True)
+    except Exception:
+        pass
+
+    relative_path = f"/uploads/photos/{candidate.id}{ext}"
+    candidate.image = relative_path
+    db.commit()
+
+    return {"ok": True, "image_url": relative_path}
+
+
+@router.post(
+    "/interview/sessions/{session_id}/screenshot",
+    status_code=200,
+    summary="Upload a periodic proctoring screenshot",
+    description=(
+        "Accepts a JPEG snapshot from the candidate's webcam, captured every 13–15 seconds "
+        "by the frontend. Stored under `uploads/screenshots/{session_id}/`. "
+        "Silent — never fails the interview if this call errors."
+    ),
+    tags=["Interview"],
+)
+@limiter.limit("10/minute")
+async def upload_screenshot(
+    session_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    timestamp: str = Form(default=""),
+    db: Session = Depends(get_db),
+):
+    MAX_SCREENSHOT_SIZE = 2 * 1024 * 1024  # 2 MB per screenshot
+
+    session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+    if not session:
+        return {"ok": False}
+
+    _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+    _upload_root = "/tmp/uploads" if _is_serverless else "uploads"
+    screenshot_dir = f"{_upload_root}/screenshots/{session_id}"
+    os.makedirs(screenshot_dir, exist_ok=True)
+
+    safe_ts = (timestamp or "").replace(":", "-").replace(".", "-")[:23]
+    filename = f"{safe_ts or 'snap'}.jpg"
+    raw_path = f"{screenshot_dir}/{filename}"
+
+    total_size = 0
+    with open(raw_path, "wb") as f:
+        while chunk := await file.read(8192):
+            total_size += len(chunk)
+            if total_size > MAX_SCREENSHOT_SIZE:
+                f.close()
+                os.remove(raw_path)
+                return {"ok": False, "reason": "too_large"}
+            f.write(chunk)
+
+    # Compress screenshot: resize to max 800x600, JPEG quality 70
+    try:
+        from PIL import Image
+        with Image.open(raw_path) as img:
+            img.thumbnail((800, 600), Image.LANCZOS)
+            img.save(raw_path, "JPEG", quality=70, optimize=True)
+    except Exception:
+        pass  # keep the original if compression fails
+
+    relative_path = f"/uploads/screenshots/{session_id}/{filename}"
+
+    # Persist screenshot record to DB for proctoring audit trail
+    screenshot = InterviewScreenshot(
+        session_id=session_id,
+        file_path=relative_path,
+        captured_at=datetime.utcnow(),
+    )
+    db.add(screenshot)
+    db.commit()
+
+    return {"ok": True, "path": relative_path}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

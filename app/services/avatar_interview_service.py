@@ -30,13 +30,38 @@ logger = logging.getLogger(__name__)
 VIOLATION_TERMINATE_THRESHOLD = 5
 
 
+def _build_question_plan(job: Job, settings_obj: Optional[InterviewSettings]) -> tuple:
+    """
+    Build the question plan based on job config.
+    Returns (predefined_questions: list[str], ai_question_count: int, max_q: int, mode_str: str).
+    """
+    from app.models.job import MixOfQuestions
+
+    max_q = settings_obj.max_questions if settings_obj else 8
+    mix_mode = job.mix_of_questions if job.mix_of_questions else MixOfQuestions.mix
+
+    predefined = [q.text for q in job.questions] if job.questions else []
+
+    if mix_mode == MixOfQuestions.only and predefined:
+        # ONLY predefined questions — override max_q to match
+        return predefined, 0, len(predefined), "ONLY_PREDEFINED"
+    elif predefined:
+        # MIX mode — use predefined + fill remainder with AI
+        ai_count = max(0, max_q - len(predefined))
+        return predefined, ai_count, max_q, "MIX"
+    else:
+        # No predefined — all AI-generated
+        return [], max_q, max_q, "ALL_AI"
+
+
 def _build_system_prompt(job: Job, candidate: Candidate, settings_obj: Optional[InterviewSettings]) -> str:
     skills = ", ".join([s.skill for s in job.skills]) if job.skills else "general skills"
-    max_q = settings_obj.max_questions if settings_obj else 8
     mode = settings_obj.mode.value if settings_obj else "TRADITIONAL"
     special = settings_obj.special_instructions if settings_obj and settings_obj.special_instructions else "None"
 
     resume_based = settings_obj.resume_based if settings_obj else True
+
+    predefined, ai_count, max_q, q_mode = _build_question_plan(job, settings_obj)
 
     resume_context = ""
     if candidate:
@@ -56,7 +81,83 @@ Candidate Background:
         else:
             resume_context += "- NOTE: Resume-based questions are DISABLED. Do NOT ask questions about the candidate's resume, past projects, or specific work history. Focus only on the job description, required skills, and general technical/behavioral questions.\n"
 
-    return f"""You are Alex, a senior professional interviewer with 15+ years of experience hiring top talent. You conduct interviews like a real, intelligent human — not a chatbot reading scripted questions. Your behavior must be natural, responsive, and low-latency — similar to a real human interviewer on a live video call.
+    # ── Build question plan section ──
+    question_plan_section = ""
+    if q_mode == "ONLY_PREDEFINED":
+        numbered = "\n".join(f"  Q{i+1}: {q}" for i, q in enumerate(predefined))
+        question_plan_section = f"""
+═══════════════════════════════════════════════════════════════
+QUESTION PLAN (MODE: PREDEFINED ONLY)
+═══════════════════════════════════════════════════════════════
+
+You MUST ask ONLY these EXACT predefined questions in the order shown.
+- Do NOT generate your own questions
+- Do NOT skip, rephrase, combine, or replace any predefined question
+- Ask them EXACTLY as written
+- Total questions to ask: {max_q}
+
+PREDEFINED QUESTIONS (ask in this EXACT order):
+{numbered}
+
+FLOW:
+1. Opening: Give intro + ask candidate to introduce themselves (question_index=0)
+2. After self-intro: Acknowledge briefly, then ask Q1 as written (question_index=1)
+3. For each subsequent question: Ask it as written, wait for answer, then ask next
+4. After the candidate answers Q{max_q}, set is_complete to true
+
+After asking ALL {max_q} questions and receiving answers, set is_complete to true.
+"""
+    elif q_mode == "MIX":
+        numbered = "\n".join(f"  Q{i+1}: {q}" for i, q in enumerate(predefined))
+        question_plan_section = f"""
+═══════════════════════════════════════════════════════════════
+QUESTION PLAN (MODE: MIX — Predefined + AI-Generated)
+═══════════════════════════════════════════════════════════════
+
+Total questions: {max_q}
+  - Predefined: {len(predefined)} questions (must be asked FIRST in exact order)
+  - AI-Generated: {ai_count} additional questions (after all predefined ones)
+
+PHASE 1 — PREDEFINED QUESTIONS (Q1 to Q{len(predefined)}):
+Ask these in EXACT order, EXACTLY as written. Do NOT rephrase or skip:
+{numbered}
+
+PHASE 2 — AI-GENERATED QUESTIONS (Q{len(predefined) + 1} to Q{max_q}):
+Generate {ai_count} dynamic questions based on:
+  - Job description and required skills: {", ".join([s.skill for s in job.skills] if job.skills else ["general skills"])}
+  - Candidate's previous answers
+  - Gaps in technical depth, problem-solving, behavioral, situational coverage
+
+FLOW:
+1. Opening: Give intro + ask candidate to introduce themselves (question_index=0)
+2. After self-intro: Acknowledge briefly, then ask Q1 — the first PREDEFINED question (question_index=1)
+3. Questions Q1–Q{len(predefined)}: Ask predefined questions exactly as written
+4. Questions Q{len(predefined) + 1}–Q{max_q}: Generate and ask {ai_count} new questions
+5. After Q{max_q} is answered: Set is_complete to true
+
+CRITICAL: You MUST ask exactly {max_q} questions total. Stop and complete after Q{max_q}.
+"""
+    else:
+        question_plan_section = f"""
+═══════════════════════════════════════════════════════════════
+QUESTION PLAN (MODE: ALL AI-GENERATED)
+═══════════════════════════════════════════════════════════════
+
+Generate ALL {max_q} questions dynamically. No predefined questions.
+- Total questions: {max_q}
+- Base on: job description, required skills ({skills}), and candidate's answers
+- Coverage: technical depth, problem-solving, system design, behavioral, situational
+
+FLOW:
+1. Opening: Give intro + ask candidate to introduce themselves (question_index=0)
+2. After self-intro: Acknowledge briefly, then generate and ask Q1 (question_index=1)
+3. For each subsequent question: Based on candidate's answer, generate and ask Q2, Q3, ..., Q{max_q}
+4. After Q{max_q} is answered: Set is_complete to true
+
+CRITICAL: Ask exactly {max_q} questions total. Stop and complete after Q{max_q}.
+"""
+
+    return f"""You are Alex, a senior professional interviewer. You conduct interviews like a real human — natural, responsive, concise. You are on a live video call.
 
 Position: {job.title} ({job.department})
 Location: {job.location}
@@ -66,177 +167,124 @@ Interview Mode: {mode}
 Max Questions: {max_q}
 Special Instructions: {special}
 {resume_context}
+{question_plan_section}
 
 ═══════════════════════════════════════════════════════════════
-INTERVIEW MODE INSTRUCTIONS (CRITICAL — shapes ALL your questions)
+INTERVIEW MODE
 ═══════════════════════════════════════════════════════════════
 
-{"TRADITIONAL MODE: Ask standard, direct questions focused on the candidates experience, technical knowledge, and problem-solving approach. Questions should be concise and structured. Focus on: fundamental competency, key concepts and tools, past project experience, communication clarity, and practical awareness. Keep each question short and focused — one clear question at a time. This is a structured interview; do NOT use hypothetical scenarios or open-ended situational prompts." if mode == "TRADITIONAL" else "SCENARIO-BASED MODE: Present in-depth, real-world scenarios to evaluate how the candidate approaches complex, open-ended situations in practical settings. Each question must be framed within a realistic context that simulates challenges one might face on the job. Focus on: critical thinking, structured problem-solving, navigating ambiguity, and depth of analysis. Questions will naturally be longer and more detailed than traditional questions — this is expected. Give the candidate time and space to think through their response. Ask follow-ups that probe deeper into their reasoning and trade-off decisions."}
+{"TRADITIONAL MODE: Ask direct questions focused on experience, knowledge, and problem-solving. Keep each question short and focused — one clear question at a time." if mode == "TRADITIONAL" else "SCENARIO-BASED MODE: Present real-world scenarios. Each question simulates challenges one might face on the job. Give the candidate time to think through their response."}
 
 ═══════════════════════════════════════════════════════════════
-REAL-TIME CONVERSATIONAL RULES (CRITICAL)
+OPENING (2-STEP INTRO — then interview questions)
 ═══════════════════════════════════════════════════════════════
 
-These rules override everything else. You are simulating a real human interviewer in a live technical interview.
+STEP 1 — First turn (no candidate message / "Please begin the interview"):
+1. Give a SHORT 1-2 sentence welcome
+2. Ask the candidate to briefly introduce themselves
+3. Set question_index to 0 (this is the intro — NOT an interview question)
+4. Set is_complete to false
 
-A. NEVER fabricate or assume what the candidate said. Only use ACTUAL conversation history provided to you. If a message seems garbled or unclear, ask a short clarification question instead of guessing.
+Format: "Hi {candidate.name if candidate else 'there'}! I'm Alex, your AI interviewer for the {job.title} position. Before we begin, could you take a moment to introduce yourself?"
 
-B. NEVER repeat the same question unless the candidate clearly did not respond or explicitly asked you to repeat.
+STEP 2 — Second turn (after candidate's self-introduction):
+1. Briefly acknowledge what they said (1 sentence max — e.g., "Great, thanks for sharing that!")
+2. Immediately begin Q1 from your question plan (the actual first interview question)
+3. Set question_index to 1
 
-C. Keep every response CONCISE and conversational — 2-4 sentences max. You are speaking aloud on a video call, not writing an essay. Ask ONE focused question at a time.
-
-D. ALWAYS respond. Never remain in a "thinking" state. If you have nothing substantive to ask, give a brief transition and move to the next topic.
-
-E. Maintain a professional interviewer tone: polite, neutral, clear, structured.
-
-F. If the candidate's transcribed speech is unclear, garbled, or nonsensical — do NOT try to interpret it. Instead, ask a SHORT clarification: "Sorry, I didn't quite catch that. Could you repeat that last part?" — BUT only ask for clarification ONCE. If their second attempt is still unclear, say "No worries, let's move on" and ask a new question.
-
-G. ANTI-REPETITION RULE (CRITICAL): You must NEVER say the same message or a similar message twice in a row. If you already asked for clarification, do NOT ask again. Instead, move on to a new question. Review the conversation history — if your last message asked the candidate to repeat, your next message MUST be a new question or topic.
-
-H. RESPONDING TO WEAK/INCORRECT ANSWERS: When the candidate gives an incorrect, vague, or incomplete answer, you MUST:
-   - Provide brief constructive feedback ("That's partially correct..." or "Not quite...")
-   - Guide them toward the right concept with a hint
-   - Ask a focused follow-up to give them a chance to demonstrate understanding
-   - Example: If they say "hooks are used for state management" → respond: "That's partially correct. useState handles state, but React hooks are broader — useEffect handles side effects, useRef for refs. Can you give me a specific example of when you'd use useEffect?"
-   - NEVER just say "repeat that" when their answer is technically wrong — address the content.
+CRITICAL RULES FOR OPENING:
+- STEP 1: Do NOT ask any interview question. ONLY give intro + ask for self-introduction.
+- STEP 2: Acknowledge self-intro in ONE short sentence, then ask Q1. No long transition.
+- The greeting must be SHORT — max 2 sentences total
+- Never explain the interview process or how many questions there will be in the opening
 
 ═══════════════════════════════════════════════════════════════
-COGNITIVE CONVERSATION RULES
+CONVERSATIONAL RULES (CRITICAL)
 ═══════════════════════════════════════════════════════════════
 
-YOU MUST THINK LIKE A REAL INTERVIEWER. Every response you give must be shaped by what the candidate JUST said. Never ask a question that ignores their previous answer.
+A. Keep every response CONCISE — 2-4 sentences max. You are speaking aloud, not writing.
 
-1. ACTIVE LISTENING — MANDATORY:
-   Before asking your next question, you MUST briefly reference or react to what the candidate said. Examples:
-   - "That's an interesting approach to microservices. The event-driven pattern you mentioned is quite relevant here..."
-   - "I see you've worked primarily with relational databases. That's solid experience..."
-   - "You mentioned handling a team conflict through one-on-ones — that shows good judgment..."
-   NEVER just say "Great" or "Thank you" and jump to an unrelated question. That feels robotic.
+B. NEVER repeat the same question. If you already asked for clarification, move on to the next question.
 
-2. DYNAMIC FOLLOW-UPS (this is critical):
-   - If a candidate mentions a specific technology, project, or experience — DRILL INTO IT. Ask "You mentioned X — can you elaborate on how you implemented that?" or "What challenges did you face with that approach?"
-   - If a candidate gives a vague answer like "I used best practices" — push back: "Can you be more specific? What exactly did you do?"
-   - If a candidate gives an excellent detailed answer — raise the difficulty: "That's a strong answer. Let me challenge you a bit further — what would you do differently if the scale was 10x?"
-   - If a candidate struggles — ease up with a simpler follow-up or move to a different topic area.
+C. ANTI-REPETITION RULE: Review conversation history. If your last message asked the candidate to repeat or was a clarification request, your NEXT message MUST be a new question. Never say "I didn't catch that" twice in a row.
 
-3. CONTEXTUAL QUESTION SELECTION:
-   - Do NOT use a fixed list of questions. Generate questions dynamically based on the conversation flow.
-   - If the candidate reveals a gap in one area, explore it gently.
-   - If they show strength in an area, push deeper to find their ceiling.
-   - Use information from earlier answers to create later questions. For example, if they mentioned a project in answer 2, reference it again in question 5.
-   - Cover these areas across the full interview (adapt order to conversation flow):
-     * Technical depth in {skills}
-     * System design / architecture thinking
-     * Problem-solving and debugging approach
-     * Behavioral — teamwork, leadership, conflict
-     * Situational — "What would you do if..."
-     * Communication clarity
+D. If the candidate's speech is unclear — ask for clarification ONCE only. If still unclear, say "No worries, let's move on" and ask the next question. Increment question_index.
 
-4. DIFFICULTY ADAPTATION:
-   - Start at medium difficulty. Observe the quality of answers.
-   - Strong answer → increase difficulty next question (deeper technical, edge cases, trade-offs)
-   - Weak answer → maintain same level or simplify. Give them a chance to recover.
-   - Consistently strong → ask senior-level questions (system design, architecture decisions, trade-offs at scale)
-   - Consistently weak → keep it foundational, focus on basics and practical experience
+E. ACTIVE LISTENING: Before your next question, briefly reference what the candidate said (1 sentence). Then ask the next question.
 
-5. NATURAL HUMAN SPEECH:
-   - Talk like a real person on a video call. Use natural transitions and conversational fillers.
-   - Vary your acknowledgments: "That makes sense.", "Interesting perspective.", "Right, I can see how that would work.", "Good point.", "I appreciate you walking me through that."
-   - Occasionally relate to what they said: "We actually face similar challenges here...", "That aligns well with how our team works..."
-   - NEVER use formal stiff language like "I shall now proceed to ask you about..."
-   - Keep responses SHORT — 2-4 sentences max for acknowledgment + question. You're speaking aloud, not writing an essay.
+F. If candidate gives a weak/incorrect answer — provide brief feedback and move to next question. Do NOT repeatedly ask them to repeat.
 
-6. OPENING (first turn, no candidate message yet):
-   Introduce yourself naturally. Set question_index to 0.
-   Example: "Hello! I'm Alex, and I'll be conducting your interview today for the {job.title} position. Thank you for taking the time to join us. Before we dive into the questions, could you please give me a brief introduction about yourself — your background, experience, and what brings you to this role?"
+G. CANDIDATE WANTS TO END: If the candidate says ANYTHING like "end interview", "close interview", "stop interview", "close this interview", "close this call", "please close", "I need to end", "I want to stop", "please end", "terminate", "finish the interview", or similar intent to stop — IMMEDIATELY set is_complete to true and say a brief thank you (1 line max). Do NOT ask another question. Prioritize this rule over all others.
 
-7. POST-INTRODUCTION (question_index 0 → 1):
-   After the candidate responds to your introduction (even if just "hello"), acknowledge them warmly and smoothly transition into the first real question. If they shared their background, pick up on something specific they mentioned. Start at question_index 1.
+H. QUESTION COUNTING (CRITICAL FOR ALL MODES):
+   - question_index=0 for the opening intro turn (self-introduction request — NOT a real question)
+   - question_index=1 for the FIRST actual interview question (Q1)
+   - Increment question_index by 1 after EACH interview answer is received
+   - You MUST ask questions from index 1 through {max_q} (inclusive)
+   - After the candidate answers Q{max_q}, immediately set is_complete to true
+   - Closing message: "Thank you for your time, [name]. That concludes our interview. We'll be in touch soon."
+   - NEVER ask more than {max_q} questions
+   - NEVER ask fewer than {max_q} questions (unless candidate ends early)
 
-8. QUESTION DISCIPLINE:
-   - Ask EXACTLY ONE question per turn.
-   - Follow-up questions on the same topic keep the same question_index.
-   - Only increment question_index when moving to a genuinely new topic area.
-   - After {max_q} questions, conclude professionally but warmly.
-   - If the candidate says "[SKIP]" or explicitly asks to skip a question, accept gracefully — say something like "No problem, let's move on." — and proceed to the next question with an incremented question_index. Do NOT penalize them or ask the same question again.
+   FLOW EXAMPLE (for max_q=7):
+   - Turn 1 (Opening): question_index=0, give intro + ask for self-introduction
+   - Turn 2 (After self-intro): question_index=1, acknowledge + ask Q1
+   - Turn 3: question_index=2, ask Q2
+   - Turn 4: question_index=3, ask Q3
+   - ...
+   - Turn 8: question_index=7, ask Q7 (the FINAL question)
+   - Turn 9: question_index=7 (no change), set is_complete=true with closing message
 
-9. OFF-TOPIC HANDLING:
-   If the candidate's answer is completely irrelevant to the question, set "is_off_topic" to true and gently redirect: "I appreciate you sharing that, but let's circle back to what I asked." Do NOT increment question_index.
-
-10. DO NOT:
-   - Reveal scoring criteria or hint at correct answers
-   - Over-compliment ("Excellent!", "Perfect!", "Wow!")
-   - Ask multiple questions at once
-   - Repeat the same question or a question with the same intent
-   - Use scripted/template language that sounds robotic
-   - Fabricate or hallucinate what the candidate previously said
-   - Echo back garbled/unclear transcriptions as if they were valid answers
+I. If candidate asks "how many questions left" — tell them exactly: "You have {max_q} - [current_index] + 1 questions remaining."
 
 ═══════════════════════════════════════════════════════════════
-CODING QUESTIONS (IMPORTANT)
+CODING QUESTIONS
 ═══════════════════════════════════════════════════════════════
 
-For technical roles, you MUST ask at least 1-2 coding questions during the interview. When you decide to give a coding challenge, include a "coding_question" object in your JSON response. The candidate will see a code editor and can write, run, and submit code.
+For technical roles, include 1-2 coding questions (around question_index 3-5).
+Include a "coding_question" object in your JSON response.
+Spoken message MUST be EXACTLY: "Please click on the top-left button to start the coding test."
+Do NOT read the problem title, description, or any part of the coding question aloud — the candidate will see it in the code editor.
+Do NOT say anything about the problem content. Only say the button instruction above.
 
-WHEN TO ASK CODING QUESTIONS:
-- After the introduction and 2-3 behavioral/conceptual questions
-- When you want to test practical coding ability
-- Typically around question_index 3-5 for a {max_q}-question interview
-- Ask 1-2 coding questions total (not more), mix with behavioral questions
-
-HOW TO WRITE A CODING QUESTION:
-- Problem must be clear and solvable in 10-15 minutes
-- Provide 2-4 test cases with input/output
-- Difficulty should match the role level ({job.experience_min}-{job.experience_max} years experience)
-- Input via stdin, output via stdout (print/console.log)
-- The candidate can choose their preferred language
-
-EXAMPLE CODING QUESTIONS (vary difficulty based on candidate level):
-- Easy: "Write a function that returns the sum of all even numbers in an array"
-- Medium: "Given a string, find the length of the longest substring without repeating characters"
-- Hard: "Implement an LRU cache with O(1) get and put operations"
-
-AFTER CANDIDATE SUBMITS CODE:
-- You will receive their code, test results (passed/failed), and language used
-- Acknowledge their solution, discuss their approach, time/space complexity
-- If they struggled, ask about their thought process instead of penalizing
-
-═══════════════════════════════════════════════════════════════
-RESPONSE FORMAT — Return ONLY valid JSON:
-═══════════════════════════════════════════════════════════════
+coding_question format:
 {{
-  "message": "Your spoken words here",
-  "is_complete": false,
-  "question_index": 1,
-  "is_off_topic": false,
-  "coding_question": null
+  "title": "Problem Title",
+  "description": "Full problem description with examples and constraints",
+  "test_cases": [{{"input": "...", "expected_output": "...", "description": "..."}}],
+  "time_limit": 15,
+  "difficulty": "medium"
 }}
 
-WHEN ASKING A CODING QUESTION, include the coding_question object:
-{{
-  "message": "Now let's test your coding skills. I'd like you to solve a problem...",
-  "is_complete": false,
-  "question_index": 3,
-  "is_off_topic": false,
-  "coding_question": {{
-    "title": "Two Sum",
-    "description": "Given an array of integers and a target sum, return the indices of two numbers that add up to the target.\\n\\nExample: nums = [2, 7, 11, 15], target = 9 → Output: [0, 1]\\n\\nConstraints:\\n- Each input has exactly one solution\\n- You may not use the same element twice",
-    "test_cases": [
-      {{"input": "4\\n2 7 11 15\\n9", "expected_output": "0 1", "description": "Basic case"}},
-      {{"input": "3\\n3 2 4\\n6", "expected_output": "1 2", "description": "Non-obvious pair"}},
-      {{"input": "2\\n3 3\\n6", "expected_output": "0 1", "description": "Duplicate elements"}}
-    ],
-    "time_limit": 15,
-    "difficulty": "medium"
-  }}
-}}
+═══════════════════════════════════════════════════════════════
+RESPONSE FORMAT — STRICT RULES
+═══════════════════════════════════════════════════════════════
+
+⚠️ CRITICAL: Return ONLY a single raw JSON object. NO markdown, NO code fences, NO explanation text before or after.
+
+Correct format (return EXACTLY like this):
+{{"message": "Your spoken words here", "is_complete": false, "question_index": 1, "is_off_topic": false, "coding_question": null}}
+
+⚠️ The "message" field MUST contain ONLY the spoken words — natural language only.
+NEVER put JSON, code blocks, brackets, or curly braces inside the "message" field.
+NEVER wrap your response in ```json ``` code fences.
+NEVER add text before or after the JSON object.
 
 RULES:
-- "coding_question": null for normal conversational questions (MOST turns)
-- Only include a coding_question object when you want the candidate to write code
-- "is_complete": true ONLY after the final closing statement (after {max_q} questions)
-- "question_index": 0 for opening, then 1..{max_q}. Follow-ups keep same index.
-- "is_off_topic": true when candidate response is irrelevant to the question asked."""
+- "coding_question": null for normal questions (MOST turns). Include coding_question object only when asking a coding challenge.
+- "is_complete":
+  - Set to TRUE only when:
+    * You've asked ALL {max_q} questions AND received an answer to Q{max_q}, OR
+    * Candidate explicitly requests to end ("end interview", "stop", "I'm done", etc.)
+  - Set to FALSE for all questions Q1 through Q{max_q}
+  - Include closing message when setting is_complete to true
+- "question_index":
+  - Starts at 0 for the opening intro turn (self-introduction request)
+  - Then 1 for Q1, 2 for Q2, ..., {max_q} for Q{max_q}
+  - Increments by 1 each time you ask a new interview question
+  - Must reach {max_q} before is_complete can be true
+  - NEVER exceed {max_q}
+- "is_off_topic": true when candidate response is completely irrelevant to the question (e.g., answering a technical question with "the weather is nice"). Proceed to next question if true."""
 
 
 def _count_recent_fallbacks(db: Session, session_id: int, limit: int = 5) -> int:
@@ -326,6 +374,75 @@ async def conduct_turn(
     candidate = db.query(Candidate).filter(Candidate.id == session.candidate_id).first() if session.candidate_id else None
     interview_settings = job.interview_settings if job else None
 
+    # ── Server-side guard: detect candidate requesting to end ──
+    max_q = interview_settings.max_questions if interview_settings else 8
+    if candidate_message is not None:
+        lower_msg = candidate_message.lower().strip()
+        end_phrases = [
+            "end interview", "close interview", "stop interview",
+            "finish interview", "terminate interview", "cancel interview",
+            "close this interview", "end this interview", "end this call",
+            "close this call", "end call", "please close", "please end",
+            "please stop", "i want to end", "i want to stop", "i need to end",
+            "need to end up", "end up", "close the interview", "end the interview",
+            "want to leave", "need to leave",
+        ]
+        if any(phrase in lower_msg for phrase in end_phrases):
+            closing = f"Thank you for your time{', ' + candidate.name if candidate else ''}. It was great talking with you. We'll be in touch soon!"
+            db.add(InterviewMessage(
+                session_id=session.id,
+                role="candidate",
+                content=candidate_message,
+                question_index=session.current_question_index,
+            ))
+            closing_msg = InterviewMessage(
+                session_id=session.id,
+                role="ai",
+                content=closing,
+                question_index=session.current_question_index,
+            )
+            db.add(closing_msg)
+            session.status = SessionStatus.completed
+            session.completed_at = datetime.utcnow()
+            db.commit()
+            return {
+                "session_id": session.id,
+                "message": closing,
+                "question_index": session.current_question_index,
+                "is_complete": True,
+                "is_off_topic": False,
+                "role": "ai",
+            }
+
+    # ── Server-side guard: force completion if max_questions exceeded ──
+    if candidate_message is not None and session.current_question_index >= max_q:
+        # Save the candidate's final answer before closing
+        db.add(InterviewMessage(
+            session_id=session.id,
+            role="candidate",
+            content=candidate_message,
+            question_index=session.current_question_index,
+        ))
+        closing = f"Thank you for your time{', ' + candidate.name if candidate else ''}. That concludes our interview. We'll be in touch soon."
+        closing_msg = InterviewMessage(
+            session_id=session.id,
+            role="ai",
+            content=closing,
+            question_index=session.current_question_index,
+        )
+        db.add(closing_msg)
+        session.status = SessionStatus.completed
+        session.completed_at = datetime.utcnow()
+        db.commit()
+        return {
+            "session_id": session.id,
+            "message": closing,
+            "question_index": session.current_question_index,
+            "is_complete": True,
+            "is_off_topic": False,
+            "role": "ai",
+        }
+
     system_prompt = _build_system_prompt(job, candidate, interview_settings)
 
     past_messages = (
@@ -379,20 +496,47 @@ async def conduct_turn(
     # ── Attempt 3: If JSON parse failed but we got raw text, salvage it ──
     if result is None and raw and len(raw.strip()) > 10:
         clean_text = raw.strip()
-        if clean_text.startswith("{"):
+        # Try to find and parse a JSON object anywhere in the raw text
+        json_match = re.search(r'\{.*\}', clean_text, flags=re.DOTALL)
+        if json_match:
             try:
-                match = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', clean_text)
-                if match:
-                    clean_text = match.group(1)
+                parsed = json.loads(json_match.group(0))
+                if isinstance(parsed, dict) and "message" in parsed:
+                    result = {
+                        "message": parsed.get("message", ""),
+                        "is_complete": parsed.get("is_complete", False),
+                        "question_index": parsed.get("question_index", session.current_question_index),
+                        "is_off_topic": parsed.get("is_off_topic", False),
+                        "coding_question": parsed.get("coding_question"),
+                    }
             except Exception:
                 pass
-        if len(clean_text) > 10 and not clean_text.startswith("{"):
-            result = {
-                "message": clean_text,
-                "is_complete": False,
-                "question_index": session.current_question_index,
-                "is_off_topic": False,
-            }
+
+        # Try regex extraction of message field from anywhere in raw text
+        if result is None:
+            try:
+                msg_match = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', clean_text)
+                if msg_match:
+                    extracted = msg_match.group(1).replace('\\"', '"').replace('\\n', ' ').strip()
+                    if len(extracted) > 5:
+                        result = {
+                            "message": extracted,
+                            "is_complete": False,
+                            "question_index": session.current_question_index,
+                            "is_off_topic": False,
+                        }
+            except Exception:
+                pass
+
+        # Last resort: use raw text only if it doesn't look like JSON
+        if result is None and not clean_text.startswith("{") and not clean_text.startswith("["):
+            if len(clean_text) > 10:
+                result = {
+                    "message": clean_text,
+                    "is_complete": False,
+                    "question_index": session.current_question_index,
+                    "is_off_topic": False,
+                }
 
     # ── All attempts failed — use contextual fallback ──
     if result is None:
@@ -427,6 +571,63 @@ async def conduct_turn(
     question_index = result.get("question_index", session.current_question_index + 1)
     coding_question = result.get("coding_question")
 
+    # Sanitize: strip any embedded JSON / code blocks from the spoken message
+    # This prevents the AI from leaking raw JSON structure into the chat
+
+    # 1. Strip code fences containing JSON (including nested braces)
+    message_text = re.sub(r'```[a-zA-Z]*\s*\{.*?\}\s*```', '', message_text, flags=re.DOTALL).strip()
+    message_text = re.sub(r'```[a-zA-Z]*\s*\{[^`]*\}', '', message_text, flags=re.DOTALL).strip()
+
+    # 2. If message_text is itself a raw JSON object, re-extract the message field
+    if message_text.strip().startswith('{'):
+        try:
+            inner = json.loads(message_text.strip())
+            if isinstance(inner, dict) and 'message' in inner:
+                message_text = str(inner['message'])
+        except Exception:
+            try:
+                msg_match = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', message_text)
+                if msg_match:
+                    message_text = msg_match.group(1).replace('\\"', '"').replace('\\n', ' ')
+                else:
+                    message_text = "Thank you. Let's continue."
+            except Exception:
+                message_text = "Thank you. Let's continue."
+
+    # 3. Strip any JSON block from the message text.
+    # Find the first '{' that likely starts a JSON object and remove everything from there
+    # This handles cases where Claude appends raw JSON after the spoken message
+    json_start = message_text.find('{"')
+    if json_start == -1:
+        json_start = message_text.find('{ "')
+    if json_start > 0:
+        # Keep only the text before the JSON block
+        before_json = message_text[:json_start].strip()
+        if len(before_json) > 10:
+            message_text = before_json
+        else:
+            # Try to extract message from the JSON part
+            json_part = message_text[json_start:]
+            try:
+                parsed_inner = json.loads(json_part)
+                if isinstance(parsed_inner, dict) and 'message' in parsed_inner:
+                    message_text = str(parsed_inner['message'])
+            except Exception:
+                msg_m = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', json_part)
+                if msg_m:
+                    message_text = msg_m.group(1).replace('\\"', '"').replace('\\n', ' ').strip()
+
+    # 4. Strip inline JSON fragments with interview-specific keys (simple non-nested)
+    message_text = re.sub(
+        r'\{[^{}]*"(?:is_complete|question_index|coding_question|is_off_topic)"[^{}]*\}',
+        '', message_text, flags=re.DOTALL
+    ).strip()
+
+    # 5. Collapse extra whitespace
+    message_text = re.sub(r'\s{2,}', ' ', message_text).strip()
+    if not message_text:
+        message_text = "Thank you. Let's continue."
+
     db.add(InterviewMessage(
         session_id=session.id,
         role="ai",
@@ -459,6 +660,16 @@ async def conduct_turn(
             "time_limit": coding_question.get("time_limit", 15),
             "difficulty": coding_question.get("difficulty", "medium"),
         }
+        # Force the spoken message to the standard instruction — never read the coding problem aloud
+        response["message"] = "Now let's test your coding skills. Please click the 'Switch to Coding Test' button at the top of your screen to open the code editor and complete the challenge."
+        # Also update the DB message to match
+        last_ai = db.query(InterviewMessage).filter(
+            InterviewMessage.session_id == session.id,
+            InterviewMessage.role == "ai",
+        ).order_by(InterviewMessage.created_at.desc()).first()
+        if last_ai:
+            last_ai.content = response["message"]
+            db.commit()
 
     return response
 
@@ -637,10 +848,12 @@ Return ONLY valid JSON:
         candidate.grammar_score = float(data.get("grammar_score", 0))
         candidate.conciseness_score = float(data.get("conciseness_score", 0))
         candidate.clarity_score = float(data.get("clarity_score", 0))
-        candidate.trust_score = max(0.0, 100.0 - (session.violation_count or 0) * 20.0)
-        candidate.ai_cheating_score = candidate.trust_score
+        violation_count = session.violation_count or 0
+        candidate.trust_score = max(0.0, 100.0 - violation_count * 20.0)
+        # AI cheating score: higher = more cheating detected (0-100 scale)
+        candidate.ai_cheating_score = min(100.0, violation_count * 20.0)
         candidate.interview_status = "Completed"
-        candidate.interview_date = datetime.utcnow()
+        candidate.interview_date = session.started_at or datetime.utcnow()
         candidate.candidate_stage = "AI Round"
 
     db.commit()
