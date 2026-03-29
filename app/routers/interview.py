@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import traceback
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -1106,24 +1107,39 @@ def log_violation(
     )
 
 
+async def _run_evaluation_background(session_id: int):
+    """Background task: generate evaluation using a fresh DB session."""
+    db = SessionLocal()
+    try:
+        logging.info(f"[Evaluation] Starting background evaluation for session {session_id}")
+        session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+        if not session:
+            logging.error(f"[Evaluation] Session {session_id} not found in DB")
+            return
+        if session.evaluation:
+            logging.info(f"[Evaluation] Session {session_id} already has evaluation — skipping")
+            return
+        messages_count = db.query(InterviewMessage).filter(InterviewMessage.session_id == session_id).count()
+        logging.info(f"[Evaluation] Session {session_id} — {messages_count} messages found, calling AI...")
+        await svc.generate_evaluation(session, db)
+        logging.info(f"[Evaluation] Session {session_id} — evaluation saved successfully")
+    except Exception as e:
+        logging.error(
+            f"[Evaluation] FAILED for session {session_id}: {type(e).__name__}: {e}\n"
+            f"{traceback.format_exc()}"
+        )
+    finally:
+        db.close()
+
+
 @router.post(
     "/interview/sessions/{session_id}/complete",
-    response_model=EvaluationRead,
-    summary="Complete interview & generate evaluation",
+    status_code=202,
+    summary="Complete interview & trigger evaluation",
     description=(
-        "Marks the session as `completed` and synchronously generates a structured AI evaluation "
-        "using **Claude Opus**.\n\n"
-        "**Evaluation scores (0–100):**\n"
-        "- `technical_score` — depth and accuracy of technical knowledge\n"
-        "- `communication_score` — clarity, articulation, professionalism\n"
-        "- `problem_solving_score` — logical thinking and approach\n"
-        "- `confidence_score` — composure under questioning\n"
-        "- `overall_score` — weighted average (technical 40%, communication 25%, "
-        "problem-solving 25%, confidence 10%)\n\n"
-        "**Recommendation thresholds:**\n"
-        "`Strong Hire` ≥ 80 · `Hire` ≥ 65 · `Maybe` ≥ 50 · `No Hire` < 50\n\n"
-        "The evaluation is also saved to the `Evaluation` table and the candidate's top-level scores "
-        "are mirrored back to the `candidates` row.\n\n"
+        "Marks the session as `completed` and triggers AI evaluation in the background.\n\n"
+        "Returns `202 Accepted` immediately. Poll `GET /interview/sessions/{id}/evaluation` "
+        "every 3–5 seconds until it returns `200` with the evaluation data.\n\n"
         "**Errors:** `400` if session is already `completed` or `terminated`."
     ),
     tags=["Interview"],
@@ -1132,12 +1148,13 @@ def log_violation(
 async def complete_interview(
     session_id: int,
     request: Request,
+    background_tasks: BackgroundTasks,
     early_termination: bool = False,
     termination_reason: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
     """
-    Complete interview & generate evaluation.
+    Complete interview & trigger background evaluation.
 
     termination_reason values:
     - None / not provided → "Completed" (normal completion)
@@ -1148,16 +1165,11 @@ async def complete_interview(
     """
     session = _get_session_or_404(session_id, db)
 
-    # If session is already completed or terminated, return or generate evaluation
+    # If already completed/terminated and evaluation exists, nothing to do
     if session.status in (SessionStatus.completed, SessionStatus.terminated):
-        if session.evaluation:
-            return _format_evaluation(session.evaluation)
-        # No evaluation yet — generate it now (also covers terminated/dropped sessions)
-        if not session.completed_at:
-            session.completed_at = datetime.utcnow()
-            db.flush()
-        evaluation = await svc.generate_evaluation(session, db)
-        return _format_evaluation(evaluation)
+        if not session.evaluation:
+            background_tasks.add_task(_run_evaluation_background, session_id)
+        return {"status": "processing", "session_id": session_id}
 
     session.status = SessionStatus.completed
     session.completed_at = datetime.utcnow()
@@ -1184,10 +1196,11 @@ async def complete_interview(
         db.add(log)
         candidate.interview_status = new_status
 
-    db.flush()
+    db.commit()
 
-    evaluation = await svc.generate_evaluation(session, db)
-    return _format_evaluation(evaluation)
+    # Trigger evaluation in background — returns 202 immediately
+    background_tasks.add_task(_run_evaluation_background, session_id)
+    return {"status": "processing", "session_id": session_id}
 
 
 @router.post(

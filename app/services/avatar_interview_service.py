@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import traceback
 from datetime import datetime
 from typing import Optional
 
@@ -801,14 +802,24 @@ Return ONLY valid JSON:
   ]
 }}"""
 
-    llm_result = await _ask_with_system_usage(
-        system="You are a senior technical evaluator. Return only valid JSON.",
-        messages=[{"role": "user", "content": prompt}],
-        model=OPUS,
-        max_tokens=4000,
-    )
+    logging.info(f"[Evaluation] Sending prompt to AI for session {session.id} (transcript length: {len(transcript)} chars)")
+    try:
+        llm_result = await _ask_with_system_usage(
+            system="You are a senior technical evaluator. Return only valid JSON.",
+            messages=[{"role": "user", "content": prompt}],
+            model=OPUS,
+            max_tokens=4000,
+        )
+    except Exception as e:
+        logging.error(f"[Evaluation] AI call failed for session {session.id}: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        raise
     log_usage(llm_result, feature="interview", session_id=session.id)
-    data = _parse_json(llm_result.text)
+    logging.info(f"[Evaluation] AI responded for session {session.id}, parsing JSON...")
+    try:
+        data = _parse_json(llm_result.text)
+    except Exception as e:
+        logging.error(f"[Evaluation] JSON parse failed for session {session.id}: {e}\nRaw AI response: {llm_result.text[:500]}")
+        raise
 
     overall = float(data.get("overall_score", 0))
     rec_str = data.get("recommendation", "Maybe")
