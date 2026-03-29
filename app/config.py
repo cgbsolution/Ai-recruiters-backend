@@ -22,19 +22,31 @@ class Settings(BaseSettings):
             return ",".join(v)
         return v or ""
 
+    # These origins are always allowed regardless of the CORS_ORIGINS env var
+    _ALWAYS_ALLOWED = [
+        "https://app.anytimehire.ai",
+        "https://myepfo.com",
+        "https://www.myepfo.com",
+    ]
+
     @property
     def cors_origins_list(self) -> List[str]:
         raw = self.CORS_ORIGINS.strip()
         if not raw:
-            return ["http://localhost:3000"]
-        # Support JSON array format: '["url1","url2"]'
-        if raw.startswith("["):
+            origins = ["http://localhost:3000"]
+        elif raw.startswith("["):
             try:
-                return json.loads(raw)
+                origins = json.loads(raw)
             except json.JSONDecodeError:
-                pass
-        # Comma-separated format: "url1,url2"
-        return [o.strip() for o in raw.split(",") if o.strip()]
+                origins = [o.strip() for o in raw.split(",") if o.strip()]
+        else:
+            origins = [o.strip() for o in raw.split(",") if o.strip()]
+
+        # Always ensure production origins are included
+        for url in self._ALWAYS_ALLOWED:
+            if url not in origins:
+                origins.append(url)
+        return origins
     UPLOAD_DIR: str = "uploads/jd"
     RESUME_UPLOAD_DIR: str = "uploads/resumes"
     MAX_UPLOAD_SIZE_MB: int = 10
