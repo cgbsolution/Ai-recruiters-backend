@@ -771,7 +771,7 @@ Then provide:
 - strengths: List of 3-5 specific strengths observed
 - weaknesses: List of 2-4 specific areas for improvement
 - detailed_feedback: 1-2 paragraphs of detailed assessment including how the scoring mode influenced the evaluation
-- per_question_evaluations: For EACH question in the transcript, provide an individual evaluation with score (0-100), list of positives, and list of negatives
+- per_question_evaluations: For EACH question in the transcript, provide an individual evaluation with score (0-100), list of positives, and list of negatives. CRITICAL: evaluate each question in COMPLETE ISOLATION — the positives and negatives for question N must be based ONLY on the candidate's answer to question N. Do NOT carry over strengths or weaknesses from other questions. Each question's evaluation must stand alone.
 - skills_ratings: Rate the candidate on 3 key skill areas relevant to the position. For each skill provide: skill name, rating (1-5 stars), and a short evaluation paragraph
 
 Return ONLY valid JSON:

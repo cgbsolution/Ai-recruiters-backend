@@ -250,6 +250,8 @@ def list_jobs(db: Session = Depends(get_db), user: User = Depends(get_current_us
             )).label("scored_count"),
         )
         .filter(Candidate.job_id.isnot(None))
+        # Exclude auto-created resume-upload placeholders (no real applicant yet)
+        .filter(~Candidate.email.like("pending_%@resume.local"))
         .group_by(Candidate.job_id)
         .all()
     )
