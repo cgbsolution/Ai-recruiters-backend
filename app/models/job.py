@@ -57,6 +57,8 @@ class Job(Base):
     allow_to_contact = Column(Boolean, default=False)
     upload_jd = Column(String(500), nullable=True)
 
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
+
     applications = Column(Integer, default=0)
     interviews = Column(Integer, default=0)
     candidates = Column(Integer, default=0)
@@ -64,6 +66,7 @@ class Job(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    organization = relationship("Organization", back_populates="jobs")
     responsibilities = relationship(
         "JobResponsibility", back_populates="job", cascade="all, delete-orphan"
     )

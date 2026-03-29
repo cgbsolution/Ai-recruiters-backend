@@ -192,5 +192,6 @@ class InterviewScreenshot(Base):
     session_id = Column(Integer, ForeignKey("interview_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
     file_path = Column(String(500), nullable=False)   # relative path under uploads/
     captured_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    face_count = Column(Integer, nullable=True)  # 0=no face, 1=single face, 2+=multiple faces
 
     session = relationship("InterviewSession", back_populates="screenshots")

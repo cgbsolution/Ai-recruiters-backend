@@ -1,11 +1,12 @@
 import os
 import uuid
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
+from app.auth import get_current_user
 from app.config import settings
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx"}
 

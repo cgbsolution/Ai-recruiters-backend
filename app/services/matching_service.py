@@ -149,6 +149,9 @@ def _run_matching(task_id: str, job_id: int, threshold: int):
             ResumeMetadata.parsing_status == "completed",
             ~ResumeMetadata.candidate_email.like("%@pending.local"),
         )
+        # Organization scoping: only match resumes from the same org
+        if job.organization_id:
+            base_q = base_q.filter(ResumeMetadata.organization_id == job.organization_id)
 
         skill_filter = _build_skill_filters(jd_skills)
         if skill_filter is not None:
@@ -348,6 +351,9 @@ def match_candidates_for_job(
         ResumeMetadata.parsing_status == "completed",
         ~ResumeMetadata.candidate_email.like("%@pending.local"),
     )
+    # Organization scoping
+    if job.organization_id:
+        base_q = base_q.filter(ResumeMetadata.organization_id == job.organization_id)
     skill_filter = _build_skill_filters(jd_skills)
     if skill_filter is not None:
         base_q = base_q.filter(skill_filter)

@@ -2,7 +2,7 @@ from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.models.candidate import Candidate
+from app.models.candidate import Candidate, CandidateStatus
 from app.models.job import Job
 from app.schemas.candidate import CandidateCreate, CandidateUpdate
 
@@ -12,6 +12,7 @@ def get_candidates(
     status: Optional[str] = None,
     job_id: Optional[int] = None,
     stage: Optional[str] = None,
+    org_id: Optional[int] = None,
 ) -> list:
     query = db.query(Candidate, Job.title).outerjoin(Job, Candidate.job_id == Job.id)
 
@@ -20,8 +21,17 @@ def get_candidates(
         ~Candidate.email.like("pending_%@resume.local")
     )
 
+    # Organization scoping
+    if org_id is not None:
+        query = query.filter(Job.organization_id == org_id)
+
     if status:
-        query = query.filter(Candidate.status == status)
+        # Match enum by value (e.g. "Selected" → CandidateStatus.selected)
+        try:
+            status_enum = CandidateStatus(status)
+        except ValueError:
+            status_enum = status
+        query = query.filter(Candidate.status == status_enum)
     if job_id:
         query = query.filter(Candidate.job_id == job_id)
     if stage:
@@ -51,7 +61,9 @@ def get_candidates(
 
     def _priority(c_dict: dict) -> int:
         s = c_dict.get("status") or ""
-        return _STATUS_PRIORITY.get(s, 0)
+        # s may be a CandidateStatus enum member; use .value for lookup
+        key = s.value if isinstance(s, CandidateStatus) else s
+        return _STATUS_PRIORITY.get(key, 0)
 
     seen_email: dict[str, dict] = {}
     seen_name_phone: dict[str, dict] = {}

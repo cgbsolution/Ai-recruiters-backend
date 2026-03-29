@@ -9,7 +9,7 @@ fast cross-job candidate matching.
 
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Float, Integer, String, Text
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -17,11 +17,15 @@ from app.database import Base
 
 class ResumeMetadata(Base):
     __tablename__ = "resume_metadata"
+    __table_args__ = (
+        UniqueConstraint("candidate_email", "organization_id", name="uq_resume_email_org"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
 
-    # ── Identity (unique per person) ──────────────────────────────────────────
-    candidate_email = Column(String(255), nullable=False, unique=True, index=True)
+    # ── Identity (unique per person per org) ─────────────────────────────────
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
+    candidate_email = Column(String(255), nullable=False, index=True)
     candidate_name = Column(String(255), nullable=True)
     phone = Column(String(50), nullable=True)
 

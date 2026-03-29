@@ -26,7 +26,25 @@ from app.models.interview import (
     ViolationType,
 )
 from app.models.job import Job
+from app.models.organization import Organization
 from app.database import SessionLocal
+
+
+def _check_and_increment_candidate_quota(db, job_id: int) -> None:
+    """Check lifetime candidate quota and increment counter. Raises 403 if exceeded."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job or not job.organization_id:
+        return
+    org = db.query(Organization).filter(Organization.id == job.organization_id).first()
+    if not org or (org.max_candidates_per_job or 0) == 0:
+        return
+    if (org.total_candidates_used or 0) >= org.max_candidates_per_job:
+        raise HTTPException(
+            status_code=403,
+            detail="You have exceeded the candidate limit. Please upgrade your plan.",
+        )
+    org.total_candidates_used = (org.total_candidates_used or 0) + 1
+    db.flush()
 from app.schemas.interview import (
     ApplyForJobRequest,
     ApplyForJobResponse,
@@ -381,6 +399,7 @@ def apply_for_job(
     ).first()
 
     if not existing_candidate:
+        _check_and_increment_candidate_quota(db, tok.job_id)
         candidate = Candidate(
             name=payload.name,
             email=email_str,
@@ -581,7 +600,8 @@ def register_candidate(
         candidate.resume_path = payload.resume_path
         db.flush()
     else:
-        # Create new candidate — use try/except for race condition protection
+        # Create new candidate — check quota and use try/except for race condition protection
+        _check_and_increment_candidate_quota(db, tok.job_id)
         candidate = Candidate(
             name=payload.name,
             email=email_str,
@@ -772,6 +792,7 @@ def auto_register_candidate(
             candidate_phone = meta.phone
             resume_path = meta.resume_file_path
 
+        _check_and_increment_candidate_quota(db, tok.job_id)
         candidate = Candidate(
             name=candidate_name,
             email=email_str,
@@ -1515,16 +1536,36 @@ async def upload_screenshot(
 
     relative_path = f"/uploads/screenshots/{session_id}/{filename}"
 
+    # Face detection using OpenCV Haar cascade
+    face_count = 1  # default: assume single face if detection fails
+    try:
+        import cv2
+        img = cv2.imread(raw_path)
+        if img is not None:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            face_cascade = cv2.CascadeClassifier(cascade_path)
+            faces = face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=4,
+                minSize=(40, 40),
+            )
+            face_count = len(faces)
+    except Exception:
+        face_count = 1  # safe default
+
     # Persist screenshot record to DB for proctoring audit trail
     screenshot = InterviewScreenshot(
         session_id=session_id,
         file_path=relative_path,
         captured_at=datetime.utcnow(),
+        face_count=face_count,
     )
     db.add(screenshot)
     db.commit()
 
-    return {"ok": True, "path": relative_path}
+    return {"ok": True, "path": relative_path, "face_count": face_count}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

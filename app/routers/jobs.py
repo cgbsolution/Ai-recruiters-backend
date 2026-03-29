@@ -1,15 +1,21 @@
 import asyncio
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from sqlalchemy import func, extract, cast, Date
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db, SessionLocal
 from app.models.interview import InterviewSession, InterviewToken, MeetingSlot
+from app.auth import get_current_user, get_org_id
+from app.models.organization import Organization
+from app.models.user import User
+from app.models.candidate import Candidate, CandidateStatus
+from app.models.job import Job as JobModel, JobStatus
 
 logger = logging.getLogger(__name__)
 from app.schemas.interview import (
@@ -21,12 +27,186 @@ from app.schemas.interview import (
 from app.schemas.job import JobCreate, JobListItem, JobRead, JobUpdate
 from app.services import job_service
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
+
+
+def _get_job_with_org_check(db: Session, job_id: int, user: User) -> JobModel:
+    """Fetch a job and verify it belongs to the user's organization."""
+    job = db.query(JobModel).filter(JobModel.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    org_id = get_org_id(user)
+    if org_id is not None and job.organization_id != org_id:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 @router.get("/stats", response_model=List[Dict[str, Any]])
-def get_stats(db: Session = Depends(get_db)):
-    return job_service.get_stats(db)
+def get_stats(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return job_service.get_stats(db, org_id=get_org_id(user))
+
+
+@router.get("/hiring-funnel", response_model=List[Dict[str, Any]])
+def get_hiring_funnel(
+    period: str = "monthly",
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Return candidate counts grouped by status (stage).
+
+    Query params:
+        period: "monthly" (Jan-Dec of current year) or "weekly" (Mon-Fri of current week).
+    """
+    org_id = get_org_id(user)
+    now = datetime.utcnow()
+    statuses = [s.value for s in CandidateStatus]
+
+    # Base query: candidates belonging to jobs (org-scoped for non-super_admin)
+    base_q = db.query(Candidate).join(JobModel, JobModel.id == Candidate.job_id)
+    if org_id is not None:
+        base_q = base_q.filter(JobModel.organization_id == org_id)
+
+    if period == "weekly":
+        # Current week: Monday to Friday
+        today = now.date()
+        monday = today - timedelta(days=today.weekday())
+        friday = monday + timedelta(days=4)
+        day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+
+        candidates = (
+            base_q
+            .filter(cast(Candidate.applied_date, Date) >= monday)
+            .filter(cast(Candidate.applied_date, Date) <= friday)
+            .all()
+        )
+
+        result = []
+        for i, label in enumerate(day_labels):
+            day_date = monday + timedelta(days=i)
+            row: Dict[str, Any] = {"label": label}
+            for s in statuses:
+                row[s.lower()] = 0
+            for c in candidates:
+                if c.applied_date and c.applied_date.date() == day_date:
+                    status_key = c.status.value.lower() if c.status else "applied"
+                    if status_key in row:
+                        row[status_key] += 1
+            result.append(row)
+        return result
+
+    # Default: monthly (Jan-Dec of current year)
+    month_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+    candidates = (
+        base_q
+        .filter(extract("year", Candidate.applied_date) == now.year)
+        .all()
+    )
+
+    result = []
+    for month_idx, label in enumerate(month_labels, start=1):
+        row: Dict[str, Any] = {"label": label}
+        for s in statuses:
+            row[s.lower()] = 0
+        for c in candidates:
+            if c.applied_date and c.applied_date.month == month_idx:
+                status_key = c.status.value.lower() if c.status else "applied"
+                if status_key in row:
+                    row[status_key] += 1
+        result.append(row)
+    return result
+
+
+@router.get("/jobs-chart", response_model=List[Dict[str, Any]])
+def get_jobs_chart(
+    period: str = "monthly",
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Return active and finished job counts over time.
+
+    Query params:
+        period: "monthly" (Jan-Dec), "weekly" (Mon-Fri), or "daily" (hours 0-23).
+    """
+    org_id = get_org_id(user)
+    now = datetime.utcnow()
+
+    base_q = db.query(JobModel)
+    if org_id is not None:
+        base_q = base_q.filter(JobModel.organization_id == org_id)
+
+    if period == "daily":
+        # Today's jobs grouped by hour (0-23)
+        today = now.date()
+        jobs = (
+            base_q
+            .filter(cast(JobModel.created_at, Date) == today)
+            .all()
+        )
+
+        result = []
+        for hour in range(24):
+            active = 0
+            finished = 0
+            for j in jobs:
+                if j.created_at and j.created_at.hour == hour:
+                    if j.status == JobStatus.inactive:
+                        finished += 1
+                    else:
+                        active += 1
+            result.append({"label": str(hour), "active": active, "finished": finished})
+        return result
+
+    if period == "weekly":
+        today = now.date()
+        monday = today - timedelta(days=today.weekday())
+        friday = monday + timedelta(days=4)
+        day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+
+        jobs = (
+            base_q
+            .filter(cast(JobModel.created_at, Date) >= monday)
+            .filter(cast(JobModel.created_at, Date) <= friday)
+            .all()
+        )
+
+        result = []
+        for i, label in enumerate(day_labels):
+            day_date = monday + timedelta(days=i)
+            active = 0
+            finished = 0
+            for j in jobs:
+                if j.created_at and j.created_at.date() == day_date:
+                    if j.status == JobStatus.inactive:
+                        finished += 1
+                    else:
+                        active += 1
+            result.append({"label": label, "active": active, "finished": finished})
+        return result
+
+    # Default: monthly (Jan-Dec of current year)
+    month_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+    jobs = (
+        base_q
+        .filter(extract("year", JobModel.created_at) == now.year)
+        .all()
+    )
+
+    result = []
+    for month_idx, label in enumerate(month_labels, start=1):
+        active = 0
+        finished = 0
+        for j in jobs:
+            if j.created_at and j.created_at.month == month_idx:
+                if j.status == JobStatus.inactive:
+                    finished += 1
+                else:
+                    active += 1
+        result.append({"label": label, "active": active, "finished": finished})
+    return result
 
 
 def _get_active_token(db: Session, job_id: int) -> str | None:
@@ -49,11 +229,11 @@ def _create_token(db: Session, job_id: int) -> str:
 
 
 @router.get("/", response_model=List[JobListItem])
-def list_jobs(db: Session = Depends(get_db)):
+def list_jobs(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     from app.models.candidate import Candidate
     from sqlalchemy import func, case
 
-    jobs = job_service.get_jobs_list(db)
+    jobs = job_service.get_jobs_list(db, org_id=get_org_id(user))
 
     # Compute real stats per job in a single query
     COMPLETED_STATUSES = ("Completed", "Terminated Prematurely", "Terminated – Cheating Detected",
@@ -129,9 +309,43 @@ def _bg_build_job_metadata(job_id: int):
         asyncio.run(_run())
 
 
+@router.get("/can-create")
+def can_create_job(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Pre-check whether the user's organization can create another job."""
+    org_id = get_org_id(user)
+    if org_id is not None:
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+        if org and (org.max_jobs or 0) > 0:
+            if (org.total_jobs_used or 0) >= org.max_jobs:
+                return {
+                    "allowed": False,
+                    "message": "You have exceeded the job limit. Please upgrade your plan.",
+                    "used": org.total_jobs_used or 0,
+                    "limit": org.max_jobs,
+                }
+    return {"allowed": True}
+
+
 @router.post("/", response_model=JobRead, status_code=status.HTTP_201_CREATED)
-def create_job(payload: JobCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    job = job_service.create_job(db, payload)
+def create_job(payload: JobCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    from app.models.job import Job as JobModel
+    org_id = get_org_id(user)
+    # Enforce org job quota using lifetime counter
+    if org_id is not None:
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+        if org and (org.max_jobs or 0) > 0:
+            if (org.total_jobs_used or 0) >= org.max_jobs:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You have exceeded the job limit. Please upgrade your plan.",
+                )
+    job = job_service.create_job(db, payload, org_id=org_id)
+    # Increment lifetime job counter
+    if org_id is not None:
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+        if org:
+            org.total_jobs_used = (org.total_jobs_used or 0) + 1
+            db.commit()
     # Auto-generate a unique interview token for this job
     token_str = _create_token(db, job.id)
     # Extract JD metadata in background
@@ -141,11 +355,9 @@ def create_job(payload: JobCreate, background_tasks: BackgroundTasks, db: Sessio
 
 
 @router.get("/{job_id}", response_model=JobRead)
-def get_job(job_id: int, db: Session = Depends(get_db)):
+def get_job(job_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     from app.models.job_metadata import JobMetadata
-    job = job_service.get_job_by_id(db, job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = _get_job_with_org_check(db, job_id, user)
     result = JobRead.model_validate(job)
     # Enrich with summary from job metadata
     jd_meta = db.query(JobMetadata).filter(JobMetadata.job_id == job_id).first()
@@ -157,7 +369,8 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
 
 
 @router.put("/{job_id}", response_model=JobRead)
-def update_job(job_id: int, payload: JobUpdate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def update_job(job_id: int, payload: JobUpdate, background_tasks: BackgroundTasks, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _get_job_with_org_check(db, job_id, user)
     job = job_service.update_job(db, job_id, payload)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -185,7 +398,8 @@ def update_job(job_id: int, payload: JobUpdate, background_tasks: BackgroundTask
         404: {"description": "Job not found"},
     },
 )
-def delete_job(job_id: int, db: Session = Depends(get_db)):
+def delete_job(job_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _get_job_with_org_check(db, job_id, user)
     ok = job_service.delete_job(db, job_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -209,10 +423,8 @@ def delete_job(job_id: int, db: Session = Depends(get_db)):
     ),
     tags=["Jobs"],
 )
-def generate_interview_url(job_id: int, request: Request, db: Session = Depends(get_db)):
-    job = job_service.get_job_by_id(db, job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+def generate_interview_url(job_id: int, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    job = _get_job_with_org_check(db, job_id, user)
 
     # Return existing active token if present
     existing = db.query(InterviewToken).filter(
@@ -261,10 +473,8 @@ def generate_interview_url(job_id: int, request: Request, db: Session = Depends(
     ),
     tags=["Jobs"],
 )
-def list_interview_sessions(job_id: int, db: Session = Depends(get_db)):
-    job = job_service.get_job_by_id(db, job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+def list_interview_sessions(job_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _get_job_with_org_check(db, job_id, user)
 
     sessions = (
         db.query(InterviewSession)
@@ -306,10 +516,8 @@ def list_interview_sessions(job_id: int, db: Session = Depends(get_db)):
     ),
     tags=["Jobs"],
 )
-def add_meeting_slot(job_id: int, payload: MeetingSlotCreate, db: Session = Depends(get_db)):
-    job = job_service.get_job_by_id(db, job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+def add_meeting_slot(job_id: int, payload: MeetingSlotCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    job = _get_job_with_org_check(db, job_id, user)
 
     slot = MeetingSlot(
         job_id=job_id,
@@ -330,7 +538,7 @@ def add_meeting_slot(job_id: int, payload: MeetingSlotCreate, db: Session = Depe
     summary="Download a generated Word document JD for a job",
     tags=["Jobs"],
 )
-def download_jd(job_id: int, db: Session = Depends(get_db)):
+def download_jd(job_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     import io
     import os
     from docx import Document
@@ -339,9 +547,7 @@ def download_jd(job_id: int, db: Session = Depends(get_db)):
     from fastapi.responses import StreamingResponse
     from app.models.job import Job, JobSkill, JobResponsibility
 
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = _get_job_with_org_check(db, job_id, user)
 
     from app.models.job_metadata import JobMetadata
 
@@ -450,12 +656,11 @@ def match_candidates(
     job_id: int,
     threshold: int = 30,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     from app.services.matching_service import start_match_task
 
-    job = job_service.get_job_by_id(db, job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    _get_job_with_org_check(db, job_id, user)
 
     task_id = start_match_task(job_id, threshold=threshold)
 
@@ -540,13 +745,12 @@ async def add_matched_candidates(
     job_id: int,
     payload: dict,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     from app.models.candidate import Candidate
     from app.models.resume_metadata import ResumeMetadata
 
-    job = job_service.get_job_by_id(db, job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = _get_job_with_org_check(db, job_id, user)
 
     candidate_emails = payload.get("candidate_emails", [])
     if not candidate_emails:
@@ -577,6 +781,16 @@ async def add_matched_candidates(
             skipped += 1
             details.append({"email": email, "status": "skipped", "reason": "no metadata found"})
             continue
+
+        # Enforce candidate quota using lifetime counter
+        if job.organization_id:
+            org = db.query(Organization).filter(Organization.id == job.organization_id).first()
+            if org and (org.max_candidates_per_job or 0) > 0:
+                if (org.total_candidates_used or 0) >= org.max_candidates_per_job:
+                    skipped += 1
+                    details.append({"email": email, "status": "skipped", "reason": "candidate limit exceeded"})
+                    continue
+                org.total_candidates_used = (org.total_candidates_used or 0) + 1
 
         candidate = Candidate(
             name=meta.candidate_name or email.split("@")[0],

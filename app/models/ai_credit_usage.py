@@ -8,7 +8,7 @@ visualise usage by feature, model, and time period on the admin dashboard.
 import enum
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Enum, Float, Integer, String, Text
+from sqlalchemy import Column, DateTime, Enum, Float, ForeignKey, Integer, String, Text
 from app.database import Base
 
 
@@ -38,6 +38,7 @@ class AiCreditUsage(Base):
     total_tokens = Column(Integer, nullable=False, default=0)
     estimated_cost = Column(Float, nullable=False, default=0.0)  # USD
 
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
     job_id = Column(Integer, nullable=True)
     candidate_id = Column(Integer, nullable=True)
     session_id = Column(Integer, nullable=True)

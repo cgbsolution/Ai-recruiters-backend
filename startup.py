@@ -32,6 +32,8 @@ REQUIRED_COLUMNS = [
     ("resume_metadata", "annual_package", "FLOAT", None),
     # Migration: i9j0k1l2m3n4_add_allow_joining_early
     ("candidates", "allow_joining_early", "BOOLEAN", "FALSE"),
+    # Migration: m3n4o5p6q7r8_add_face_count_to_screenshots
+    ("interview_screenshots", "face_count", "INTEGER", None),
 ]
 
 # Tables that need to be created if they don't exist.
@@ -77,6 +79,51 @@ REQUIRED_TABLES = [
         captured_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
     """,
+    # Migration: n4o5p6q7r8s9_add_users_table
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'userrole') THEN
+            CREATE TYPE userrole AS ENUM ('super_admin', 'admin', 'recruiter');
+        END IF;
+    END
+    $$;
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(150) NOT NULL,
+        email VARCHAR(255) NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        role userrole NOT NULL DEFAULT 'recruiter',
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        is_email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+        email_verify_token VARCHAR(128),
+        email_verify_expires TIMESTAMP,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP
+    )
+    """,
+    # Migration: o5p6q7r8s9t0_add_organizations_multi_tenant
+    """
+    CREATE TABLE IF NOT EXISTS organizations (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        domain VARCHAR(255) NOT NULL UNIQUE,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP
+    )
+    """,
+]
+
+# Columns that need to be added for multi-tenancy
+REQUIRED_COLUMNS = REQUIRED_COLUMNS + [
+    ("users", "organization_id", "INTEGER", None),
+    ("jobs", "organization_id", "INTEGER", None),
+    ("questions", "organization_id", "INTEGER", None),
+    ("resume_metadata", "organization_id", "INTEGER", None),
+    ("ai_credit_usage", "organization_id", "INTEGER", None),
 ]
 
 # Indexes to create (safe with IF NOT EXISTS)
@@ -86,6 +133,15 @@ REQUIRED_INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_ai_credit_usage_id ON ai_credit_usage (id)",
     "CREATE INDEX IF NOT EXISTS ix_per_question_evaluations_session_id ON per_question_evaluations (session_id)",
     "CREATE INDEX IF NOT EXISTS ix_interview_screenshots_session_id ON interview_screenshots (session_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email ON users (email)",
+    "CREATE INDEX IF NOT EXISTS ix_users_id ON users (id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_organizations_domain ON organizations (domain)",
+    "CREATE INDEX IF NOT EXISTS ix_organizations_id ON organizations (id)",
+    "CREATE INDEX IF NOT EXISTS ix_users_organization_id ON users (organization_id)",
+    "CREATE INDEX IF NOT EXISTS ix_jobs_organization_id ON jobs (organization_id)",
+    "CREATE INDEX IF NOT EXISTS ix_questions_organization_id ON questions (organization_id)",
+    "CREATE INDEX IF NOT EXISTS ix_resume_metadata_organization_id ON resume_metadata (organization_id)",
+    "CREATE INDEX IF NOT EXISTS ix_ai_credit_usage_organization_id ON ai_credit_usage (organization_id)",
 ]
 
 

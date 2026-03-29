@@ -24,13 +24,27 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.auth import get_current_user, get_org_id
 from app.database import get_db, SessionLocal
+from app.models.organization import Organization
 from app.models.resume_metadata import ResumeMetadata
+from app.models.user import User, UserRole
 from app.schemas.resume_metadata import ResumeMetadataUpdate
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
+
+
+def _check_resume_db_permission(user: User, db: Session) -> None:
+    """Raise 403 if user's org doesn't have resume database access. Super admins always pass."""
+    if user.role == UserRole.super_admin:
+        return
+    if not user.organization_id:
+        raise HTTPException(status_code=403, detail="You do not have permission to perform this action. Please contact your admin.")
+    org = db.query(Organization).filter(Organization.id == user.organization_id).first()
+    if not org or not org.allow_resume_database:
+        raise HTTPException(status_code=403, detail="You do not have permission to perform this action. Please contact your admin.")
 
 IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
 UPLOAD_ROOT = "/tmp/uploads" if IS_SERVERLESS else "uploads"
@@ -93,13 +107,16 @@ def _parse_single_resume(meta_id: int, file_path: str, batch_id: str):
         parsed = fast_parse_resume(raw_text)
         parsed_email = parsed.get("candidate_email")
 
-        # Deduplication
+        # Deduplication (org-scoped)
         target = meta
         if parsed_email and meta.candidate_email != parsed_email:
-            existing = db.query(ResumeMetadata).filter(
+            dedup_query = db.query(ResumeMetadata).filter(
                 ResumeMetadata.candidate_email == parsed_email,
                 ResumeMetadata.id != meta.id,
-            ).first()
+            )
+            if meta.organization_id is not None:
+                dedup_query = dedup_query.filter(ResumeMetadata.organization_id == meta.organization_id)
+            existing = dedup_query.first()
             if existing:
                 target = existing
                 if existing.resume_file_path and os.path.exists(existing.resume_file_path) and existing.resume_file_path != file_path:
@@ -181,13 +198,16 @@ async def _ai_parse_single_resume(meta_id: int, file_path: str, batch_id: str):
 
         parsed_email = data.get("email")
 
-        # Deduplication
+        # Deduplication (org-scoped)
         target = meta
         if parsed_email and meta.candidate_email != parsed_email:
-            existing = db.query(ResumeMetadata).filter(
+            dedup_query = db.query(ResumeMetadata).filter(
                 ResumeMetadata.candidate_email == parsed_email,
                 ResumeMetadata.id != meta.id,
-            ).first()
+            )
+            if meta.organization_id is not None:
+                dedup_query = dedup_query.filter(ResumeMetadata.organization_id == meta.organization_id)
+            existing = dedup_query.first()
             if existing:
                 target = existing
                 if existing.resume_file_path and os.path.exists(existing.resume_file_path) and existing.resume_file_path != file_path:
@@ -277,6 +297,20 @@ def _ensure_bulk_worker():
 
 # ── Bulk Upload ──────────────────────────────────────────────────────────────
 
+@router.get("/permissions")
+def get_resume_db_permissions(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Check if the current user has resume database write access."""
+    if user.role == UserRole.super_admin:
+        return {"allowed": True}
+    if not user.organization_id:
+        return {"allowed": False}
+    org = db.query(Organization).filter(Organization.id == user.organization_id).first()
+    return {"allowed": bool(org and org.allow_resume_database)}
+
+
 @router.post(
     "/upload",
     summary="Upload resumes to the central database (bulk)",
@@ -293,7 +327,9 @@ async def upload_resumes(
     files: List[UploadFile] = File(...),
     parse_mode: str = Query("fast", description="'fast' (regex) or 'ai' (Claude AI)"),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
+    _check_resume_db_permission(user, db)
     _ensure_bulk_worker()
 
     if parse_mode not in ("fast", "ai"):
@@ -336,6 +372,7 @@ async def upload_resumes(
             candidate_name=Path(file.filename).stem.replace("_", " ").replace("-", " ").title(),
             resume_file_path=file_path,
             parsing_status="pending",
+            organization_id=user.organization_id,
         )
         db.add(meta)
         db.commit()
@@ -371,11 +408,13 @@ def get_batch_progress(batch_id: str):
     "/failed",
     summary="List all failed resume records",
 )
-def list_failed_resumes(db: Session = Depends(get_db)):
+def list_failed_resumes(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Return all resumes that failed parsing, with error details."""
-    failed = db.query(ResumeMetadata).filter(
-        ResumeMetadata.parsing_status == "failed",
-    ).order_by(ResumeMetadata.created_at.desc()).all()
+    org_id = get_org_id(user)
+    query = db.query(ResumeMetadata).filter(ResumeMetadata.parsing_status == "failed")
+    if org_id is not None:
+        query = query.filter(ResumeMetadata.organization_id == org_id)
+    failed = query.order_by(ResumeMetadata.created_at.desc()).all()
 
     return {
         "count": len(failed),
@@ -397,11 +436,13 @@ def list_failed_resumes(db: Session = Depends(get_db)):
     "/failed/download",
     summary="Download CSV of failed resume records",
 )
-def download_failed_resumes(db: Session = Depends(get_db)):
+def download_failed_resumes(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Download a CSV file listing all resumes that failed parsing."""
-    failed = db.query(ResumeMetadata).filter(
-        ResumeMetadata.parsing_status == "failed",
-    ).order_by(ResumeMetadata.created_at.desc()).all()
+    org_id = get_org_id(user)
+    query = db.query(ResumeMetadata).filter(ResumeMetadata.parsing_status == "failed")
+    if org_id is not None:
+        query = query.filter(ResumeMetadata.organization_id == org_id)
+    failed = query.order_by(ResumeMetadata.created_at.desc()).all()
 
     output = io.StringIO()
     writer = csv.writer(output)
@@ -451,8 +492,14 @@ def list_resumes(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     query = db.query(ResumeMetadata)
+
+    # Organization scoping
+    org_id = get_org_id(user)
+    if org_id is not None:
+        query = query.filter(ResumeMetadata.organization_id == org_id)
 
     # Exclude stale placeholder records (never parsed)
     query = query.filter(
@@ -524,23 +571,23 @@ def list_resumes(
     "/stats",
     summary="Get resume database statistics",
 )
-def get_stats(db: Session = Depends(get_db)):
-    # Exclude stale placeholder records from stats
-    base = db.query(func.count(ResumeMetadata.id)).filter(
-        ~ResumeMetadata.candidate_email.like("%@pending.local")
-    )
-    total = base.scalar() or 0
+def get_stats(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    org_id = get_org_id(user)
+
+    # Base filter: exclude stale placeholder records
+    base_filters = [~ResumeMetadata.candidate_email.like("%@pending.local")]
+    if org_id is not None:
+        base_filters.append(ResumeMetadata.organization_id == org_id)
+
+    total = db.query(func.count(ResumeMetadata.id)).filter(*base_filters).scalar() or 0
     completed = db.query(func.count(ResumeMetadata.id)).filter(
-        ResumeMetadata.parsing_status == "completed",
-        ~ResumeMetadata.candidate_email.like("%@pending.local"),
+        *base_filters, ResumeMetadata.parsing_status == "completed",
     ).scalar() or 0
     pending = db.query(func.count(ResumeMetadata.id)).filter(
-        ResumeMetadata.parsing_status.in_(["pending", "processing"]),
-        ~ResumeMetadata.candidate_email.like("%@pending.local"),
+        *base_filters, ResumeMetadata.parsing_status.in_(["pending", "processing"]),
     ).scalar() or 0
     failed = db.query(func.count(ResumeMetadata.id)).filter(
-        ResumeMetadata.parsing_status == "failed",
-        ~ResumeMetadata.candidate_email.like("%@pending.local"),
+        *base_filters, ResumeMetadata.parsing_status == "failed",
     ).scalar() or 0
 
     return {
@@ -557,8 +604,12 @@ def get_stats(db: Session = Depends(get_db)):
     "/{meta_id}",
     summary="Get single resume metadata detail",
 )
-def get_resume_detail(meta_id: int, db: Session = Depends(get_db)):
-    meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
+def get_resume_detail(meta_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    org_id = get_org_id(user)
+    query = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id)
+    if org_id is not None:
+        query = query.filter(ResumeMetadata.organization_id == org_id)
+    meta = query.first()
     if not meta:
         raise HTTPException(status_code=404, detail="Resume not found")
     return _serialize_meta(meta, include_text=True)
@@ -575,8 +626,13 @@ def update_resume_metadata(
     meta_id: int,
     body: ResumeMetadataUpdate,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
-    meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
+    org_id = get_org_id(user)
+    query = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id)
+    if org_id is not None:
+        query = query.filter(ResumeMetadata.organization_id == org_id)
+    meta = query.first()
     if not meta:
         raise HTTPException(status_code=404, detail="Resume not found")
 
@@ -603,17 +659,27 @@ def update_resume_metadata(
     summary="Delete ALL resume metadata records and files",
     status_code=200,
 )
-def clear_all_resumes(db: Session = Depends(get_db)):
-    """Wipe the entire resume database. Use with caution."""
+def clear_all_resumes(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Wipe the resume database for the current organization (or all for super admin)."""
+    _check_resume_db_permission(user, db)
     from app.models.candidate import Candidate
 
-    # Unlink all candidates
-    db.query(Candidate).filter(Candidate.resume_metadata_id.isnot(None)).update(
-        {"resume_metadata_id": None}, synchronize_session="fetch"
-    )
+    org_id = get_org_id(user)
 
-    all_resumes = db.query(ResumeMetadata).all()
+    # Scope to organization
+    resume_query = db.query(ResumeMetadata)
+    if org_id is not None:
+        resume_query = resume_query.filter(ResumeMetadata.organization_id == org_id)
+
+    all_resumes = resume_query.all()
+    resume_ids = [m.id for m in all_resumes]
     count = len(all_resumes)
+
+    # Unlink candidates referencing these resumes
+    if resume_ids:
+        db.query(Candidate).filter(Candidate.resume_metadata_id.in_(resume_ids)).update(
+            {"resume_metadata_id": None}, synchronize_session="fetch"
+        )
 
     for meta in all_resumes:
         if meta.resume_file_path and os.path.exists(meta.resume_file_path):
@@ -625,8 +691,8 @@ def clear_all_resumes(db: Session = Depends(get_db)):
 
     db.commit()
 
-    # Also clean up the uploads/resumes folder
-    if os.path.exists(RESUME_UPLOAD_DIR):
+    # Clean up uploads folder only for super admin (global wipe)
+    if org_id is None and os.path.exists(RESUME_UPLOAD_DIR):
         for f in os.listdir(RESUME_UPLOAD_DIR):
             try:
                 os.remove(os.path.join(RESUME_UPLOAD_DIR, f))
@@ -643,10 +709,14 @@ def clear_all_resumes(db: Session = Depends(get_db)):
     summary="Delete a resume metadata record",
     status_code=204,
 )
-def delete_resume(meta_id: int, db: Session = Depends(get_db)):
+def delete_resume(meta_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     from app.models.candidate import Candidate
 
-    meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
+    org_id = get_org_id(user)
+    query = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id)
+    if org_id is not None:
+        query = query.filter(ResumeMetadata.organization_id == org_id)
+    meta = query.first()
     if not meta:
         raise HTTPException(status_code=404, detail="Resume not found")
 
@@ -675,15 +745,20 @@ def delete_resume(meta_id: int, db: Session = Depends(get_db)):
         "Returns count of deleted records."
     ),
 )
-def cleanup_stale_records(db: Session = Depends(get_db)):
+def cleanup_stale_records(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Remove placeholder records that were never parsed or failed."""
     from app.models.candidate import Candidate
 
+    org_id = get_org_id(user)
+
     # Delete placeholder records that are still pending/failed (never parsed)
-    stale = db.query(ResumeMetadata).filter(
+    query = db.query(ResumeMetadata).filter(
         ResumeMetadata.candidate_email.like("%@pending.local"),
         ResumeMetadata.parsing_status.in_(["pending", "failed"]),
-    ).all()
+    )
+    if org_id is not None:
+        query = query.filter(ResumeMetadata.organization_id == org_id)
+    stale = query.all()
 
     deleted_count = 0
     stale_ids = [m.id for m in stale]
@@ -714,11 +789,15 @@ def cleanup_stale_records(db: Session = Depends(get_db)):
     "/{meta_id}/reparse",
     summary="Re-parse a single resume with improved regex + LLM correction",
 )
-async def reparse_single_resume(meta_id: int, use_llm: bool = True, db: Session = Depends(get_db)):
+async def reparse_single_resume(meta_id: int, use_llm: bool = True, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     from app.services.fast_resume_parser import fast_parse_resume
     from app.services.llm_resume_parser import llm_parse_resume, needs_llm_correction
 
-    meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
+    org_id = get_org_id(user)
+    query = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id)
+    if org_id is not None:
+        query = query.filter(ResumeMetadata.organization_id == org_id)
+    meta = query.first()
     if not meta:
         raise HTTPException(status_code=404, detail="Resume not found")
     if not meta.raw_text:
@@ -786,15 +865,19 @@ async def reparse_single_resume(meta_id: int, use_llm: bool = True, db: Session 
     "/reparse-bad",
     summary="Re-parse resumes that have bad data (auto-detected) using regex + LLM",
 )
-async def reparse_bad_resumes(db: Session = Depends(get_db)):
+async def reparse_bad_resumes(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Find resumes with garbage data and re-parse them with LLM correction."""
     from app.services.fast_resume_parser import fast_parse_resume
     from app.services.llm_resume_parser import llm_parse_resume, needs_llm_correction
 
-    metas = db.query(ResumeMetadata).filter(
+    org_id = get_org_id(user)
+    query = db.query(ResumeMetadata).filter(
         ResumeMetadata.parsing_status == "completed",
         ResumeMetadata.raw_text.isnot(None),
-    ).all()
+    )
+    if org_id is not None:
+        query = query.filter(ResumeMetadata.organization_id == org_id)
+    metas = query.all()
 
     needs_fix = []
     for meta in metas:
@@ -860,16 +943,20 @@ async def reparse_bad_resumes(db: Session = Depends(get_db)):
         "Does NOT change candidate_email or parsing_status. Useful after parser improvements."
     ),
 )
-def reparse_all_resumes(db: Session = Depends(get_db)):
+def reparse_all_resumes(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Re-parse all completed resumes using the improved fast parser."""
     from app.services.fast_resume_parser import fast_parse_resume, _is_valid_name
     import json
     from datetime import datetime
 
-    metas = db.query(ResumeMetadata).filter(
+    org_id = get_org_id(user)
+    query = db.query(ResumeMetadata).filter(
         ResumeMetadata.parsing_status == "completed",
         ResumeMetadata.raw_text.isnot(None),
-    ).all()
+    )
+    if org_id is not None:
+        query = query.filter(ResumeMetadata.organization_id == org_id)
+    metas = query.all()
 
     updated = 0
     errors = 0
@@ -939,6 +1026,7 @@ def reparse_all_resumes(db: Session = Depends(get_db)):
 async def import_resumes(
     request: Request,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     body = await request.json()
     if not isinstance(body, list):
@@ -954,11 +1042,11 @@ async def import_resumes(
             skipped += 1
             continue
 
-        # Skip if already exists
-        existing = db.query(ResumeMetadata).filter(
-            ResumeMetadata.candidate_email == email
-        ).first()
-        if existing:
+        # Skip if already exists in this org
+        dup_query = db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == email)
+        if user.organization_id:
+            dup_query = dup_query.filter(ResumeMetadata.organization_id == user.organization_id)
+        if dup_query.first():
             skipped += 1
             continue
 
@@ -980,6 +1068,7 @@ async def import_resumes(
                 raw_text=record.get("raw_text"),
                 parsing_status=record.get("parsing_status", "completed"),
                 parsed_at=datetime.fromisoformat(record["parsed_at"]) if record.get("parsed_at") else None,
+                organization_id=user.organization_id,
             )
             db.add(meta)
             imported += 1
@@ -1011,6 +1100,7 @@ async def import_with_file(
     metadata: str = Form(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Import a single resume with its file from local to server."""
     try:
@@ -1022,11 +1112,11 @@ async def import_with_file(
     if not email or "@pending.local" in email:
         return {"status": "skipped", "reason": "invalid email"}
 
-    # Skip if already exists
-    existing = db.query(ResumeMetadata).filter(
-        ResumeMetadata.candidate_email == email
-    ).first()
-    if existing:
+    # Skip if already exists in this org
+    dup_query = db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == email)
+    if user.organization_id:
+        dup_query = dup_query.filter(ResumeMetadata.organization_id == user.organization_id)
+    if dup_query.first():
         return {"status": "skipped", "reason": "already exists"}
 
     # Save file
@@ -1054,6 +1144,7 @@ async def import_with_file(
             resume_file_path=file_path,
             parsing_status=record.get("parsing_status", "completed"),
             parsed_at=datetime.fromisoformat(record["parsed_at"]) if record.get("parsed_at") else None,
+            organization_id=user.organization_id,
         )
         db.add(meta)
         db.commit()

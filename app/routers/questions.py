@@ -3,21 +3,23 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.auth import get_current_user, get_org_id
 from app.database import get_db
+from app.models.user import User
 from app.schemas.question import QuestionCreate, QuestionRead, QuestionUpdate
 from app.services import question_service
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 @router.get("/", response_model=List[QuestionRead])
-def list_questions(db: Session = Depends(get_db)):
-    return question_service.get_questions(db)
+def list_questions(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return question_service.get_questions(db, org_id=get_org_id(user))
 
 
 @router.post("/", response_model=QuestionRead, status_code=status.HTTP_201_CREATED)
-def create_question(payload: QuestionCreate, db: Session = Depends(get_db)):
-    return question_service.create_question(db, payload)
+def create_question(payload: QuestionCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return question_service.create_question(db, payload, org_id=get_org_id(user))
 
 
 @router.put("/{question_id}", response_model=QuestionRead)

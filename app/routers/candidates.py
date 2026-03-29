@@ -15,11 +15,46 @@ from sqlalchemy.orm import Session
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
+from app.auth import get_current_user, get_org_id
 from app.database import get_db, SessionLocal
 from app.models.candidate import Candidate
+from app.models.organization import Organization
 from app.models.resume_metadata import ResumeMetadata
+from app.models.user import User
 
 limiter = Limiter(key_func=get_remote_address)
+
+
+def _get_candidate_with_org_check(db: Session, candidate_id: int, user: User) -> Candidate:
+    """Fetch a candidate and verify it belongs to the user's organization."""
+    from app.models.job import Job as JobModel
+    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    org_id = get_org_id(user)
+    if org_id is not None and candidate.job_id:
+        job = db.query(JobModel).filter(JobModel.id == candidate.job_id).first()
+        if not job or job.organization_id != org_id:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+    return candidate
+
+
+def _check_and_increment_candidate_quota(db: Session, job_id: int) -> None:
+    """Check lifetime candidate quota and increment counter. Raises 403 if exceeded."""
+    from app.models.job import Job as JobModel
+    job = db.query(JobModel).filter(JobModel.id == job_id).first()
+    if not job or not job.organization_id:
+        return
+    org = db.query(Organization).filter(Organization.id == job.organization_id).first()
+    if not org or (org.max_candidates_per_job or 0) == 0:
+        return
+    if (org.total_candidates_used or 0) >= org.max_candidates_per_job:
+        raise HTTPException(
+            status_code=403,
+            detail="You have exceeded the candidate limit. Please upgrade your plan.",
+        )
+    org.total_candidates_used = (org.total_candidates_used or 0) + 1
+    db.flush()
 from app.schemas.candidate import (
     CancelInterviewRequest,
     CandidateCreate,
@@ -32,7 +67,7 @@ from app.schemas.candidate import (
 from app.schemas.resume_metadata import DuplicateCheckResponse
 from app.services import candidate_service
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
 UPLOAD_ROOT = "/tmp/uploads" if IS_SERVERLESS else "uploads"
@@ -46,7 +81,15 @@ ALLOWED_RESUME_TYPES = {
 }
 
 # ── Concurrent background parse pool ─────────────────────────────────────────
-_parse_semaphore = asyncio.Semaphore(3)  # max 3 concurrent parses
+_parse_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_parse_semaphore() -> asyncio.Semaphore:
+    """Lazy-init semaphore inside the running event loop."""
+    global _parse_semaphore
+    if _parse_semaphore is None:
+        _parse_semaphore = asyncio.Semaphore(3)
+    return _parse_semaphore
 
 
 def _sync_extract_text(file_path: str) -> str:
@@ -65,7 +108,7 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
     Uses Haiku (~1-2s) for parsing + smart scoring (~50ms) for fit score.
     Total: ~3-5s per resume vs ~30-40s with old Sonnet approach.
     """
-    async with _parse_semaphore:
+    async with _get_parse_semaphore():
         db = SessionLocal()
         try:
             candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
@@ -76,6 +119,13 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
             db.commit()
 
             from app.models.job import Job, JobSkill, JobResponsibility
+
+            # Determine organization_id from the job
+            _org_id = None
+            if job_id:
+                _job = db.query(Job).filter(Job.id == job_id).first()
+                if _job:
+                    _org_id = _job.organization_id
 
             # ── Step 1: Extract text in thread pool ───────────────────────────
             resume_text = await asyncio.to_thread(_sync_extract_text, file_path)
@@ -131,12 +181,15 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
                     existing.role = parsed.get("current_designation") or existing.role
                     existing.parsing_status = "processing"
 
-                    # Update ResumeMetadata for existing candidate
-                    ex_meta = db.query(ResumeMetadata).filter(
+                    # Update ResumeMetadata for existing candidate (org-scoped)
+                    ex_meta_q = db.query(ResumeMetadata).filter(
                         ResumeMetadata.candidate_email == real_email
-                    ).first()
+                    )
+                    if _org_id is not None:
+                        ex_meta_q = ex_meta_q.filter(ResumeMetadata.organization_id == _org_id)
+                    ex_meta = ex_meta_q.first()
                     if not ex_meta:
-                        ex_meta = ResumeMetadata(candidate_email=real_email)
+                        ex_meta = ResumeMetadata(candidate_email=real_email, organization_id=_org_id)
                         db.add(ex_meta)
                     ex_meta.candidate_name = parsed.get("candidate_name")
                     ex_meta.phone = parsed.get("phone")
@@ -173,15 +226,21 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
             candidate.location = parsed.get("location") or candidate.location
             candidate.role = parsed.get("current_designation") or candidate.role
 
-            # ── Upsert ResumeMetadata ─────────────────────────────────────────
+            # ── Upsert ResumeMetadata (org-scoped) ────────────────────────────
             meta = None
             if parsed_email and not parsed_email.endswith("@resume.local"):
-                meta = db.query(ResumeMetadata).filter(
+                meta_q = db.query(ResumeMetadata).filter(
                     ResumeMetadata.candidate_email == parsed_email
-                ).first()
+                )
+                if _org_id is not None:
+                    meta_q = meta_q.filter(ResumeMetadata.organization_id == _org_id)
+                meta = meta_q.first()
 
             if not meta:
-                meta = ResumeMetadata(candidate_email=parsed_email or candidate.email)
+                meta = ResumeMetadata(
+                    candidate_email=parsed_email or candidate.email,
+                    organization_id=_org_id,
+                )
                 db.add(meta)
 
             meta.candidate_name = parsed.get("candidate_name")
@@ -209,17 +268,35 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
                 await _compute_fit_score_with_fallback(candidate, db, job_id, resume_text)
 
             candidate.parsing_status = "completed"
+
+            # ── Increment quota only on successful parse ─────────────────────
+            if job_id:
+                from app.models.job import Job as _QJob
+                _qjob = db.query(_QJob).filter(_QJob.id == job_id).first()
+                if _qjob and _qjob.organization_id:
+                    _qorg = db.query(Organization).filter(
+                        Organization.id == _qjob.organization_id
+                    ).first()
+                    if _qorg:
+                        _qorg.total_candidates_used = (_qorg.total_candidates_used or 0) + 1
+
             db.commit()
 
         except Exception as exc:
             logger.error("Background parse failed for candidate %s: %s", candidate_id, exc, exc_info=True)
             try:
+                db.rollback()
                 candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
                 if candidate:
-                    candidate.parsing_status = "failed"
+                    db.delete(candidate)
                     db.commit()
-            except Exception:
-                pass
+                    logger.info("Deleted failed candidate %s", candidate_id)
+                # Clean up the uploaded file
+                if file_path and os.path.isfile(file_path):
+                    os.remove(file_path)
+                    logger.info("Deleted failed resume file: %s", file_path)
+            except Exception as cleanup_exc:
+                logger.warning("Cleanup after parse failure: %s", cleanup_exc)
         finally:
             db.close()
 
@@ -261,9 +338,58 @@ async def _compute_fit_score_with_fallback(
         logger.error("AI fit score also FAILED for candidate %s: %s", candidate.id, fit_exc, exc_info=True)
 
 
+_background_tasks: list[asyncio.Task] = []  # prevent GC of fire-and-forget tasks
+
+
 def _launch_parse_task(candidate_id: int, file_path: str, job_id: int | None):
     """Fire-and-forget a concurrent parse task (guarded by semaphore)."""
-    asyncio.get_event_loop().create_task(_parse_one(candidate_id, file_path, job_id))
+    def _task_done(t: asyncio.Task):
+        _background_tasks.discard(t) if hasattr(_background_tasks, 'discard') else None
+        try:
+            _background_tasks.remove(t)
+        except ValueError:
+            pass
+        exc = t.exception() if not t.cancelled() else None
+        if exc:
+            logger.error("Parse task for candidate %s crashed: %s", candidate_id, exc, exc_info=exc)
+
+    try:
+        loop = asyncio.get_running_loop()
+        logger.info("Launching parse task for candidate %s on loop %s", candidate_id, id(loop))
+    except RuntimeError:
+        logger.error("No running event loop for parse task (candidate %s)", candidate_id)
+        return
+
+    task = loop.create_task(_parse_one(candidate_id, file_path, job_id))
+    _background_tasks.append(task)  # prevent garbage collection
+    task.add_done_callback(_task_done)
+    logger.info("Parse task created for candidate %s: %s", candidate_id, task)
+
+
+# ── Candidate Quota Pre-check ──────────────────────────────────────────────────
+
+@router.get("/can-add")
+def can_add_candidate(
+    job_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Pre-check whether another candidate can be added for this job."""
+    from app.models.job import Job as JobModel
+    job = db.query(JobModel).filter(JobModel.id == job_id).first()
+    if not job or not job.organization_id:
+        return {"allowed": True}
+    org = db.query(Organization).filter(Organization.id == job.organization_id).first()
+    if not org or (org.max_candidates_per_job or 0) == 0:
+        return {"allowed": True}
+    if (org.total_candidates_used or 0) >= org.max_candidates_per_job:
+        return {
+            "allowed": False,
+            "message": "You have exceeded the candidate limit. Please upgrade your plan.",
+            "used": org.total_candidates_used or 0,
+            "limit": org.max_candidates_per_job,
+        }
+    return {"allowed": True}
 
 
 # ── Standard CRUD ─────────────────────────────────────────────────────────────
@@ -284,8 +410,9 @@ def list_candidates(
     job_id: Optional[int] = None,
     stage: Optional[str] = None,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
-    return candidate_service.get_candidates(db, status=status, job_id=job_id, stage=stage)
+    return candidate_service.get_candidates(db, status=status, job_id=job_id, stage=stage, org_id=get_org_id(user))
 
 
 @router.post(
@@ -294,7 +421,10 @@ def list_candidates(
     status_code=status.HTTP_201_CREATED,
     summary="Create candidate manually",
 )
-def create_candidate(payload: CandidateCreate, db: Session = Depends(get_db)):
+def create_candidate(payload: CandidateCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    # Enforce org candidate quota using lifetime counter
+    if payload.job_id:
+        _check_and_increment_candidate_quota(db, payload.job_id)
     candidate = candidate_service.create_candidate(db, payload)
 
     # Auto-compute fit score if candidate is linked to a job
@@ -318,17 +448,16 @@ def create_candidate(payload: CandidateCreate, db: Session = Depends(get_db)):
     response_model=CandidateRead,
     summary="Get candidate by ID",
 )
-def get_candidate(candidate_id: int, db: Session = Depends(get_db)):
-    candidate = candidate_service.get_candidate_by_id(db, candidate_id)
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+def get_candidate(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
     return candidate
 
 
 @router.put("/{candidate_id}", response_model=CandidateRead, summary="Update candidate")
 def update_candidate(
-    candidate_id: int, payload: CandidateUpdate, db: Session = Depends(get_db)
+    candidate_id: int, payload: CandidateUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
+    _get_candidate_with_org_check(db, candidate_id, user)
     candidate = candidate_service.update_candidate(db, candidate_id, payload)
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
@@ -336,7 +465,8 @@ def update_candidate(
 
 
 @router.delete("/{candidate_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete candidate")
-def delete_candidate(candidate_id: int, db: Session = Depends(get_db)):
+def delete_candidate(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _get_candidate_with_org_check(db, candidate_id, user)
     ok = candidate_service.delete_candidate(db, candidate_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Candidate not found")
@@ -357,12 +487,11 @@ def hire_candidate(
     candidate_id: int,
     payload: dict = None,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     from app.models.job import Job
 
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
     job_id = (payload or {}).get("job_id")
 
@@ -380,6 +509,7 @@ def hire_candidate(
         job = db.query(Job).filter(Job.id == job_id).first()
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
+        _check_and_increment_candidate_quota(db, job_id)
         new_entry = Candidate(
             name=candidate.name,
             role=candidate.role or job.title,
@@ -433,12 +563,10 @@ def hire_candidate(
     "/{candidate_id}/job-associations",
     summary="Get all jobs this candidate is linked to",
 )
-def get_job_associations(candidate_id: int, db: Session = Depends(get_db)):
+def get_job_associations(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     from app.models.job import Job
 
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
     entries = (
         db.query(Candidate.job_id, Candidate.status, Candidate.candidate_stage, Job.title)
@@ -478,10 +606,13 @@ def check_duplicate(
     email: str,
     job_id: Optional[int] = None,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
-    meta = db.query(ResumeMetadata).filter(
-        ResumeMetadata.candidate_email == email
-    ).first()
+    org_id = get_org_id(user)
+    query = db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == email)
+    if org_id is not None:
+        query = query.filter(ResumeMetadata.organization_id == org_id)
+    meta = query.first()
 
     if not meta:
         return DuplicateCheckResponse(exists=False)
@@ -515,10 +646,8 @@ def check_duplicate(
         "Once `parsing_status` is `completed`, the `resume_fit_score` field will contain the fit percentage."
     ),
 )
-def get_parsing_status(candidate_id: int, db: Session = Depends(get_db)):
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+def get_parsing_status(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
     return {
         "candidate_id": candidate.id,
         "parsing_status": candidate.parsing_status,
@@ -557,13 +686,39 @@ async def upload_resumes(
     replace_existing: Optional[bool] = Form(False),
     files: List[UploadFile] = File(...),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Upload one or more resumes. Files are saved to disk, candidate records
     created with parsing_status='pending', and parsing launched concurrently
     in background (up to 3 at a time via semaphore).
     """
+    # Verify user owns the job
+    if job_id:
+        from app.models.job import Job as JobModel
+        org_id = get_org_id(user)
+        job = db.query(JobModel).filter(JobModel.id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if org_id is not None and job.organization_id != org_id:
+            raise HTTPException(status_code=404, detail="Job not found")
+
     created_candidates = []
+    parse_tasks = []
+
+    # Pre-check quota availability (don't increment yet — only on successful parse)
+    if job_id:
+        from app.models.job import Job as _JobModel
+        _job = db.query(_JobModel).filter(_JobModel.id == job_id).first()
+        if _job and _job.organization_id:
+            _org = db.query(Organization).filter(Organization.id == _job.organization_id).first()
+            if _org and (_org.max_candidates_per_job or 0) > 0:
+                remaining = _org.max_candidates_per_job - (_org.total_candidates_used or 0)
+                if remaining < len(files):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Candidate quota exceeded. You can add {max(0, remaining)} more candidate(s).",
+                    )
 
     for file in files:
         if file.content_type not in ALLOWED_RESUME_TYPES:
@@ -598,10 +753,39 @@ async def upload_resumes(
         db.refresh(candidate)
         created_candidates.append(candidate)
 
-        # Launch concurrent background parse (semaphore limits to 3 at a time)
-        _launch_parse_task(candidate.id, file_path, job_id)
+        # Queue for background parse
+        parse_tasks.append((candidate.id, file_path, job_id))
 
-    return created_candidates
+    # Parse all resumes concurrently (semaphore limits to 3 at a time)
+    # Awaiting here ensures tasks complete reliably (no fire-and-forget issues)
+    if parse_tasks:
+        await asyncio.gather(
+            *[_parse_one(cid, fp, jid) for cid, fp, jid in parse_tasks],
+            return_exceptions=True,
+        )
+
+    # Re-fetch candidates to return final parsed state
+    # Some placeholders may have been deleted during dedup (merged into existing),
+    # so also look up by the resume file path to find the surviving candidate.
+    db.expire_all()  # clear stale cache from the outer session
+    result = []
+    seen_ids = set()
+    for c in created_candidates:
+        refreshed = db.query(Candidate).filter(Candidate.id == c.id).first()
+        if refreshed and refreshed.id not in seen_ids:
+            result.append(refreshed)
+            seen_ids.add(refreshed.id)
+        elif c.resume_path:
+            # Placeholder was deleted (dedup) — find the surviving candidate by resume path
+            surviving = db.query(Candidate).filter(
+                Candidate.resume_path == c.resume_path,
+                Candidate.job_id == job_id,
+            ).first()
+            if surviving and surviving.id not in seen_ids:
+                result.append(surviving)
+                seen_ids.add(surviving.id)
+
+    return result
 
 
 # ── Fit Score Recompute ───────────────────────────────────────────────────────
@@ -618,11 +802,9 @@ async def upload_resumes(
         "candidates when higher accuracy is needed."
     ),
 )
-async def compute_fit_score(candidate_id: int, db: Session = Depends(get_db)):
+async def compute_fit_score(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Re-compute fit score using AI semantic analysis (6-dimension model)."""
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
     if not candidate.job_id:
         raise HTTPException(status_code=400, detail="Candidate is not linked to a job")
 
@@ -646,11 +828,15 @@ async def compute_fit_score(candidate_id: int, db: Session = Depends(get_db)):
 async def batch_recompute_scores(
     job_id: int,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Batch recompute AI fit scores for all candidates in a job opening."""
     from app.models.job import Job
+    org_id = get_org_id(user)
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if org_id is not None and job.organization_id != org_id:
         raise HTTPException(status_code=404, detail="Job not found")
 
     candidates = db.query(Candidate).filter(Candidate.job_id == job_id).all()
@@ -813,14 +999,13 @@ async def schedule_interview(
     candidate_id: int,
     payload: ScheduleInterviewRequest,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Schedule (or re-schedule) an interview for a candidate and send notifications."""
     from app.services.interview_service import send_schedule_email, send_whatsapp_message
     from app.models.interview import InterviewStatusLog
 
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
     old_status = candidate.interview_status
     is_reschedule = old_status == "Scheduled"
@@ -920,14 +1105,13 @@ async def cancel_interview(
     candidate_id: int,
     payload: CancelInterviewRequest,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Cancel a scheduled interview and notify the candidate."""
     from app.services.interview_service import send_cancel_email, send_whatsapp_message
     from app.models.interview import InterviewStatusLog
 
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
     if candidate.interview_status != "Scheduled":
         raise HTTPException(
@@ -985,15 +1169,14 @@ def promote_candidate(
     candidate_id: int,
     payload: PromoteStageRequest,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Move candidate to a new hiring stage."""
     valid_stages = {"AI Round", "Panel Round", "Offer-Made", "Rejected", "Candidates"}
     if payload.stage not in valid_stages:
         raise HTTPException(status_code=400, detail=f"Invalid stage. Must be one of: {valid_stages}")
 
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
     candidate.candidate_stage = payload.stage
     if payload.stage == "Offer-Made":
@@ -1017,13 +1200,12 @@ async def send_whatsapp(
     candidate_id: int,
     payload: SendWhatsAppRequest,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Send a custom WhatsApp message to a candidate."""
     from app.services.interview_service import send_whatsapp_message
 
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
     phone = payload.phone or candidate.phone
     if not phone:
@@ -1052,14 +1234,12 @@ async def send_whatsapp(
         "Score fields are `null` until the interview is completed."
     ),
 )
-def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
+def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Return full evaluation data: resume analysis + scores + interview Q&A transcript."""
     from app.models.interview import InterviewSession, InterviewMessage, SessionStatus, Evaluation, Violation
     from app.models.job import Job
 
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
     fit_reasoning = None
     fit_details = None
@@ -1205,6 +1385,7 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
             screenshots_list.append({
                 "file_path": fp,
                 "captured_at": (ss.captured_at.isoformat() + "Z") if ss.captured_at else None,
+                "face_count": ss.face_count,
             })
 
         # ── Latest AI evaluation for this session ─────────────────────────────
@@ -1301,15 +1482,13 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db)):
     "/{candidate_id}/evaluation/download-pdf",
     summary="Download evaluation report as PDF",
 )
-def download_evaluation_pdf(candidate_id: int, db: Session = Depends(get_db)):
+def download_evaluation_pdf(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Generate and return a PDF evaluation report for the candidate."""
     from io import BytesIO
     from fastapi.responses import StreamingResponse
     from app.models.interview import InterviewSession, InterviewMessage, SessionStatus, Evaluation
 
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
     try:
         from fpdf import FPDF
@@ -1460,7 +1639,7 @@ def download_evaluation_pdf(candidate_id: int, db: Session = Depends(get_db)):
     "/{candidate_id}/evaluation/download-docx",
     summary="Download evaluation report as DOCX",
 )
-def download_evaluation_docx(candidate_id: int, db: Session = Depends(get_db)):
+def download_evaluation_docx(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Generate and return a DOCX evaluation report for the candidate."""
     from io import BytesIO
     from fastapi.responses import StreamingResponse
@@ -1469,9 +1648,7 @@ def download_evaluation_docx(candidate_id: int, db: Session = Depends(get_db)):
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from app.models.interview import InterviewSession, InterviewMessage, SessionStatus, Evaluation
 
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
     latest_session = (
         db.query(InterviewSession)
@@ -1609,15 +1786,13 @@ def download_evaluation_docx(candidate_id: int, db: Session = Depends(get_db)):
     "/{candidate_id}/evaluation/download-transcript",
     summary="Download interview transcript as text file",
 )
-def download_transcript(candidate_id: int, db: Session = Depends(get_db)):
+def download_transcript(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Generate and return a plain text interview transcript."""
     from io import BytesIO
     from fastapi.responses import StreamingResponse
     from app.models.interview import InterviewSession, InterviewMessage, SessionStatus
 
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
     latest_session = (
         db.query(InterviewSession)

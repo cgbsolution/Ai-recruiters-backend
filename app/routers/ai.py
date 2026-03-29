@@ -1,7 +1,7 @@
 import os
 import uuid
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -21,9 +21,10 @@ from app.schemas.ai import (
     SuggestQuestionsRequest,
     SuggestQuestionsResponse,
 )
+from app.auth import get_current_user
 from app.services import ai_service
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 @router.post(

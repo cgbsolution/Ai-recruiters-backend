@@ -55,15 +55,18 @@ def _insert_children(db: Session, job: Job, data: JobCreate) -> None:
         ))
 
 
-def get_jobs_list(db: Session) -> List[Job]:
-    return db.query(Job).order_by(Job.created_at.desc()).all()
+def get_jobs_list(db: Session, org_id: Optional[int] = None) -> List[Job]:
+    q = db.query(Job)
+    if org_id is not None:
+        q = q.filter(Job.organization_id == org_id)
+    return q.order_by(Job.created_at.desc()).all()
 
 
 def get_job_by_id(db: Session, job_id: int) -> Optional[Job]:
     return db.query(Job).filter(Job.id == job_id).first()
 
 
-def create_job(db: Session, data: JobCreate) -> Job:
+def create_job(db: Session, data: JobCreate, org_id: Optional[int] = None) -> Job:
     job = Job(
         title=data.title,
         department=data.department,
@@ -83,6 +86,7 @@ def create_job(db: Session, data: JobCreate) -> Job:
         mix_of_questions=data.mix_of_questions,
         allow_to_contact=data.allow_to_contact,
         upload_jd=data.upload_jd,
+        organization_id=org_id,
     )
     db.add(job)
     db.flush()
@@ -228,24 +232,35 @@ def _pct_change(current: int, previous: int) -> float:
     return round(((current - previous) / previous) * 100, 1)
 
 
-def get_stats(db: Session) -> List[Dict[str, Any]]:
+def get_stats(db: Session, org_id: Optional[int] = None) -> List[Dict[str, Any]]:
     from app.models.job import JobStatus
     from app.models.candidate import CandidateStatus
 
     now = datetime.utcnow()
 
+    # Org filter helpers
+    def _job_filter(q):
+        if org_id is not None:
+            q = q.filter(Job.organization_id == org_id)
+        return q
+
+    def _cand_filter(q):
+        if org_id is not None:
+            q = q.join(Job, Candidate.job_id == Job.id).filter(Job.organization_id == org_id)
+        return q
+
     # ── Current totals ───────────────────────────────────────────────────
-    active_jobs = db.query(func.count(Job.id)).filter(Job.status == JobStatus.open).scalar() or 0
-    finished_jobs = db.query(func.count(Job.id)).filter(Job.status == JobStatus.inactive).scalar() or 0
-    interview_count = db.query(func.count(Candidate.id)).filter(
+    active_jobs = _job_filter(db.query(func.count(Job.id)).filter(Job.status == JobStatus.open)).scalar() or 0
+    finished_jobs = _job_filter(db.query(func.count(Job.id)).filter(Job.status == JobStatus.inactive)).scalar() or 0
+    interview_count = _cand_filter(db.query(func.count(Candidate.id)).filter(
         Candidate.status == CandidateStatus.interview, Candidate.job_id.isnot(None)
-    ).scalar() or 0
-    offered_count = db.query(func.count(Candidate.id)).filter(
+    )).scalar() or 0
+    offered_count = _cand_filter(db.query(func.count(Candidate.id)).filter(
         Candidate.status == CandidateStatus.offered, Candidate.job_id.isnot(None)
-    ).scalar() or 0
-    waiting_count = db.query(func.count(Candidate.id)).filter(
+    )).scalar() or 0
+    waiting_count = _cand_filter(db.query(func.count(Candidate.id)).filter(
         Candidate.status == CandidateStatus.applied, Candidate.job_id.isnot(None)
-    ).scalar() or 0
+    )).scalar() or 0
 
     # ── Week boundaries ──────────────────────────────────────────────────
     this_monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -257,16 +272,17 @@ def get_stats(db: Session) -> List[Dict[str, Any]]:
     def _daily_chart_job(status):
         """Count jobs created per day this week with a given status."""
         day_col = cast(Job.created_at, Date).label("day")
-        rows = (
+        q = (
             db.query(day_col, func.count(Job.id).label("cnt"))
             .filter(
                 Job.status == status,
                 Job.created_at >= this_monday,
                 Job.created_at < this_monday + timedelta(days=5),
             )
-            .group_by(day_col)
-            .all()
         )
+        if org_id is not None:
+            q = q.filter(Job.organization_id == org_id)
+        rows = q.group_by(day_col).all()
         by_date = {r.day: int(r.cnt) for r in rows}
         chart = []
         for i in range(5):
@@ -277,7 +293,7 @@ def get_stats(db: Session) -> List[Dict[str, Any]]:
     def _daily_chart_candidate(status):
         """Count candidates updated to a given status per day this week."""
         day_col = cast(Candidate.updated_at, Date).label("day")
-        rows = (
+        q = (
             db.query(day_col, func.count(Candidate.id).label("cnt"))
             .filter(
                 Candidate.status == status,
@@ -285,9 +301,10 @@ def get_stats(db: Session) -> List[Dict[str, Any]]:
                 Candidate.updated_at >= this_monday,
                 Candidate.updated_at < this_monday + timedelta(days=5),
             )
-            .group_by(day_col)
-            .all()
         )
+        if org_id is not None:
+            q = q.join(Job, Candidate.job_id == Job.id).filter(Job.organization_id == org_id)
+        rows = q.group_by(day_col).all()
         by_date = {r.day: int(r.cnt) for r in rows}
         chart = []
         for i in range(5):
@@ -296,48 +313,48 @@ def get_stats(db: Session) -> List[Dict[str, Any]]:
         return chart
 
     # ── Previous week totals (for trend %) ───────────────────────────────
-    prev_active = db.query(func.count(Job.id)).filter(
+    prev_active = _job_filter(db.query(func.count(Job.id)).filter(
         Job.status == JobStatus.open,
         Job.created_at >= last_monday, Job.created_at < last_friday_end,
-    ).scalar() or 0
-    prev_finished = db.query(func.count(Job.id)).filter(
+    )).scalar() or 0
+    prev_finished = _job_filter(db.query(func.count(Job.id)).filter(
         Job.status == JobStatus.inactive,
         Job.updated_at >= last_monday, Job.updated_at < last_friday_end,
-    ).scalar() or 0
-    prev_interview = db.query(func.count(Candidate.id)).filter(
+    )).scalar() or 0
+    prev_interview = _cand_filter(db.query(func.count(Candidate.id)).filter(
         Candidate.status == CandidateStatus.interview, Candidate.job_id.isnot(None),
         Candidate.updated_at >= last_monday, Candidate.updated_at < last_friday_end,
-    ).scalar() or 0
-    prev_offered = db.query(func.count(Candidate.id)).filter(
+    )).scalar() or 0
+    prev_offered = _cand_filter(db.query(func.count(Candidate.id)).filter(
         Candidate.status == CandidateStatus.offered, Candidate.job_id.isnot(None),
         Candidate.updated_at >= last_monday, Candidate.updated_at < last_friday_end,
-    ).scalar() or 0
-    prev_waiting = db.query(func.count(Candidate.id)).filter(
+    )).scalar() or 0
+    prev_waiting = _cand_filter(db.query(func.count(Candidate.id)).filter(
         Candidate.status == CandidateStatus.applied, Candidate.job_id.isnot(None),
         Candidate.updated_at >= last_monday, Candidate.updated_at < last_friday_end,
-    ).scalar() or 0
+    )).scalar() or 0
 
     # ── Current week totals (for trend comparison) ───────────────────────
-    curr_active = db.query(func.count(Job.id)).filter(
+    curr_active = _job_filter(db.query(func.count(Job.id)).filter(
         Job.status == JobStatus.open,
         Job.created_at >= this_monday, Job.created_at < this_monday + timedelta(days=5),
-    ).scalar() or 0
-    curr_finished = db.query(func.count(Job.id)).filter(
+    )).scalar() or 0
+    curr_finished = _job_filter(db.query(func.count(Job.id)).filter(
         Job.status == JobStatus.inactive,
         Job.updated_at >= this_monday, Job.updated_at < this_monday + timedelta(days=5),
-    ).scalar() or 0
-    curr_interview = db.query(func.count(Candidate.id)).filter(
+    )).scalar() or 0
+    curr_interview = _cand_filter(db.query(func.count(Candidate.id)).filter(
         Candidate.status == CandidateStatus.interview, Candidate.job_id.isnot(None),
         Candidate.updated_at >= this_monday, Candidate.updated_at < this_monday + timedelta(days=5),
-    ).scalar() or 0
-    curr_offered = db.query(func.count(Candidate.id)).filter(
+    )).scalar() or 0
+    curr_offered = _cand_filter(db.query(func.count(Candidate.id)).filter(
         Candidate.status == CandidateStatus.offered, Candidate.job_id.isnot(None),
         Candidate.updated_at >= this_monday, Candidate.updated_at < this_monday + timedelta(days=5),
-    ).scalar() or 0
-    curr_waiting = db.query(func.count(Candidate.id)).filter(
+    )).scalar() or 0
+    curr_waiting = _cand_filter(db.query(func.count(Candidate.id)).filter(
         Candidate.status == CandidateStatus.applied, Candidate.job_id.isnot(None),
         Candidate.updated_at >= this_monday, Candidate.updated_at < this_monday + timedelta(days=5),
-    ).scalar() or 0
+    )).scalar() or 0
 
     return [
         {
