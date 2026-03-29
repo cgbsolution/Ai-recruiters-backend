@@ -18,4 +18,4 @@ COPY . .
 RUN mkdir -p uploads/jd uploads/resumes uploads/recordings models
 
 # Ensure all DB columns exist, stamp alembic, then start server
-CMD python startup.py && alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD python startup.py && alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --log-level warning --no-access-log

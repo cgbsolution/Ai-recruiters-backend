@@ -1370,23 +1370,26 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User 
             })
 
         # ── Screenshots (face detection frames) for this session ──────────────
-        from app.models.interview import InterviewScreenshot
-        screenshots = (
-            db.query(InterviewScreenshot)
-            .filter(InterviewScreenshot.session_id == latest_session.id)
-            .order_by(InterviewScreenshot.captured_at)
-            .all()
-        )
-        for ss in screenshots:
-            # file_path is stored as "/uploads/screenshots/{session_id}/{filename}" — no extra slash needed
-            fp = ss.file_path.replace(os.sep, "/")
-            if not fp.startswith("/"):
-                fp = f"/{fp}"
-            screenshots_list.append({
-                "file_path": fp,
-                "captured_at": (ss.captured_at.isoformat() + "Z") if ss.captured_at else None,
-                "face_count": ss.face_count,
-            })
+        try:
+            from app.models.interview import InterviewScreenshot
+            screenshots = (
+                db.query(InterviewScreenshot)
+                .filter(InterviewScreenshot.session_id == latest_session.id)
+                .order_by(InterviewScreenshot.captured_at)
+                .all()
+            )
+            for ss in screenshots:
+                fp = ss.file_path.replace(os.sep, "/") if ss.file_path else ""
+                if fp and not fp.startswith("/"):
+                    fp = f"/{fp}"
+                screenshots_list.append({
+                    "file_path": fp,
+                    "captured_at": (ss.captured_at.isoformat() + "Z") if ss.captured_at else None,
+                    "face_count": getattr(ss, "face_count", None),
+                })
+        except Exception as _ss_err:
+            import logging as _log
+            _log.warning(f"Could not load screenshots for session {latest_session.id}: {_ss_err}")
 
         # ── Latest AI evaluation for this session ─────────────────────────────
         ev = (

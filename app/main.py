@@ -1,4 +1,5 @@
 import logging
+import traceback
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,9 +13,11 @@ import sqlalchemy as sa
 from app.config import settings
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# Keep app-level loggers at INFO so our own messages still appear
+logging.getLogger("app").setLevel(logging.INFO)
 from app.database import Base, engine
 from app.routers import ai, auth, candidates, credits, interview, jobs, organizations, questions, resume_database, uploads
 
@@ -249,6 +252,18 @@ app = FastAPI(
     ],
 )
 
+# ── Global exception handler — logs full traceback for every 500 ─────────────
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logging.error(
+        f"UNHANDLED 500 | {request.method} {request.url}\n"
+        f"{traceback.format_exc()}"
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {type(exc).__name__}: {exc}"},
+    )
+
 # ── CORS ─────────────────────────────────────────────────────────────────────
 _cors_origins = settings.cors_origins_list
 
@@ -267,9 +282,12 @@ app.add_middleware(
 async def add_cors_on_error(request: Request, call_next):
     origin = request.headers.get("origin", "")
     response = await call_next(request)
-    if origin and (origin in _cors_origins or "*" in _cors_origins):
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
+    if origin:
+        if "*" in _cors_origins:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+        elif origin in _cors_origins:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Methods"] = "*"
         response.headers["Access-Control-Allow-Headers"] = "*"
     return response
