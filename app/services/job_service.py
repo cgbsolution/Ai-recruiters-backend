@@ -203,15 +203,31 @@ def delete_job(db: Session, job_id: int) -> bool:
         except Exception as e:
             logger.warning("Skipped job_metadata delete: %s", e)
 
-        # 8. Tables without ORM models (may not exist — use SAVEPOINT for each)
-        for tbl in ("job_pre_interview_fields", "scoring_training_data", "ai_credit_usage"):
-            _safe_delete(db, f"DELETE FROM {tbl} WHERE job_id = :jid", {"jid": job_id}, logger)
+        # 8. Tables without ORM models — delete with raw SQL.
+        # job_pre_interview_fields has a FK to jobs so MUST be deleted before the job.
+        # Use SAVEPOINT per table so a missing table doesn't abort the whole transaction.
+        for tbl in (
+            "job_pre_interview_fields",
+            "scoring_training_data",
+            "ai_credit_usage",
+            "ai_usage_logs",
+            "interview_pre_fields",
+        ):
+            try:
+                with db.begin_nested():
+                    db.execute(text(f"DELETE FROM {tbl} WHERE job_id = :jid"), {"jid": job_id})
+                    logger.info("Deleted from %s for job %d", tbl, job_id)
+            except Exception as e:
+                logger.warning("Skipped %s (may not exist): %s", tbl, e)
 
         # 9. Delete candidates and their associated files (recordings, screenshots, resumes)
         from app.services.candidate_service import _cleanup_candidate_files
         candidates = db.query(Candidate).filter(Candidate.job_id == job_id).all()
         for cand in candidates:
-            _cleanup_candidate_files(db, cand)
+            try:
+                _cleanup_candidate_files(db, cand)
+            except Exception as e:
+                logger.warning("File cleanup failed for candidate %d: %s", cand.id, e)
             db.delete(cand)
 
         # 10. Delete the job

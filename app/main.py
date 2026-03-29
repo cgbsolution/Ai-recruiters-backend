@@ -250,13 +250,29 @@ app = FastAPI(
 )
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
+_cors_origins = settings.cors_origins_list
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins_list,
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# FastAPI's CORSMiddleware does NOT add CORS headers to 500 error responses,
+# causing the browser to report a CORS error instead of the real error.
+# This middleware ensures CORS headers are present on ALL responses.
+@app.middleware("http")
+async def add_cors_on_error(request: Request, call_next):
+    origin = request.headers.get("origin", "")
+    response = await call_next(request)
+    if origin and (origin in _cors_origins or "*" in _cors_origins):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
 
 # ── Static file serving for uploads ──────────────────────────────────────────
 import os
