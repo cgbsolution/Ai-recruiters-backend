@@ -81,6 +81,21 @@ except Exception as e:
         "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'candidatestatus') THEN CREATE TYPE candidatestatus AS ENUM ('Applied','Interview','Offered','Selected','Hired','Rejected'); END IF; END $$;",
         "DO $$ BEGIN ALTER TYPE candidatestatus ADD VALUE IF NOT EXISTS 'Selected'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
         "DO $$ BEGIN ALTER TYPE candidatestatus ADD VALUE IF NOT EXISTS 'Hired'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+        # evaluations table — newer columns added after initial schema
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS per_question_evaluations TEXT",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS skills_ratings TEXT",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS meets_threshold BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS pronunciation_score FLOAT",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS enthusiasm_score FLOAT",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS grammar_score FLOAT",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS conciseness_score FLOAT",
+        "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS clarity_score FLOAT",
+        # interview_screenshots table
+        "CREATE TABLE IF NOT EXISTS interview_screenshots (id SERIAL PRIMARY KEY, session_id INTEGER REFERENCES interview_sessions(id) ON DELETE CASCADE, file_path VARCHAR(500), captured_at TIMESTAMP, face_count INTEGER)",
+        "ALTER TABLE interview_screenshots ADD COLUMN IF NOT EXISTS face_count INTEGER",
+        # users table
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS designation VARCHAR(150)",
     ]
     try:
         with engine.connect() as conn:
