@@ -30,6 +30,8 @@ class User(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     password_hash = Column(Text, nullable=False)
     role = Column(Enum(UserRole), nullable=False, default=UserRole.recruiter)
+    phone = Column(String(50), nullable=True)
+    designation = Column(String(150), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     is_email_verified = Column(Boolean, default=False, nullable=False)
     email_verify_token = Column(String(128), nullable=True)

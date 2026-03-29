@@ -214,11 +214,52 @@ def get_me(user: User = Depends(get_current_user), db: Session = Depends(get_db)
         "name": user.name,
         "email": user.email,
         "role": user.role.value,
+        "phone": user.phone,
+        "designation": user.designation,
         "is_active": user.is_active,
         "is_email_verified": user.is_email_verified,
         "organization_id": user.organization_id,
         "organization_name": org_name,
         "created_at": user.created_at,
+    }
+
+
+# ── Update Own Profile ──────────────────────────────────────────────────────
+
+@router.patch("/profile")
+def update_profile(
+    body: dict,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Update the current user's own profile fields (name, phone, designation)."""
+    if "name" in body and body["name"].strip():
+        user.name = body["name"].strip()
+    if "phone" in body:
+        user.phone = body["phone"] or None
+    if "designation" in body:
+        user.designation = body["designation"] or None
+    user.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(user)
+
+    org_name = None
+    if user.organization_id:
+        from app.models.organization import Organization
+        org = db.query(Organization).filter(Organization.id == user.organization_id).first()
+        org_name = org.name if org else None
+
+    return {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "role": user.role.value,
+        "phone": user.phone,
+        "designation": user.designation,
+        "is_active": user.is_active,
+        "is_email_verified": user.is_email_verified,
+        "organization_id": user.organization_id,
+        "organization_name": org_name,
     }
 
 
