@@ -17,6 +17,7 @@ from app.auth import (
     require_roles,
     verify_password,
 )
+from app.config import settings
 from app.database import get_db
 from app.models.organization import Organization
 from app.models.user import User, UserRole
@@ -43,6 +44,7 @@ class SignInRequest(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    expires_in: int = 0  # seconds until token expires
     user: dict
 
 
@@ -139,6 +141,7 @@ def signup(body: SignUpRequest, db: Session = Depends(get_db)):
         token = create_access_token(user.id, user.role.value, org_id=organization_id)
         return TokenResponse(
             access_token=token,
+            expires_in=settings.SESSION_TIMEOUT_MINUTES * 60,
             user={
                 "id": user.id,
                 "name": user.name,
@@ -187,6 +190,7 @@ def login(body: SignInRequest, db: Session = Depends(get_db)):
 
     return TokenResponse(
         access_token=token,
+        expires_in=settings.SESSION_TIMEOUT_MINUTES * 60,
         user={
             "id": user.id,
             "name": user.name,

@@ -28,11 +28,10 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 # ── JWT ──────────────────────────────────────────────────────────────────────
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 
 
 def create_access_token(user_id: int, role: str, org_id: Optional[int] = None) -> str:
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.utcnow() + timedelta(minutes=settings.SESSION_TIMEOUT_MINUTES)
     payload = {
         "sub": str(user_id),
         "role": role,

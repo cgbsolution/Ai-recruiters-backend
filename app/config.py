@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     MAX_UPLOAD_SIZE_MB: int = 10
     APP_ENV: str = "development"
     SECRET_KEY: str = "change-me-in-production"
+    SESSION_TIMEOUT_MINUTES: int = 60 * 24  # 24 hours — override via .env
 
     # ── Email / SMTP ─────────────────────────────────────────────────────────
     SMTP_HOST: str = ""
