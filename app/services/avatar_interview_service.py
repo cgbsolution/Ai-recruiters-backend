@@ -809,6 +809,7 @@ Return ONLY valid JSON:
             messages=[{"role": "user", "content": prompt}],
             model=OPUS,
             max_tokens=4000,
+            timeout_seconds=180,  # Opus with full transcript needs up to 2-3 minutes
         )
     except Exception as e:
         logging.error(f"[Evaluation] AI call failed for session {session.id}: {type(e).__name__}: {e}\n{traceback.format_exc()}")

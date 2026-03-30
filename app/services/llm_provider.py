@@ -161,6 +161,13 @@ async def _anthropic_ask_with_system(
                 await asyncio.sleep(2 ** attempt)
                 continue
             raise
+        except anthropic.APITimeoutError:
+            if attempt < retries - 1:
+                wait = 5 * (attempt + 1)  # 5s, 10s, ...
+                logger.warning(f"[LLM] Anthropic timeout (attempt {attempt + 1}/{retries}), retrying in {wait}s...")
+                await asyncio.sleep(wait)
+                continue
+            raise
 
 
 # ── Gemini Client ───────────────────────────────────────────────────────────
