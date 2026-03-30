@@ -1511,6 +1511,7 @@ async def upload_screenshot(
     request: Request,
     file: UploadFile = File(...),
     timestamp: str = Form(default=""),
+    face_count: str = Form(default=""),
     db: Session = Depends(get_db),
 ):
     MAX_SCREENSHOT_SIZE = 2 * 1024 * 1024  # 2 MB per screenshot
@@ -1549,36 +1550,25 @@ async def upload_screenshot(
 
     relative_path = f"/uploads/screenshots/{session_id}/{filename}"
 
-    # Face detection using OpenCV Haar cascade
-    face_count = 1  # default: assume single face if detection fails
-    try:
-        import cv2
-        img = cv2.imread(raw_path)
-        if img is not None:
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-            face_cascade = cv2.CascadeClassifier(cascade_path)
-            faces = face_cascade.detectMultiScale(
-                gray,
-                scaleFactor=1.1,
-                minNeighbors=4,
-                minSize=(40, 40),
-            )
-            face_count = len(faces)
-    except Exception:
-        face_count = 1  # safe default
+    # Use face count from frontend MediaPipe detection (much more accurate than server-side Haar cascade)
+    detected_faces = 1  # default: assume single face
+    if face_count.strip():
+        try:
+            detected_faces = int(face_count)
+        except ValueError:
+            detected_faces = 1
 
     # Persist screenshot record to DB for proctoring audit trail
     screenshot = InterviewScreenshot(
         session_id=session_id,
         file_path=relative_path,
         captured_at=datetime.utcnow(),
-        face_count=face_count,
+        face_count=detected_faces,
     )
     db.add(screenshot)
     db.commit()
 
-    return {"ok": True, "path": relative_path, "face_count": face_count}
+    return {"ok": True, "path": relative_path, "face_count": detected_faces}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
