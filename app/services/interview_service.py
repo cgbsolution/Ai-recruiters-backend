@@ -47,9 +47,16 @@ def _format_interview_date(candidate) -> str:
     if not candidate.interview_date:
         return "To be confirmed"
     dt = candidate.interview_date
-    raw_tz = candidate.interview_timezone or "IST"
+    raw_tz = candidate.interview_timezone or "Asia/Kolkata"
     tz_label = _TZ_LABELS.get(raw_tz, raw_tz)
-    return dt.strftime(f"%a, %b %d, %Y, %I:%M %p") + f" ({tz_label})"
+    # dt is a naive datetime stored as UTC — convert to target timezone before formatting
+    try:
+        from datetime import timezone as _tz
+        from zoneinfo import ZoneInfo
+        local_dt = dt.replace(tzinfo=_tz.utc).astimezone(ZoneInfo(raw_tz))
+    except Exception:
+        local_dt = dt  # fallback: format as-is if tz conversion fails
+    return local_dt.strftime("%a, %b %d, %Y, %I:%M %p") + f" ({tz_label})"
 
 
 def _send_email_sync(msg, recipients) -> bool:

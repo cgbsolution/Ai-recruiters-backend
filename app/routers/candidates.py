@@ -1452,7 +1452,7 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User 
             "role": candidate.role,
             "candidate_stage": candidate.candidate_stage,
             "interview_status": candidate.interview_status,
-            "interview_date": candidate.interview_date.isoformat() if candidate.interview_date else None,
+            "interview_date": candidate.interview_date.isoformat() + "Z" if candidate.interview_date else None,
             "interview_timezone": candidate.interview_timezone,
             "image": candidate.image,
         },

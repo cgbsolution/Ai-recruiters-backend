@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
 
 
 class CandidateCreate(BaseModel):
@@ -124,6 +124,13 @@ class CandidateRead(BaseModel):
     parsing_status: Optional[str] = None
 
     model_config = {"from_attributes": True}
+
+    @field_serializer("interview_date")
+    def _serialize_interview_date(self, v: Optional[datetime]) -> Optional[str]:
+        """Naive datetime from DB is stored as UTC — append Z so clients parse it correctly."""
+        if v is None:
+            return None
+        return v.isoformat() + "Z"
 
 
 class PromoteStageRequest(BaseModel):
