@@ -37,3 +37,6 @@ bcrypt>=4.0.0
 # ── Rate Limiting ───────────────────────────────────────────────────────────
 slowapi>=0.1.9
 opencv-python-headless>=4.8.0
+
+# ── Timezone data (required for zoneinfo on slim Docker images) ─────────────
+tzdata>=2024.1
