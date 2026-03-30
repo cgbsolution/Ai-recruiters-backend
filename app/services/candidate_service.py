@@ -65,6 +65,17 @@ def get_candidates(
         key = s.value if isinstance(s, CandidateStatus) else s
         return _STATUS_PRIORITY.get(key, 0)
 
+    # When scoped to a specific job, skip dedup — each row is a distinct candidate record
+    # for that job. Dedup only applies when listing across all jobs (global candidates view).
+    if job_id:
+        results = []
+        for candidate, job_title in rows:
+            c_dict = candidate.__dict__.copy()
+            c_dict.pop("_sa_instance_state", None)
+            c_dict["job_title"] = job_title
+            results.append(c_dict)
+        return results
+
     seen_email: dict[str, dict] = {}
     seen_name_phone: dict[str, dict] = {}
     results: list[dict] = []

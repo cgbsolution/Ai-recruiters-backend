@@ -180,6 +180,11 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
                     existing.location = parsed.get("location") or existing.location
                     existing.role = parsed.get("current_designation") or existing.role
                     existing.parsing_status = "processing"
+                    # Reset interview state — this is a fresh submission for this job
+                    existing.interview_status = "New"
+                    existing.interview_date = None
+                    existing.interview_timezone = None
+                    existing.candidate_stage = "Candidates"
 
                     # Update ResumeMetadata for existing candidate (org-scoped)
                     ex_meta_q = db.query(ResumeMetadata).filter(
@@ -521,7 +526,7 @@ def hire_candidate(
             job_id=job_id,
             resume_path=candidate.resume_path,
             candidate_stage="Offer-Made",
-            interview_status=candidate.interview_status,
+            interview_status="New",
         )
         db.add(new_entry)
         job_ids_linked.append(job_id)
