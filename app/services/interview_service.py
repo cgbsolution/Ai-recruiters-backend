@@ -112,18 +112,24 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
             pass
 
     from app.models.job import Job
+    from app.models.organization import Organization
     job_title = "the role"
     job = None
+    org_name = "Our Company"
     if candidate.job_id:
         job = db.query(Job).filter(Job.id == candidate.job_id).first()
         if job:
             job_title = job.title
+            if job.organization_id:
+                org = db.query(Organization).filter(Organization.id == job.organization_id).first()
+                if org:
+                    org_name = org.name
 
     action_word = "Rescheduled" if is_reschedule else "Schedule"
     subject = template.get("subject") or f"Your Interview {action_word} for {job_title}"
     intro_text = template.get("intro_text") or (
-        f"You are shortlisted for an AI Interview round for the role "
-        f"{job_title} at company CGBiz Solutions Private limited"
+        f"You are shortlisted for an AI Interview round for the role of "
+        f"{job_title} at {org_name}."
     )
     date_str = _format_interview_date(candidate)
 
@@ -334,11 +340,17 @@ async def send_cancel_email(candidate, db: "Session") -> bool:
         return False
 
     from app.models.job import Job
+    from app.models.organization import Organization
     job_title = "the role"
+    org_name = "Our Company"
     if candidate.job_id:
         job = db.query(Job).filter(Job.id == candidate.job_id).first()
         if job:
             job_title = job.title
+            if job.organization_id:
+                org = db.query(Organization).filter(Organization.id == job.organization_id).first()
+                if org:
+                    org_name = org.name
 
     subject = f"Interview Cancelled – {job_title}"
 
@@ -348,10 +360,10 @@ async def send_cancel_email(candidate, db: "Session") -> bool:
     <h2 style="color:#dc2626;">Interview Cancelled</h2>
     <p>Hello {candidate.name},</p>
     <p>We regret to inform you that your scheduled interview for the role of
-       <strong>{job_title}</strong> at CGBiz Solutions Private Limited has been cancelled.</p>
+       <strong>{job_title}</strong> at {org_name} has been cancelled.</p>
     <p>If you have any questions, please reach out to the HR team.</p>
     <hr/>
-    <p style="font-size:12px;color:#888;">CGBiz Solutions Private Limited | HR Team</p>
+    <p style="font-size:12px;color:#888;">{org_name} | HR Team</p>
   </div>
 </body></html>
 """

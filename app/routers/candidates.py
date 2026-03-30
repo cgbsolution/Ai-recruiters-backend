@@ -1087,9 +1087,15 @@ async def schedule_interview(
     if payload.send_whatsapp and candidate.phone:
         try:
             from app.models.job import Job
+            from app.models.organization import Organization
             job = db.query(Job).filter(Job.id == candidate.job_id).first()
             job_title = job.title if job else "the role"
-            msg = _build_whatsapp_message(candidate, job_title, is_reschedule=is_reschedule)
+            org_name = "Our Company"
+            if job and job.organization_id:
+                org = db.query(Organization).filter(Organization.id == job.organization_id).first()
+                if org:
+                    org_name = org.name
+            msg = _build_whatsapp_message(candidate, job_title, org_name=org_name, is_reschedule=is_reschedule)
             await send_whatsapp_message(candidate.phone, msg)
             whatsapp_sent = True
         except Exception:
@@ -1160,11 +1166,17 @@ async def cancel_interview(
     if payload.send_whatsapp and candidate.phone:
         try:
             from app.models.job import Job
+            from app.models.organization import Organization
             job = db.query(Job).filter(Job.id == candidate.job_id).first()
             job_title = job.title if job else "the role"
+            org_name = "Our Company"
+            if job and job.organization_id:
+                org = db.query(Organization).filter(Organization.id == job.organization_id).first()
+                if org:
+                    org_name = org.name
             msg = (
                 f"Hi {candidate.name},\n"
-                f"Your interview for the role of {job_title} at CGBiz Solutions Private Limited "
+                f"Your interview for the role of {job_title} at {org_name} "
                 f"has been cancelled. Please contact HR for further details."
             )
             await send_whatsapp_message(candidate.phone, msg)
@@ -1906,7 +1918,7 @@ def download_transcript(candidate_id: int, db: Session = Depends(get_db), user: 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _build_whatsapp_message(candidate: Candidate, job_title: str, is_reschedule: bool = False) -> str:
+def _build_whatsapp_message(candidate: Candidate, job_title: str, org_name: str = "Our Company", is_reschedule: bool = False) -> str:
     action = "rescheduled" if is_reschedule else "scheduled"
     date_str = ""
     if candidate.interview_date:
@@ -1916,7 +1928,7 @@ def _build_whatsapp_message(candidate: Candidate, job_title: str, is_reschedule:
     link = candidate.interview_link or ""
     return (
         f"Hi {candidate.name},\n"
-        f"Your Interview for the role of {job_title} by CGBiz Solutions Private limited "
+        f"Your Interview for the role of {job_title} at {org_name} "
         f"has been {action} on {date_str}. "
         f"Please ensure you're ready.\n\n"
         f"Interview Link: {link}"
