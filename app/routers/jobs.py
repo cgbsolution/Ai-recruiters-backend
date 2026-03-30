@@ -13,7 +13,7 @@ from app.database import get_db, SessionLocal
 from app.models.interview import InterviewSession, InterviewToken, MeetingSlot
 from app.auth import get_current_user, get_org_id
 from app.models.organization import Organization
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.models.candidate import Candidate, CandidateStatus
 from app.models.job import Job as JobModel, JobStatus
 
@@ -45,9 +45,9 @@ def _check_code_editor_permission(db: Session, user: User, code_editor_enabled: 
     """Raise 403 if code_editor_required is True but org has not enabled it."""
     if not code_editor_enabled:
         return
+    if user.role == UserRole.super_admin:
+        return  # super_admin — always allowed
     org_id = get_org_id(user)
-    if org_id is None:
-        return  # super_admin with no org — always allowed
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if org and not getattr(org, "allow_code_editor", False):
         raise HTTPException(

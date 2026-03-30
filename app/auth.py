@@ -101,9 +101,8 @@ def require_roles(*roles: UserRole):
 # ── Organization Scoping ─────────────────────────────────────────────────────
 
 def get_org_id(user: User) -> Optional[int]:
-    """Return the user's organization_id, or None for super_admin (global access)."""
-    if user.role == UserRole.super_admin:
-        return None
+    """Return the user's organization_id for scoping queries.
+    Super admins with an org see their org's data; without one they get global access."""
     return user.organization_id
 
 

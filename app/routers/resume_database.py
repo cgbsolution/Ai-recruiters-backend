@@ -692,7 +692,7 @@ def clear_all_resumes(db: Session = Depends(get_db), user: User = Depends(get_cu
     db.commit()
 
     # Clean up uploads folder only for super admin (global wipe)
-    if org_id is None and os.path.exists(RESUME_UPLOAD_DIR):
+    if user.role == UserRole.super_admin and os.path.exists(RESUME_UPLOAD_DIR):
         for f in os.listdir(RESUME_UPLOAD_DIR):
             try:
                 os.remove(os.path.join(RESUME_UPLOAD_DIR, f))
