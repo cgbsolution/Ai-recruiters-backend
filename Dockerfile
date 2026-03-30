@@ -14,8 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Create upload directories
-RUN mkdir -p uploads/jd uploads/resumes uploads/recordings models
+# Create upload directories (also created at runtime from the mounted volume)
+RUN mkdir -p uploads/jd uploads/resumes uploads/recordings uploads/photos uploads/screenshots models
 
 # Ensure all DB columns exist, stamp alembic, then start server
 CMD python startup.py && alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --log-level warning --no-access-log
