@@ -75,6 +75,7 @@ class ScheduleInterviewRequest(BaseModel):
     email_extra_body: Optional[str] = None
     cc_emails: Optional[List[str]] = None
     send_whatsapp: bool = False
+    create_google_meet: bool = False
 
 
 class CandidateRead(BaseModel):

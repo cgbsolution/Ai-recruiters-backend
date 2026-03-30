@@ -96,7 +96,7 @@ def _send_email_sync(msg, recipients) -> bool:
         return False
 
 
-async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = False) -> bool:
+async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = False, google_meet_link: str = None) -> bool:
     """
     Send interview schedule/reschedule notification email to the candidate.
     Reads SMTP settings from config; returns True on success.
@@ -214,6 +214,31 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
           </table>
         </td></tr>"""
 
+    # Google Meet section (if a Meet link was created)
+    meet_section = ""
+    if google_meet_link:
+        meet_section = f"""
+        <!-- GOOGLE MEET box -->
+        <tr><td style="padding:0 24px 16px;">
+          <table cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#ECFDF5;border:1px solid #A7F3D0;border-radius:8px;">
+            <tr>
+              <td style="padding:16px 20px;">
+                <table cellpadding="0" cellspacing="0" border="0" width="100%">
+                  <tr>
+                    <td width="36" valign="top" style="padding-right:12px;">
+                      <span style="font-size:20px;color:#16a34a;">&#127909;</span>
+                    </td>
+                    <td>
+                      <div style="font-size:11px;font-weight:700;color:#16a34a;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Google Meet</div>
+                      <a href="{google_meet_link}" style="font-size:14px;color:#15803D;text-decoration:underline;word-break:break-all;">{google_meet_link}</a>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+          </table>
+        </td></tr>"""
+
     html_body = f"""
 <!DOCTYPE html>
 <html>
@@ -273,6 +298,8 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
         </td></tr>
 
         {link_section}
+
+        {meet_section}
 
         <!-- Flexibility text -->
         <tr><td style="padding:0 24px 24px;">

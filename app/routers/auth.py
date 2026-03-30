@@ -230,6 +230,8 @@ def get_me(user: User = Depends(get_current_user), db: Session = Depends(get_db)
         "organization_name": org_name,
         "allow_code_editor": allow_code_editor,
         "allow_whatsapp": allow_whatsapp,
+        "google_connected": bool(getattr(user, "google_refresh_token", None)),
+        "google_email": getattr(user, "google_email", None),
         "created_at": user.created_at,
     }
 
@@ -484,3 +486,104 @@ def delete_user(
     db.commit()
 
     logger.info("User deleted by %s: %s (id=%d)", current_user.email, target.email, user_id)
+
+
+# ── Google OAuth2 (Connect / Callback / Disconnect) ─────────────────────────
+
+@router.get("/google/connect")
+def google_connect(user: User = Depends(get_current_user)):
+    """
+    Return the Google OAuth2 authorization URL.
+    Frontend opens this URL in a popup window.
+    """
+    if not settings.GOOGLE_CLIENT_ID or not settings.GOOGLE_CLIENT_SECRET:
+        raise HTTPException(status_code=501, detail="Google OAuth is not configured on this server")
+
+    from app.services.google_calendar_service import build_oauth_url
+
+    # Use a short-lived JWT as the state parameter (CSRF protection)
+    state_token = create_access_token(user.id, user.role.value, org_id=user.organization_id)
+    auth_url = build_oauth_url(state=state_token)
+
+    return {"url": auth_url}
+
+
+@router.get("/google/callback")
+def google_callback(code: str, state: str, db: Session = Depends(get_db)):
+    """
+    Google redirects here after user authorizes.
+    Exchanges the code for tokens, stores them on the user, and returns
+    an HTML page that notifies the opener window and closes itself.
+    """
+    from app.auth import decode_access_token
+    from app.services.google_calendar_service import exchange_code_for_tokens
+
+    # Verify state (contains user JWT)
+    try:
+        payload = decode_access_token(state)
+        user_id = int(payload["sub"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid or expired state token")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    try:
+        tokens = exchange_code_for_tokens(code)
+    except Exception as e:
+        logger.error("Google OAuth token exchange failed: %s", e)
+        raise HTTPException(status_code=400, detail="Failed to connect Google account. Please try again.")
+
+    user.google_access_token = tokens["access_token"]
+    user.google_refresh_token = tokens["refresh_token"]
+    user.google_email = tokens["email"]
+    user.google_connected_at = datetime.utcnow()
+    user.updated_at = datetime.utcnow()
+    db.commit()
+
+    logger.info("Google account connected for user %s: %s", user.email, tokens["email"])
+
+    # Return HTML that notifies the opener window and closes the popup
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html>
+    <head><title>Google Connected</title></head>
+    <body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;background:#f9fafb;">
+      <div style="text-align:center;padding:40px;background:white;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.1);">
+        <div style="font-size:48px;margin-bottom:16px;">&#10003;</div>
+        <h2 style="color:#16a34a;margin:0 0 8px;">Google Account Connected!</h2>
+        <p style="color:#6b7280;margin:0;">You can close this window now.</p>
+      </div>
+      <script>
+        if (window.opener) {
+          window.opener.postMessage({ type: "google-connected" }, "*");
+        }
+        setTimeout(() => window.close(), 2000);
+      </script>
+    </body>
+    </html>
+    """)
+
+
+@router.post("/google/disconnect")
+def google_disconnect(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Disconnect the user's Google account by clearing stored tokens."""
+    # Optionally revoke the token with Google
+    if user.google_access_token:
+        try:
+            import requests as req
+            req.post("https://oauth2.googleapis.com/revoke", params={"token": user.google_access_token})
+        except Exception:
+            pass  # Best-effort revocation
+
+    user.google_access_token = None
+    user.google_refresh_token = None
+    user.google_email = None
+    user.google_connected_at = None
+    user.updated_at = datetime.utcnow()
+    db.commit()
+
+    logger.info("Google account disconnected for user %s", user.email)
+    return {"message": "Google account disconnected"}

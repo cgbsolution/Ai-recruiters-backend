@@ -37,6 +37,13 @@ class User(Base):
     email_verify_token = Column(String(128), nullable=True)
     email_verify_expires = Column(DateTime, nullable=True)
     organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
+
+    # ── Google OAuth2 (per-user, for Google Meet / Calendar integration) ─────
+    google_access_token = Column(Text, nullable=True)
+    google_refresh_token = Column(Text, nullable=True)
+    google_email = Column(String(255), nullable=True)
+    google_connected_at = Column(DateTime, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

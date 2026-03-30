@@ -99,6 +99,11 @@ except Exception as e:
         # users table
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS designation VARCHAR(150)",
+        # users — Google OAuth
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_access_token TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_refresh_token TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_email VARCHAR(255)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_connected_at TIMESTAMP",
     ]
     try:
         with engine.connect() as conn:

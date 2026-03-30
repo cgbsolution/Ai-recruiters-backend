@@ -1074,11 +1074,45 @@ async def schedule_interview(
     db.commit()
     db.refresh(candidate)
 
+    # ── Google Meet creation (if requested) ─────────────────────────────────
+    google_meet_link = None
+    if payload.create_google_meet:
+        if not getattr(user, "google_refresh_token", None):
+            raise HTTPException(
+                status_code=400,
+                detail="Google account not connected. Please connect your Google account in Profile settings first.",
+            )
+        try:
+            from app.services.google_calendar_service import create_meet_event
+            from app.models.job import Job as JobModel
+            job = db.query(JobModel).filter(JobModel.id == candidate.job_id).first()
+            job_title = job.title if job else "Interview"
+
+            meet_result = create_meet_event(
+                access_token=user.google_access_token,
+                refresh_token=user.google_refresh_token,
+                summary=f"Interview - {candidate.name} for {job_title}",
+                description=f"Interview with {candidate.name} for the role of {job_title}",
+                start_dt=payload.interview_date,
+                attendee_email=candidate.email,
+                timezone=payload.interview_timezone.replace("Calcutta", "Kolkata"),
+            )
+            google_meet_link = meet_result.get("meet_link")
+
+            # Update token if it was refreshed
+            if meet_result.get("new_access_token"):
+                user.google_access_token = meet_result["new_access_token"]
+                db.commit()
+
+            logger.info("Google Meet created for candidate %s: %s", candidate.id, google_meet_link)
+        except Exception:
+            logger.warning("Failed to create Google Meet for candidate %s", candidate.id, exc_info=True)
+
     email_sent = False
     whatsapp_sent = False
 
     try:
-        email_sent = await send_schedule_email(candidate, db, is_reschedule=is_reschedule)
+        email_sent = await send_schedule_email(candidate, db, is_reschedule=is_reschedule, google_meet_link=google_meet_link)
         if not email_sent:
             logger.warning("Email send returned False for candidate %s", candidate.id)
     except Exception:
@@ -1106,6 +1140,8 @@ async def schedule_interview(
     response_dict = result.model_dump()
     response_dict["email_sent"] = email_sent
     response_dict["whatsapp_sent"] = whatsapp_sent
+    if google_meet_link:
+        response_dict["google_meet_link"] = google_meet_link
     return response_dict
 
 
