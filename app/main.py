@@ -90,6 +90,9 @@ except Exception as e:
         "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS grammar_score FLOAT",
         "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS conciseness_score FLOAT",
         "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS clarity_score FLOAT",
+        # organizations — feature flags
+        "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS allow_code_editor BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS allow_whatsapp BOOLEAN DEFAULT FALSE",
         # interview_screenshots table
         "CREATE TABLE IF NOT EXISTS interview_screenshots (id SERIAL PRIMARY KEY, session_id INTEGER REFERENCES interview_sessions(id) ON DELETE CASCADE, file_path VARCHAR(500), captured_at TIMESTAMP, face_count INTEGER)",
         "ALTER TABLE interview_screenshots ADD COLUMN IF NOT EXISTS face_count INTEGER",

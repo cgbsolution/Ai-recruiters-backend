@@ -205,9 +205,13 @@ def login(body: SignInRequest, db: Session = Depends(get_db)):
 def get_me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return the current authenticated user's info."""
     org_name = None
+    allow_code_editor = False
+    allow_whatsapp = False
     if user.organization_id:
         org = db.query(Organization).filter(Organization.id == user.organization_id).first()
         org_name = org.name if org else None
+        allow_code_editor = getattr(org, "allow_code_editor", False) if org else False
+        allow_whatsapp = getattr(org, "allow_whatsapp", False) if org else False
 
     return {
         "id": user.id,
@@ -220,6 +224,8 @@ def get_me(user: User = Depends(get_current_user), db: Session = Depends(get_db)
         "is_email_verified": user.is_email_verified,
         "organization_id": user.organization_id,
         "organization_name": org_name,
+        "allow_code_editor": allow_code_editor,
+        "allow_whatsapp": allow_whatsapp,
         "created_at": user.created_at,
     }
 

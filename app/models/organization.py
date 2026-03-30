@@ -21,6 +21,8 @@ class Organization(Base):
     total_candidates_used = Column(Integer, default=0, nullable=False, server_default="0")
     # Feature permissions — controlled by super admin
     allow_resume_database = Column(Boolean, default=False, nullable=False, server_default="false")
+    allow_code_editor = Column(Boolean, default=False, nullable=False, server_default="false")
+    allow_whatsapp = Column(Boolean, default=False, nullable=False, server_default="false")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

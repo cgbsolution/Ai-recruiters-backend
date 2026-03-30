@@ -1007,6 +1007,18 @@ async def schedule_interview(
 
     candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
+    # Validate WhatsApp permission
+    if payload.send_whatsapp:
+        org_id = user.organization_id
+        if org_id is not None:
+            from app.models.organization import Organization as OrgModel
+            org = db.query(OrgModel).filter(OrgModel.id == org_id).first()
+            if org and not getattr(org, "allow_whatsapp", False):
+                raise HTTPException(
+                    status_code=403,
+                    detail="WhatsApp notifications are not enabled for your organization. Contact your super admin.",
+                )
+
     old_status = candidate.interview_status
     is_reschedule = old_status == "Scheduled"
 

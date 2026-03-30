@@ -41,6 +41,21 @@ def _get_job_with_org_check(db: Session, job_id: int, user: User) -> JobModel:
     return job
 
 
+def _check_code_editor_permission(db: Session, user: User, code_editor_enabled: bool):
+    """Raise 403 if code_editor_required is True but org has not enabled it."""
+    if not code_editor_enabled:
+        return
+    org_id = get_org_id(user)
+    if org_id is None:
+        return  # super_admin with no org — always allowed
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if org and not getattr(org, "allow_code_editor", False):
+        raise HTTPException(
+            status_code=403,
+            detail="Code Editor is not enabled for your organization. Contact your super admin to enable it.",
+        )
+
+
 @router.get("/stats", response_model=List[Dict[str, Any]])
 def get_stats(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     return job_service.get_stats(db, org_id=get_org_id(user))
@@ -332,6 +347,10 @@ def can_create_job(db: Session = Depends(get_db), user: User = Depends(get_curre
 def create_job(payload: JobCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     from app.models.job import Job as JobModel
     org_id = get_org_id(user)
+    # Validate code editor permission
+    ce = getattr(payload, "interview_settings", None)
+    if ce and getattr(ce, "code_editor_required", False):
+        _check_code_editor_permission(db, user, True)
     # Enforce org job quota using lifetime counter
     if org_id is not None:
         org = db.query(Organization).filter(Organization.id == org_id).first()
@@ -373,6 +392,10 @@ def get_job(job_id: int, db: Session = Depends(get_db), user: User = Depends(get
 @router.put("/{job_id}", response_model=JobRead)
 def update_job(job_id: int, payload: JobUpdate, background_tasks: BackgroundTasks, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _get_job_with_org_check(db, job_id, user)
+    # Validate code editor permission on update
+    ce = getattr(payload, "interview_settings", None)
+    if ce and getattr(ce, "code_editor_required", False):
+        _check_code_editor_permission(db, user, True)
     job = job_service.update_job(db, job_id, payload)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")

@@ -34,6 +34,8 @@ class OrgCreateRequest(BaseModel):
     max_jobs: int = 0
     max_candidates_per_job: int = 0
     allow_resume_database: bool = False
+    allow_code_editor: bool = False
+    allow_whatsapp: bool = False
 
 
 class OrgUpdateRequest(BaseModel):
@@ -43,6 +45,8 @@ class OrgUpdateRequest(BaseModel):
     max_jobs: int | None = None
     max_candidates_per_job: int | None = None
     allow_resume_database: bool | None = None
+    allow_code_editor: bool | None = None
+    allow_whatsapp: bool | None = None
 
 
 class OrgOut(BaseModel):
@@ -108,6 +112,8 @@ def list_organizations(
             "total_jobs_used": o.total_jobs_used or 0,
             "total_candidates_used": o.total_candidates_used or 0,
             "allow_resume_database": o.allow_resume_database,
+            "allow_code_editor": o.allow_code_editor,
+            "allow_whatsapp": o.allow_whatsapp,
             "created_at": o.created_at,
             "updated_at": o.updated_at,
             "user_count": user_counts.get(o.id, 0),
@@ -166,6 +172,8 @@ def get_organization(org_id: int, db: Session = Depends(get_db)):
         "total_jobs_used": org.total_jobs_used or 0,
         "total_candidates_used": org.total_candidates_used or 0,
         "allow_resume_database": org.allow_resume_database,
+        "allow_code_editor": org.allow_code_editor,
+        "allow_whatsapp": org.allow_whatsapp,
         "created_at": org.created_at,
         "updated_at": org.updated_at,
         "user_count": user_count,
@@ -214,6 +222,8 @@ def create_organization(body: OrgCreateRequest, db: Session = Depends(get_db)):
         max_jobs=max(0, body.max_jobs),
         max_candidates_per_job=max(0, body.max_candidates_per_job),
         allow_resume_database=body.allow_resume_database,
+        allow_code_editor=body.allow_code_editor,
+        allow_whatsapp=body.allow_whatsapp,
     )
     db.add(org)
     db.commit()
@@ -270,6 +280,10 @@ def update_organization(
         org.max_candidates_per_job = max(0, body.max_candidates_per_job)
     if body.allow_resume_database is not None:
         org.allow_resume_database = body.allow_resume_database
+    if body.allow_code_editor is not None:
+        org.allow_code_editor = body.allow_code_editor
+    if body.allow_whatsapp is not None:
+        org.allow_whatsapp = body.allow_whatsapp
 
     org.updated_at = datetime.utcnow()
     db.commit()
