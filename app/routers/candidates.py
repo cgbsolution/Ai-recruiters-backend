@@ -1490,6 +1490,51 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User 
     }
 
 
+# ── Regenerate Evaluation ─────────────────────────────────────────────────────
+
+
+@router.post(
+    "/{candidate_id}/regenerate-evaluation",
+    summary="Force-regenerate AI evaluation for a completed session",
+)
+def regenerate_evaluation(
+    candidate_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Find the latest completed/terminated session for this candidate and
+    re-trigger the AI evaluation background task. Safe to call even if an
+    evaluation already exists — it will re-run and overwrite.
+    """
+    from app.models.interview import InterviewSession, Evaluation, SessionStatus
+    from app.routers.interview import _run_evaluation_background
+
+    _get_candidate_with_org_check(db, candidate_id, user)
+
+    session = (
+        db.query(InterviewSession)
+        .filter(
+            InterviewSession.candidate_id == candidate_id,
+            InterviewSession.status.in_([SessionStatus.completed, SessionStatus.terminated]),
+        )
+        .order_by(InterviewSession.completed_at.desc())
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="No completed interview session found for this candidate")
+
+    # Delete existing evaluation so background task will regenerate it
+    existing = db.query(Evaluation).filter(Evaluation.session_id == session.id).first()
+    if existing:
+        db.delete(existing)
+        db.commit()
+
+    background_tasks.add_task(_run_evaluation_background, session.id)
+    return {"status": "processing", "session_id": session.id, "message": "Evaluation is being regenerated in the background"}
+
+
 # ── Download Endpoints ────────────────────────────────────────────────────────
 
 
