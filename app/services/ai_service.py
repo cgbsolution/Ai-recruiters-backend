@@ -208,7 +208,7 @@ Generate 2–4 skill groups that logically cluster the required skills.
 Extract all responsibilities mentioned in the JD.
 coding_questions_count must be at least 1 for technical roles."""
 
-    result = await _ask_with_usage(prompt, model=SONNET, max_tokens=2048)
+    result = await _ask_with_usage(prompt, model=SONNET, max_tokens=4096)
     log_usage(result, feature="jd_parsing")
     data = _parse_json(result.text)
     return GenerateJDResponse(**data)

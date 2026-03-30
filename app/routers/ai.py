@@ -1,4 +1,6 @@
+import logging
 import os
+import traceback
 import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
@@ -83,6 +85,7 @@ async def parse_jd_file(request: Request, file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
+        logging.error(f"[JD Parse] FAILED for file '{file.filename}': {type(e).__name__}: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"JD parsing failed: {str(e)}")
     finally:
         # Clean up temp file
