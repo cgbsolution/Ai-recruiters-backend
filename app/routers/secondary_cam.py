@@ -130,7 +130,11 @@ def validate_pairing(pairing_code: str, db: Session = Depends(get_db)):
     job_title = ""
     candidate_name = ""
     if session:
-        candidate_name = session.candidate_name or ""
+        if session.candidate_id:
+            from app.models.candidate import Candidate as CandModel
+            cand = db.query(CandModel).filter(CandModel.id == session.candidate_id).first()
+            if cand:
+                candidate_name = cand.name or ""
         if session.job_id:
             from app.models.job import Job
             job = db.query(Job).filter(Job.id == session.job_id).first()
