@@ -126,9 +126,8 @@ def validate_pairing(pairing_code: str, db: Session = Depends(get_db)):
     if not cam_session:
         raise HTTPException(404, "Invalid or expired pairing code")
 
-    # Check if code is too old (expire after 2 hours)
-    if cam_session.created_at and (datetime.utcnow() - cam_session.created_at) > timedelta(hours=2):
-        raise HTTPException(410, "Pairing code has expired. Please generate a new one.")
+    # Pairing code is valid as long as the interview session exists.
+    # It's generated fresh when the candidate reaches the secondary camera step.
 
     from app.models.interview import InterviewSession
     session = db.query(InterviewSession).filter(
