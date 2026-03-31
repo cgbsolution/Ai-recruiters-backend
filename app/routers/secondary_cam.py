@@ -264,6 +264,91 @@ async def upload_snapshot(
     return {"status": "ok"}
 
 
+@router.post("/connect/{pairing_code}/verify-frame", summary="Verify camera frame has person and laptop")
+async def verify_frame(
+    pairing_code: str,
+    frame: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Analyze a camera frame to detect:
+    1. Person/face is visible
+    2. Laptop/screen is visible (bright rectangular area)
+    Returns detection results for real-time UI updates on phone.
+    """
+    cam_session = db.query(SecondaryCamSession).filter(
+        SecondaryCamSession.pairing_code == pairing_code
+    ).first()
+    if not cam_session:
+        raise HTTPException(404, "Invalid pairing code")
+
+    import numpy as np
+
+    # Read frame bytes
+    contents = await frame.read()
+    np_arr = np.frombuffer(contents, np.uint8)
+
+    person_detected = False
+    screen_detected = False
+
+    try:
+        import cv2
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return {"person_detected": False, "screen_detected": False, "error": "Invalid image"}
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+
+        # 1. Face detection using Haar Cascade
+        face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
+        person_detected = len(faces) > 0
+
+        # 2. Screen/laptop detection — look for bright rectangular regions
+        # A laptop screen appears as a bright, roughly rectangular area
+        _, bright_mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        min_screen_area = (h * w) * 0.03  # at least 3% of frame
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > min_screen_area:
+                # Check if roughly rectangular (aspect ratio of a screen)
+                x, y, cw, ch = cv2.boundingRect(contour)
+                aspect = max(cw, ch) / (min(cw, ch) + 1)
+                if 1.0 < aspect < 4.0:  # screens are roughly 16:9 to 4:3
+                    screen_detected = True
+                    break
+
+    except ImportError:
+        # OpenCV not available — do basic brightness check
+        try:
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(contents))
+            pixels = np.array(img)
+            avg_brightness = pixels.mean()
+            # If avg brightness > 80, something is in frame (not blank/black)
+            person_detected = avg_brightness > 60
+            screen_detected = avg_brightness > 80
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("Frame verification error: %s", e)
+
+    # Update heartbeat while we're at it
+    cam_session.last_heartbeat = datetime.utcnow()
+    db.commit()
+
+    return {
+        "person_detected": person_detected,
+        "screen_detected": screen_detected,
+    }
+
+
 @router.post("/{session_id}/complete", summary="Mark secondary cam session as completed")
 def complete_session(session_id: int, db: Session = Depends(get_db)):
     """Mark the secondary camera session as completed when interview ends."""
