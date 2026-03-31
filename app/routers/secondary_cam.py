@@ -87,18 +87,27 @@ def get_status(session_id: int, db: Session = Depends(get_db)):
     # Check if heartbeat is stale
     heartbeat_stale = False
     seconds_since_heartbeat = None
+    current_status = cam_session.status
+
     if cam_session.last_heartbeat:
         delta = datetime.utcnow() - cam_session.last_heartbeat
         seconds_since_heartbeat = int(delta.total_seconds())
         heartbeat_stale = seconds_since_heartbeat > HEARTBEAT_STALE_SECONDS
 
-        # Auto-mark as disconnected if heartbeat is very stale and was active
-        if heartbeat_stale and cam_session.status == "active":
+        # Auto-mark as disconnected if heartbeat is stale and was connected/active/verified
+        if heartbeat_stale and current_status in ("active", "connected", "verified"):
             cam_session.status = "disconnected"
+            current_status = "disconnected"
             db.commit()
+    elif current_status == "connected":
+        # Phone registered but never sent a heartbeat — might have disconnected immediately
+        if cam_session.created_at:
+            age = (datetime.utcnow() - cam_session.created_at).total_seconds()
+            if age > 30:  # 30 seconds without a heartbeat after registering
+                heartbeat_stale = True
 
     return {
-        "status": cam_session.status,
+        "status": current_status,
         "heartbeat_stale": heartbeat_stale,
         "seconds_since_heartbeat": seconds_since_heartbeat,
         "verified_at": cam_session.verified_at.isoformat() if cam_session.verified_at else None,
@@ -117,8 +126,8 @@ def validate_pairing(pairing_code: str, db: Session = Depends(get_db)):
     if not cam_session:
         raise HTTPException(404, "Invalid or expired pairing code")
 
-    # Check if code is too old (expire after 30 minutes)
-    if cam_session.created_at and (datetime.utcnow() - cam_session.created_at) > timedelta(minutes=30):
+    # Check if code is too old (expire after 2 hours)
+    if cam_session.created_at and (datetime.utcnow() - cam_session.created_at) > timedelta(hours=2):
         raise HTTPException(410, "Pairing code has expired. Please generate a new one.")
 
     from app.models.interview import InterviewSession
