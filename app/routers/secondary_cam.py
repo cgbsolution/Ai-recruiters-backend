@@ -19,7 +19,6 @@ from app.database import get_db
 from app.models.secondary_cam import (
     SecondaryCamSession,
     SecondaryCamSnapshot,
-    SecondaryCamStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,7 +53,7 @@ def init_pairing(session_id: int, db: Session = Depends(get_db)):
     if existing:
         return {
             "pairing_code": existing.pairing_code,
-            "status": existing.status.value,
+            "status": existing.status,
         }
 
     pairing_code = uuid.uuid4().hex[:16]
@@ -62,7 +61,7 @@ def init_pairing(session_id: int, db: Session = Depends(get_db)):
     cam_session = SecondaryCamSession(
         session_id=session_id,
         pairing_code=pairing_code,
-        status=SecondaryCamStatus.pending,
+        status="pending",
     )
     db.add(cam_session)
     db.commit()
@@ -72,7 +71,7 @@ def init_pairing(session_id: int, db: Session = Depends(get_db)):
 
     return {
         "pairing_code": pairing_code,
-        "status": cam_session.status.value,
+        "status": cam_session.status,
     }
 
 
@@ -94,12 +93,12 @@ def get_status(session_id: int, db: Session = Depends(get_db)):
         heartbeat_stale = seconds_since_heartbeat > HEARTBEAT_STALE_SECONDS
 
         # Auto-mark as disconnected if heartbeat is very stale and was active
-        if heartbeat_stale and cam_session.status == SecondaryCamStatus.active:
-            cam_session.status = SecondaryCamStatus.disconnected
+        if heartbeat_stale and cam_session.status == "active":
+            cam_session.status = "disconnected"
             db.commit()
 
     return {
-        "status": cam_session.status.value,
+        "status": cam_session.status,
         "heartbeat_stale": heartbeat_stale,
         "seconds_since_heartbeat": seconds_since_heartbeat,
         "verified_at": cam_session.verified_at.isoformat() if cam_session.verified_at else None,
@@ -144,7 +143,7 @@ def validate_pairing(pairing_code: str, db: Session = Depends(get_db)):
     return {
         "valid": True,
         "pairing_code": pairing_code,
-        "status": cam_session.status.value,
+        "status": cam_session.status,
         "job_title": job_title,
         "candidate_name": candidate_name,
     }
@@ -163,7 +162,7 @@ def register_device(
     if not cam_session:
         raise HTTPException(404, "Invalid pairing code")
 
-    cam_session.status = SecondaryCamStatus.connected
+    cam_session.status = "connected"
     cam_session.device_info = device_info
     cam_session.last_heartbeat = datetime.utcnow()
     db.commit()
@@ -192,7 +191,7 @@ async def confirm_position(
     with open(filepath, "wb") as f:
         shutil.copyfileobj(snapshot.file, f)
 
-    cam_session.status = SecondaryCamStatus.verified
+    cam_session.status = "verified"
     cam_session.positioning_snapshot = filepath
     cam_session.verified_at = datetime.utcnow()
     cam_session.last_heartbeat = datetime.utcnow()
@@ -215,17 +214,17 @@ def heartbeat(pairing_code: str, db: Session = Depends(get_db)):
     cam_session.last_heartbeat = datetime.utcnow()
 
     # Transition from verified → active on first heartbeat after verification
-    if cam_session.status == SecondaryCamStatus.verified:
-        cam_session.status = SecondaryCamStatus.active
+    if cam_session.status == "verified":
+        cam_session.status = "active"
 
     # Reconnection: disconnected → active
-    if cam_session.status == SecondaryCamStatus.disconnected:
-        cam_session.status = SecondaryCamStatus.active
+    if cam_session.status == "disconnected":
+        cam_session.status = "active"
         logger.info("Secondary cam reconnected: code=%s", pairing_code)
 
     db.commit()
 
-    return {"status": cam_session.status.value}
+    return {"status": cam_session.status}
 
 
 @router.post("/connect/{pairing_code}/snapshot", summary="Upload periodic snapshot")
@@ -264,6 +263,6 @@ def complete_session(session_id: int, db: Session = Depends(get_db)):
         SecondaryCamSession.session_id == session_id
     ).first()
     if cam_session:
-        cam_session.status = SecondaryCamStatus.completed
+        cam_session.status = "completed"
         db.commit()
     return {"status": "completed"}

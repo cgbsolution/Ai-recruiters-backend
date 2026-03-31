@@ -3,7 +3,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -29,7 +29,7 @@ class SecondaryCamSession(Base):
         unique=True,
     )
     pairing_code = Column(String(32), unique=True, nullable=False, index=True)
-    status = Column(Enum(SecondaryCamStatus), default=SecondaryCamStatus.pending)
+    status = Column(String(20), default="pending")
     device_info = Column(Text, nullable=True)
     last_heartbeat = Column(DateTime, nullable=True)
     positioning_snapshot = Column(String(500), nullable=True)
