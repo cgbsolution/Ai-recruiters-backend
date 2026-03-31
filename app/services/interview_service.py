@@ -15,6 +15,7 @@ import logging
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formataddr
 from typing import TYPE_CHECKING
 
 import httpx
@@ -348,7 +349,7 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = getattr(settings, "EMAIL_FROM", settings.SMTP_USER)
+    msg["From"] = formataddr(("Anytimehire", getattr(settings, "EMAIL_FROM", settings.SMTP_USER)))
     msg["To"] = candidate.email
     if cc_emails:
         msg["Cc"] = ", ".join(cc_emails)
@@ -397,7 +398,7 @@ async def send_cancel_email(candidate, db: "Session") -> bool:
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = getattr(settings, "EMAIL_FROM", settings.SMTP_USER)
+    msg["From"] = formataddr(("Anytimehire", getattr(settings, "EMAIL_FROM", settings.SMTP_USER)))
     msg["To"] = candidate.email
     msg.attach(MIMEText(html_body, "html"))
 
