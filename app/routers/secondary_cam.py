@@ -30,7 +30,7 @@ SECONDARY_CAM_DIR = os.path.join(UPLOAD_DIR, "secondary_cam")
 os.makedirs(SECONDARY_CAM_DIR, exist_ok=True)
 
 # Heartbeat is considered stale after this many seconds
-HEARTBEAT_STALE_SECONDS = 10
+HEARTBEAT_STALE_SECONDS = 5
 
 
 # ── Desktop Endpoints (called by interview page) ─────────────────────────────
