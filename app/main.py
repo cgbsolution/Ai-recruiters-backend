@@ -19,7 +19,7 @@ logging.basicConfig(
 # Keep app-level loggers at INFO so our own messages still appear
 logging.getLogger("app").setLevel(logging.INFO)
 from app.database import Base, engine
-from app.routers import ai, auth, candidates, credits, file_manager, interview, jobs, organizations, questions, resume_database, uploads
+from app.routers import ai, auth, candidates, credits, file_manager, interview, jobs, organizations, questions, resume_database, secondary_cam, uploads
 
 import app.models  # noqa: F401 — ensure all models are registered with Base
 
@@ -104,6 +104,9 @@ except Exception as e:
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_refresh_token TEXT",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_email VARCHAR(255)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_connected_at TIMESTAMP",
+        # secondary camera verification
+        "CREATE TABLE IF NOT EXISTS secondary_cam_sessions (id SERIAL PRIMARY KEY, session_id INTEGER REFERENCES interview_sessions(id) ON DELETE CASCADE UNIQUE, pairing_code VARCHAR(32) UNIQUE NOT NULL, status VARCHAR(20) DEFAULT 'pending', device_info TEXT, last_heartbeat TIMESTAMP, positioning_snapshot VARCHAR(500), created_at TIMESTAMP DEFAULT NOW(), verified_at TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS secondary_cam_snapshots (id SERIAL PRIMARY KEY, secondary_session_id INTEGER REFERENCES secondary_cam_sessions(id) ON DELETE CASCADE, file_path VARCHAR(500) NOT NULL, captured_at TIMESTAMP DEFAULT NOW())",
     ]
     try:
         with engine.connect() as conn:
@@ -328,6 +331,7 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
 
 # ── Routers ──────────────────────────────────────────────────────────────────
 app.include_router(jobs.router, prefix="/jobs", tags=["Jobs"])
+app.include_router(jobs.public_router, prefix="/jobs", tags=["Jobs"])
 app.include_router(questions.router, prefix="/questions", tags=["Questions"])
 app.include_router(candidates.router, prefix="/candidates", tags=["Candidates"])
 app.include_router(ai.router, prefix="/ai", tags=["AI"])
@@ -338,6 +342,7 @@ app.include_router(resume_database.router, prefix="/resume-database", tags=["Res
 app.include_router(credits.router, prefix="/credits", tags=["AI Credits"])
 app.include_router(organizations.router, prefix="/organizations", tags=["Organizations"])
 app.include_router(file_manager.router, prefix="/file-manager", tags=["File Manager"])
+app.include_router(secondary_cam.router, tags=["Secondary Camera"])
 
 
 @app.get("/health", tags=["Health"])

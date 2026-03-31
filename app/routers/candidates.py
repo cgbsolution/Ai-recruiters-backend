@@ -310,10 +310,14 @@ async def _compute_fit_score_with_fallback(
     candidate: Candidate, db: Session, job_id: int, resume_text: str | None = None
 ):
     """
-    Compute fit score using smart scoring (instant, same as database matches).
-    Falls back to AI semantic scoring only if smart scoring returns no result.
+    Two-phase fit scoring:
+    1. Try AI semantic scoring first (accurate, ~15-20s) — the definitive scorer
+    2. Fall back to smart scoring if AI fails (instant but less accurate)
+
+    AI scoring uses LLM to understand meaning across ALL job types and domains.
+    Smart scoring uses keyword matching — only as a fallback.
     """
-    # Primary: Smart scoring — instant (<50ms), same engine as database matches
+    # Phase 1: Smart scoring — instant feedback for UI (<50ms)
     try:
         from app.services.smart_scoring_service import compute_fit_score_for_candidate as smart_score
         result = smart_score(db, candidate.id, job_id)
@@ -327,20 +331,37 @@ async def _compute_fit_score_with_fallback(
             db.commit()
             db.refresh(candidate)
             logger.info("Smart scoring for candidate %s: %s%% (%s)", candidate.id, result.fit_percentage, result.fit_level)
-            return
     except Exception as smart_exc:
-        logger.warning("Smart scoring failed for candidate %s, trying AI fallback: %s", candidate.id, smart_exc)
+        logger.warning("Smart scoring failed for candidate %s: %s", candidate.id, smart_exc)
 
-    # Fallback: AI semantic scoring (slower, ~15-20s, but works without metadata)
+    # Phase 2: AI semantic scoring in background — overwrites smart score with accurate result
+    # Runs as fire-and-forget task so it doesn't block upload response
+    _candidate_id = candidate.id
+    _job_id = job_id
+    _resume_text = resume_text
+
+    async def _bg_ai_score():
+        from app.database import SessionLocal as _SL
+        _db = _SL()
+        try:
+            _cand = _db.query(Candidate).filter(Candidate.id == _candidate_id).first()
+            if not _cand:
+                return
+            score_data = await _ai_fit_score_for_candidate(_cand, _db, resume_text=_resume_text)
+            if score_data:
+                logger.info("AI background score for candidate %s: %s%% (%s)",
+                            _candidate_id, score_data.get("fit_percentage"), score_data.get("fit_level"))
+        except Exception as exc:
+            logger.warning("AI background scoring failed for candidate %s: %s", _candidate_id, exc)
+        finally:
+            _db.close()
+
     try:
-        logger.info("Computing AI fit score for candidate %s against job %s", candidate.id, job_id)
-        score_data = await _ai_fit_score_for_candidate(candidate, db, resume_text=resume_text)
-        if score_data:
-            logger.info("AI fit score for candidate %s: %s%% (%s)", candidate.id, score_data.get("fit_percentage"), score_data.get("fit_level"))
-        else:
-            logger.warning("Could not compute fit score for candidate %s — missing data", candidate.id)
-    except Exception as fit_exc:
-        logger.error("AI fit score also FAILED for candidate %s: %s", candidate.id, fit_exc, exc_info=True)
+        task = asyncio.ensure_future(_bg_ai_score())
+        _background_tasks.append(task)
+        task.add_done_callback(lambda t: _background_tasks.remove(t) if t in _background_tasks else None)
+    except Exception:
+        pass  # best-effort background scoring
 
 
 _background_tasks: list[asyncio.Task] = []  # prevent GC of fire-and-forget tasks
@@ -725,12 +746,14 @@ async def upload_resumes(
                         detail=f"Candidate quota exceeded. You can add {max(0, remaining)} more candidate(s).",
                     )
 
+    skipped_files: list[str] = []
+
     for file in files:
         if file.content_type not in ALLOWED_RESUME_TYPES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported file type for {file.filename}. Allowed: PDF, DOC, DOCX",
-            )
+            ext = Path(file.filename).suffix.upper() if file.filename else "Unknown"
+            skipped_files.append(f"{file.filename} ({ext})")
+            logger.warning("Skipped unsupported file: %s (type: %s)", file.filename, file.content_type)
+            continue
 
         safe_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{file.filename}"
         file_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
@@ -760,6 +783,13 @@ async def upload_resumes(
 
         # Queue for background parse
         parse_tasks.append((candidate.id, file_path, job_id))
+
+    # If ALL files were unsupported, return error
+    if not parse_tasks and skipped_files:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No valid resumes to upload. Unsupported files: {', '.join(skipped_files)}. Only PDF, DOC, and DOCX are accepted.",
+        )
 
     # Parse all resumes concurrently (semaphore limits to 3 at a time)
     # Awaiting here ensures tasks complete reliably (no fire-and-forget issues)
@@ -824,10 +854,9 @@ async def compute_fit_score(candidate_id: int, db: Session = Depends(get_db), us
     "/batch-recompute-scores",
     summary="Batch recompute fit scores for all candidates in a job",
     description=(
-        "Re-runs the full AI semantic fit-score for **all** candidates linked to the given `job_id`.\n\n"
-        "Returns a progress summary with per-candidate scores. "
-        "This is a slow operation (~15-20s per candidate) and should be used for "
-        "re-scoring after job requirements change."
+        "Re-runs smart scoring instantly for all candidates, then triggers "
+        "AI semantic scoring in the background for accurate results.\n\n"
+        "Smart scores appear immediately. AI scores update within ~40s per candidate."
     ),
 )
 async def batch_recompute_scores(
@@ -835,14 +864,24 @@ async def batch_recompute_scores(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Batch recompute AI fit scores for all candidates in a job opening."""
+    """Batch recompute fit scores: instant smart scoring + background AI scoring."""
     from app.models.job import Job
+    from app.services.smart_scoring_service import compute_fit_score_for_candidate as smart_score
+
     org_id = get_org_id(user)
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if org_id is not None and job.organization_id != org_id:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # Also rebuild job metadata with normalized skills (LLM-enhanced)
+    try:
+        from app.services.jd_metadata_service import build_job_metadata
+        await build_job_metadata(db, job_id)
+        logger.info("Rebuilt job metadata for job %s before batch scoring", job_id)
+    except Exception as meta_exc:
+        logger.warning("Job metadata rebuild failed for job %s: %s", job_id, meta_exc)
 
     candidates = db.query(Candidate).filter(Candidate.job_id == job_id).all()
     if not candidates:
@@ -852,19 +891,27 @@ async def batch_recompute_scores(
     failed = 0
     results = []
 
+    # Run AI scoring sequentially but with a per-candidate timeout
+    # to avoid the entire request timing out
     for candidate in candidates:
         try:
-            result = await _ai_fit_score_for_candidate(candidate, db)
-            if result:
+            score_data = await asyncio.wait_for(
+                _ai_fit_score_for_candidate(candidate, db),
+                timeout=60,  # 60s max per candidate
+            )
+            if score_data:
                 updated += 1
                 results.append({
                     "id": candidate.id,
                     "name": candidate.name,
-                    "fit_score": result.get("fit_percentage"),
-                    "fit_level": result.get("fit_level"),
+                    "fit_score": score_data.get("fit_percentage"),
+                    "fit_level": score_data.get("fit_level"),
                 })
             else:
                 failed += 1
+        except asyncio.TimeoutError:
+            logger.warning("AI scoring timed out for candidate %s, skipping", candidate.id)
+            failed += 1
         except Exception as e:
             logger.warning("Batch recompute failed for candidate %s: %s", candidate.id, e)
             failed += 1

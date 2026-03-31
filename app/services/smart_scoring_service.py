@@ -31,24 +31,24 @@ logger = logging.getLogger(__name__)
 # ── Feature Weights (sum = 1.00) ────────────────────────────────────────────
 
 WEIGHTS = {
-    # ── Core matching (85% total) ──
-    "f_skills_overlap": 0.50,       # PRIMARY — does candidate have the required skills?
+    # ── Core matching (70% total) ──
+    "f_skills_overlap": 0.30,       # Skills match — important but not sole factor
     "f_keyword_overlap": 0.15,      # JD keywords & responsibilities in resume
-    "f_tech_stack_align": 0.10,     # Related technology alignment
-    "f_experience_fit": 0.10,       # Experience years within range
-    # ── Minor factors (15% total — each 1-3%) ──
-    "f_title_similarity": 0.04,
-    "f_text_similarity": 0.04,
-    "f_skills_tfidf": 0.03,
-    "f_seniority_match": 0.02,
-    "f_education_match": 0.01,
-    "f_certification_match": 0.005,
-    "f_industry_relevance": 0.005,
+    "f_text_similarity": 0.10,      # Full resume-to-JD semantic similarity
+    "f_experience_fit": 0.15,       # Experience years + domain relevance
+    # ── Secondary factors (30% total) ──
+    "f_tech_stack_align": 0.08,     # Related technology alignment
+    "f_title_similarity": 0.06,     # Job title alignment
+    "f_skills_tfidf": 0.05,         # TF-IDF similarity captures domain language
+    "f_seniority_match": 0.04,      # Seniority level alignment
+    "f_education_match": 0.03,      # Education requirements
+    "f_certification_match": 0.02,  # Relevant certifications
+    "f_industry_relevance": 0.02,   # Domain/industry match
     "f_location_match": 0.00,       # Not relevant for scoring
 }
 
-# Minimum skills overlap before penalty applies
-_SKILLS_GATE_THRESHOLD = 0.25
+# Minimum skills overlap before penalty applies (lowered to avoid crushing domain-specific roles)
+_SKILLS_GATE_THRESHOLD = 0.10
 
 
 # ── Result ───────────────────────────────────────────────────────────────────
@@ -96,22 +96,24 @@ def _score(features: FeatureVector, resume: ResumeData, job: JobData) -> Scoring
     raw = sum(feat[k] * w for k, w in WEIGHTS.items())
 
     # ── Skills Gate ─────────────────────────────────────────────────────────
-    # If the candidate has very few matching skills, cap the total score.
-    # Skills are the CORE — everything else is secondary.
+    # If the candidate has very few matching skills, apply a mild penalty.
+    # But don't crush scores — keyword matching misses domain synonyms.
     skills_score = feat["f_skills_overlap"]
 
     if skills_score < _SKILLS_GATE_THRESHOLD:
-        # Penalize heavily — scale down by how far below the gate they are
-        gate_multiplier = max(0.10, skills_score / _SKILLS_GATE_THRESHOLD)
+        # Mild penalty — scale down but keep at least 40% of the raw score
+        # This avoids crushing scores for domain-specific roles where
+        # keyword matching fails (e.g., "D365 CRM" vs "Microsoft Dynamics")
+        gate_multiplier = max(0.40, skills_score / _SKILLS_GATE_THRESHOLD)
         raw = raw * gate_multiplier
 
     percentage = max(0, min(100, int(round(raw * 100))))
 
-    # Hard cap: score should never exceed skills match by too much.
-    # If you match 40% of skills, max score is ~60%. Prevents inflation
-    # from generic dimensions (education, industry, seniority).
+    # Soft cap: score should not exceed skills match by too much,
+    # but allow generous headroom since text similarity and keywords
+    # can capture domain alignment that skill keywords miss.
     skills_pct = int(round(skills_score * 100))
-    max_allowed = skills_pct + 20  # allow at most +20% above skills match
+    max_allowed = skills_pct + 40  # allow at most +40% above skills match
     if percentage > max_allowed:
         percentage = max_allowed
 

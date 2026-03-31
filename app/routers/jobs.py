@@ -29,6 +29,9 @@ from app.services import job_service
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
+# Separate router for public endpoints (no auth required)
+public_router = APIRouter()
+
 
 def _get_job_with_org_check(db: Session, job_id: int, user: User) -> JobModel:
     """Fetch a job and verify it belongs to the user's organization."""
@@ -558,12 +561,12 @@ def add_meeting_slot(job_id: int, payload: MeetingSlotCreate, db: Session = Depe
 
 # ── Download JD as Word Document ─────────────────────────────────────────────
 
-@router.get(
+@public_router.get(
     "/{job_id}/download-jd",
     summary="Download a generated Word document JD for a job",
     tags=["Jobs"],
 )
-def download_jd(job_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def download_jd(job_id: int, db: Session = Depends(get_db)):
     import io
     import os
     from docx import Document
@@ -572,7 +575,9 @@ def download_jd(job_id: int, db: Session = Depends(get_db), user: User = Depends
     from fastapi.responses import StreamingResponse
     from app.models.job import Job, JobSkill, JobResponsibility
 
-    job = _get_job_with_org_check(db, job_id, user)
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
 
     from app.models.job_metadata import JobMetadata
 

@@ -160,7 +160,8 @@ _SYNONYM_GROUPS = [
     ["tailwind", "tailwindcss", "tailwind css"],
     ["bootstrap", "bootstrap css"],
     ["figma", "ui design"],
-    ["agile", "scrum", "kanban"],
+    ["agile", "scrum", "kanban", "agile methodology", "agile methodologies",
+     "agile scrum", "scrum methodology"],
     ["devops", "dev ops"],
     ["microservices", "micro services", "microservice architecture"],
     ["data science", "data analytics"],
@@ -177,6 +178,88 @@ _SYNONYM_GROUPS = [
     ["wordpress", "wordpress development"],
     ["active directory", "ad"],
     ["office 365", "microsoft 365", "o365"],
+    # ── Microsoft Dynamics 365 / CRM / Power Platform ──
+    # Note: compound phrases like "D365 Sales Configuration and Customization" from JDs
+    # are handled by containment matching in _compute_skills_overlap, not synonym groups.
+    # These groups handle the BASE technology names.
+    ["dynamics 365", "d365", "dynamics crm", "microsoft dynamics 365", "microsoft dynamics crm",
+     "ms dynamics", "ms crm", "mscrm", "ms dynamics 365", "dynamics 365 crm",
+     "dynamics crm 365", "microsoft crm", "d365 crm", "crm 365",
+     "microsoft dynamics crm development", "dynamics crm development",
+     "microsoft dynamics 365 customer engagement", "d365 customer engagement",
+     "dynamics 365 customer engagement", "d365 ce", "dynamics 365 ce",
+     "crm customer engagement", "crm model apps",
+     "crm model apps configuration and customization",
+     "d365 crm model apps"],
+    ["dynamics 365 sales", "d365 sales", "dynamics sales", "crm sales module",
+     "dynamics 365 sales module", "sales module",
+     "d365 sales configuration and customization",
+     "d365 sales business application"],
+    ["dynamics 365 customer service", "d365 customer service", "customer service module",
+     "dynamics customer service"],
+    ["dynamics 365 customer insights", "d365 customer insights", "customer insights",
+     "d365 customer insights journeys", "customer insights journeys",
+     "d365 customer insights data", "customer insights data",
+     "d365 marketing", "dynamics 365 marketing", "dynamics marketing",
+     "d365 customer insights marketing",
+     "customer insights data specialty"],
+    ["dynamics 365 field service", "d365 field service", "field service module",
+     "dynamics field service"],
+    ["dynamics 365 project operations", "d365 project operations",
+     "project service automation", "psa", "dynamics project operations"],
+    ["power platform", "microsoft power platform"],
+    ["power apps", "powerapps", "power app", "canvas apps", "model driven apps",
+     "model-driven apps", "mda"],
+    ["power automate", "microsoft flow", "ms flow", "power automate flows",
+     "flow automation"],
+    ["power pages", "power portals", "portal", "power portal"],
+    ["power bi", "powerbi", "power b i"],
+    ["dataverse", "common data service", "cds", "microsoft dataverse"],
+    ["copilot studio", "power virtual agents", "pva", "microsoft copilot studio"],
+    ["microsoft copilot", "copilot", "m365 copilot", "copilot for sales",
+     "copilot for customer insights"],
+    ["azure logic apps", "logic apps", "azure logic app"],
+    ["azure functions", "azure function"],
+    ["azure devops", "azure pipelines", "ado"],
+    ["dynamics 365 finance", "d365 finance", "d365 f&o", "dynamics finance and operations",
+     "dynamics 365 finance and operations", "d365 finance and operations"],
+    # ── CRM / ERP Consulting Skills ──
+    ["requirement gathering", "requirements gathering", "business requirements",
+     "gathering requirements", "requirement analysis", "requirements analysis"],
+    ["gap analysis", "gap fit analysis", "fit gap analysis", "gap/fit analysis"],
+    ["solution design", "solution architecture", "solution design document",
+     "functional design", "functional design document", "fdd"],
+    ["business process flow", "bpf", "business process flows"],
+    ["plugin", "plug-in", "plugins", "plug-ins", "plug in", "plug ins", "crm plugin", "crm plugins"],
+    ["custom workflow", "custom workflows", "workflow", "workflows"],
+    ["ribbon workbench", "ribbon customization", "ribbon customizations"],
+    ["fetchxml", "fetch xml", "advanced find"],
+    ["xrm toolbox", "xrm tool box"],
+    ["solution deployment", "solution management", "solution export",
+     "solution import"],
+    ["data migration", "data integration", "data migration and integration"],
+    ["stakeholder management", "stakeholder engagement", "client engagement",
+     "client management", "client relationship management"],
+    ["functional consulting", "functional consultant", "business consulting",
+     "crm consulting", "crm consultant"],
+    ["end-to-end implementation", "end to end implementation",
+     "e2e implementation", "full lifecycle implementation",
+     "end to end crm implementation", "end to end microsoft customer insights implementation",
+     "end to end d365 implementation"],
+    ["user acceptance testing", "uat", "acceptance testing"],
+    ["training delivery", "end user training", "end-user training",
+     "user training", "training and documentation"],
+    ["business requirement document", "brd", "functional requirement document",
+     "frd", "functional specification"],
+    ["project management", "project delivery", "project lifecycle"],
+    ["pre-sales", "presales", "rfp", "rfq", "request for proposal"],
+    ["change management", "scope management", "change control"],
+    # ── ERP / Integration ──
+    ["sap integration", "sap connector", "sap"],
+    ["odata", "odata api", "web api"],
+    ["rest api", "rest apis", "restful api", "api integration"],
+    ["ssis", "sql server integration services"],
+    ["ssrs", "sql server reporting services"],
 ]
 
 def _build_synonym_map():
@@ -189,7 +272,13 @@ _build_synonym_map()
 
 
 def _canonicalize_skill(skill: str) -> str:
-    """Normalize a skill string to its canonical form."""
+    """Normalize a skill string to its canonical form.
+
+    Tries multiple strategies:
+    1. Exact match in synonym map
+    2. Strip parenthetical content and retry
+    3. For long compound skills, try progressively shorter prefixes
+    """
     s = re.sub(r'[.\-/]', ' ', skill.lower().strip())
     s = re.sub(r'\s+', ' ', s).strip()
 
@@ -204,9 +293,19 @@ def _canonicalize_skill(skill: str) -> str:
         result = _SKILL_SYNONYMS.get(base)
         if result:
             return result
-        return base
 
-    return s
+    # For long compound skills (4+ words), try progressively shorter prefixes
+    # e.g., "microsoft dynamics 365 customer engagement" → try
+    #   "microsoft dynamics 365 customer" → "microsoft dynamics 365" → "microsoft dynamics"
+    words = (base if base != s else s).split()
+    if len(words) >= 4:
+        for end in range(len(words) - 1, 1, -1):
+            prefix = " ".join(words[:end])
+            result = _SKILL_SYNONYMS.get(prefix)
+            if result:
+                return result
+
+    return base if base != s else s
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -398,7 +497,7 @@ def _tfidf_cosine(text_a: str, text_b: str) -> float:
 def _compute_skills_overlap(
     resume_skills: list[str], job_skills: list[str], raw_text: Optional[str] = None
 ) -> float:
-    """Fuzzy skill matching with synonym awareness + raw text fallback. Returns 0.0–1.0."""
+    """Fuzzy skill matching with synonym awareness, containment matching, and raw text fallback. Returns 0.0–1.0."""
     if not job_skills:
         return 0.0  # no job skills defined → can't score
 
@@ -408,25 +507,52 @@ def _compute_skills_overlap(
     if not canonical_job:
         return 0.0
 
-    # Direct match (exact canonical match)
+    # Pass 1: Direct match (exact canonical match)
     matched = canonical_resume & canonical_job
 
-    # Multi-word skill matching — only for multi-word skills to avoid
-    # false positives like "java" matching "javascript"
+    # Pass 2: Containment matching — if a resume skill is CONTAINED in a job skill
+    # or vice versa, count it. This handles compound domain skills:
+    # e.g., JD: "dynamics 365 customer engagement" matches resume: "dynamics 365"
+    # e.g., JD: "data integration and migration" matches resume: "data integration"
     unmatched_job = canonical_job - matched
     for jskill in list(unmatched_job):
         j_tokens = set(jskill.split())
         if len(j_tokens) < 2:
-            continue  # skip single-word skills — require exact match only
+            continue  # skip single-word skills for containment — too many false positives
         for rskill in canonical_resume:
             r_tokens = set(rskill.split())
-            # Multi-word overlap: "spring boot" matches if resume has "spring boot"
-            if j_tokens and r_tokens and len(j_tokens & r_tokens) / len(j_tokens) >= 0.7:
+            if len(r_tokens) < 2:
+                continue
+            # Resume skill is fully contained in job skill (or vice versa)
+            # e.g., "dynamics 365" ⊂ "dynamics 365 customer engagement"
+            if r_tokens.issubset(j_tokens) or j_tokens.issubset(r_tokens):
                 matched.add(jskill)
                 break
 
-    # Raw text fallback — use WORD BOUNDARY regex to avoid substring false positives
-    # e.g., \bjava\b will NOT match inside "javascript"
+    # Pass 3: Multi-word token overlap matching (lowered threshold to 50%)
+    # Handles cases like "d365 sales configuration and customization" vs "dynamics 365 sales"
+    unmatched_job = canonical_job - matched
+    for jskill in list(unmatched_job):
+        j_tokens = set(jskill.split())
+        if len(j_tokens) < 2:
+            continue
+        # Remove common filler words for better matching
+        _FILLER = {"and", "or", "the", "of", "in", "for", "with", "on", "to", "a", "an"}
+        j_meaningful = j_tokens - _FILLER
+        if not j_meaningful:
+            j_meaningful = j_tokens
+        for rskill in canonical_resume:
+            r_tokens = set(rskill.split())
+            r_meaningful = r_tokens - _FILLER
+            if not r_meaningful:
+                r_meaningful = r_tokens
+            # Match if 50%+ of meaningful job skill tokens overlap with resume
+            overlap = len(j_meaningful & r_meaningful)
+            if overlap >= 1 and overlap / len(j_meaningful) >= 0.50:
+                matched.add(jskill)
+                break
+
+    # Pass 4: Raw text fallback — scan resume full text for job skill phrases
     if raw_text and (canonical_job - matched):
         raw_lower = raw_text.lower()
         still_unmatched = canonical_job - matched
@@ -443,6 +569,15 @@ def _compute_skills_overlap(
                     if re.search(r'\b' + re.escape(orig_lower) + r'\b', raw_lower):
                         matched.add(jskill)
                         break
+            if jskill in matched:
+                continue
+            # Check individual meaningful tokens (2+ chars) in raw text
+            # If most of the job skill's key tokens appear in the resume text, count it
+            j_tokens = set(jskill.split()) - {"and", "or", "the", "of", "in", "for", "with", "on", "to", "a", "an"}
+            if len(j_tokens) >= 2:
+                token_hits = sum(1 for t in j_tokens if len(t) > 2 and re.search(r'\b' + re.escape(t) + r'\b', raw_lower))
+                if token_hits / len(j_tokens) >= 0.60:
+                    matched.add(jskill)
 
     return min(1.0, len(matched) / len(canonical_job))
 

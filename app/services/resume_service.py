@@ -212,9 +212,8 @@ STRICT RULES:
 
 async def calculate_fit_score(req: FitScoreRequest) -> FitScoreResponse:
     """
-    Enterprise-grade ATS fit score engine.
-    Deterministic resume-to-JD matching with weighted scoring model.
-    Behaves like a production ATS system — no hallucination, no inflation.
+    Context-aware AI fit score engine using weighted semantic evaluation.
+    Uses LLM to understand meaning, not just keywords.
     """
     from app.services.ai_service import _ask_with_usage, _parse_json, SONNET
     from app.services.credit_service import log_usage
@@ -240,162 +239,174 @@ Full Job Description Text:
 
     resume_text = req.resume_text[:10000]
 
-    prompt = f"""You are an enterprise-grade ATS (Applicant Tracking System) engine.
-Your job is to calculate a precise FIT SCORE between a candidate's resume and a job description.
-You must behave as a deterministic system, not a chatbot.
+    prompt = f"""You are a senior technical recruiter evaluating a candidate's resume against a job description.
+Your goal is to produce an ACCURATE, FAIR, and MEANINGFUL fit score that reflects real-world hiring judgment.
 
 ---
 
-INPUT:
-
-Job Description:
+JOB DESCRIPTION:
 - Title: {req.job_title}
 - Required Experience: {exp_min}-{exp_max} years
 - Required Skills: {required_skills_str}
 - Key Responsibilities: {responsibilities_str}
 {jd_section}
 
-Candidate Resume:
+CANDIDATE RESUME:
 \"\"\"
 {resume_text}
 \"\"\"
 
 ---
 
-STEP 1: PARSE THE RESUME
+EVALUATION METHODOLOGY (Weighted Scoring — Total = 100 points):
 
-Read EVERY WORD of the resume. Extract:
-- All skills (from ALL sections — summary, experience, projects, certifications, NOT just a skills section)
-- All work experience with roles, companies, durations
-- Total experience in years
-- Education and certifications
+1. EXPERIENCE RELEVANCE (25 points):
+   - Years of experience vs required range
+   - Domain relevance — how closely past work aligns with the JD domain
+   - If candidate has {exp_min}+ years in the SAME domain → full score
+   - Extra years in the domain = bonus, not penalty
+   - Weight recent experience more heavily
 
-SKILL NORMALIZATION — apply before matching:
-- React.js / ReactJS → React
-- Node.js / NodeJS → Node.js
-- Next.js → Next.js (keep)
-- Remove duplicates
-- Keep only technical + domain skills (ignore "team player", "hardworking")
-- BUT keep professional skills: "Team Leadership", "Stakeholder Management", "Project Management"
+2. JD REQUIREMENT MATCH (30 points):
+   - Map EACH key responsibility in the JD to candidate's demonstrated experience
+   - Score based on coverage of JD requirements:
+     * Requirement gathering / business analysis
+     * Stakeholder management / client advisory
+     * Solution design / documentation
+     * Implementation / configuration
+     * Training delivery
+     * Project management / delivery
+     * End-to-end implementation experience
+   - Use SEMANTIC matching — different words for same competency count as a match
+   - Example: "conducted workshops with clients" = "requirement gathering" = "client engagement"
 
-DOMAIN SKILL EXTRACTION — extract from context:
-- "conducted IS audits" → "IS Auditing"
-- "PCI-DSS compliance" → "PCI-DSS"
-- "managed team" → "Team Leadership"
-- "vulnerability assessments" → "Vulnerability Assessment"
-- "risk assessment" → "Risk Assessment"
-- "ITGC testing" → "ITGC"
-- "SOX compliance" → "SOX"
-- "ISO 27001" → "ISO 27001"
-- "GDPR" → "GDPR"
-- "NIST CSF" → "NIST CSF"
-- "COBIT" → "COBIT"
+3. SKILLS & TOOLS (20 points):
+   - Technical skills and ecosystem alignment
+   - Use SEMANTIC EQUIVALENCE — do NOT rely on exact keyword matching:
+     * "Microsoft Dynamics CRM" = "D365" = "Dynamics 365" = "MSCRM"
+     * "Power Automate" = "Microsoft Flow" = "Flow automation"
+     * "Plugins" = "Plug-ins" = "CRM Plugins"
+     * "Customer Insights" = "D365 Marketing" = "CI Journeys"
+     * "React" = "React.js" = "ReactJS"
+     * Any technology mentioned in context counts (e.g., "worked on Azure Logic Apps" → Azure Logic Apps is a skill)
+   - Score = proportion of required skills/tools the candidate demonstrably has
 
-ROLE NORMALIZATION:
-- SDE / Developer / Software Dev → Software Engineer
-- Frontend Dev → Frontend Developer
-- IS Auditor / IT Auditor → Information Systems Auditor
+4. FUNCTIONAL / CONSULTING ALIGNMENT (15 points):
+   - Is the candidate a functional consultant vs technical developer? Match to JD expectation
+   - If JD needs "Sr. Consultant" → weigh consulting skills, client-facing ability, advisory
+   - If JD needs "Developer" → weigh technical implementation, coding
+   - Look for: consulting experience, client interaction, workshops, advisory, training
+   - Also consider: developer mindset (plugins, code) vs consultant mindset (requirements, design, training)
 
----
-
-STEP 2: FIT SCORE CALCULATION (Total = 100 points)
-
-1. SKILLS MATCH (40 points):
-   - Required skills matching = 30 points
-   - Preferred/additional skills = 10 points
-   - Use SEMANTIC matching: React == React.js, ITGC == IT General Controls
-   - "Gap analysis" ≈ "Risk Assessment" (related domain)
-   - If resume says "conducted PCI-DSS audits" → PCI-DSS is matched
-   - Score = (matched_required / total_required) * 30 + (matched_preferred / total_preferred) * 10
-
-2. EXPERIENCE MATCH (30 points):
-   - Compare candidate total experience vs required {exp_min}-{exp_max} years
-   - If equal or higher → full 30 points
-   - If lower → proportional (e.g. 3 years for 5-year req → 3/5 * 30 = 18)
-   - Also evaluate RELEVANCE of experience to the JD roles/domain
-
-3. ROLE MATCH (20 points):
-   - Match resume job titles/roles against JD title and responsibilities
-   - Frontend Developer ≈ React Developer (high match)
-   - IS Auditor ≈ Project Leader IS Audit (high match)
-   - Software Engineer ≈ Backend Developer if skills align
-
-4. EDUCATION MATCH (10 points):
-   - If JD explicitly requires specific education → score based on match
-   - If JD has no education requirements → give full 10 points
+5. SENIORITY & ROLE FIT (10 points):
+   - Does the candidate's seniority level match the JD?
+   - Senior Consultant needs leadership, mentoring, independent delivery
+   - Junior roles need learning ability, basic skills
+   - Consider company pedigree and career progression
 
 ---
 
-STEP 3: GENERATE OUTPUT
-
-Return ONLY valid JSON — no markdown fences, no extra text:
+OUTPUT FORMAT — Return ONLY valid JSON (no markdown, no extra text):
 
 {{
   "fit_level": "high or medium or low",
   "fit_percentage": 0,
-  "summary": "2-3 sentence overall fit assessment like a senior recruiter verdict",
+  "summary": "2-3 sentence recruiter-style assessment of overall fit",
 
   "score_breakdown": {{
-    "core_skills": 0,
-    "experience_fit": 0,
-    "responsibility_match": 0,
-    "tools_technology": 0,
-    "leadership_ownership": 0,
-    "compliance_domain": 0
+    "experience_relevance": 0,
+    "jd_requirement_match": 0,
+    "skills_and_tools": 0,
+    "consulting_alignment": 0,
+    "seniority_fit": 0
   }},
 
   "strength_mapping": {{
-    "strong_matches": ["Skill/area with high alignment — evidence from resume"],
-    "partial_matches": ["Skill/area with partial coverage — what is present and weak"],
-    "gaps": ["Required skill/area truly absent from resume"]
+    "strong_matches": [
+      "Specific strength with evidence from resume (e.g., '8+ years D365 CRM — exceeds 4-year requirement')"
+    ],
+    "partial_matches": [
+      "Area with some coverage but gaps (e.g., 'Customer Insights: has Journey experience but no Data implementation')"
+    ],
+    "gaps": [
+      "Required area truly absent (e.g., 'No Microsoft Copilot experience mentioned')"
+    ]
   }},
 
   "key_matching_skills": ["Matched skill 1", "Matched skill 2"],
   "missing_weak_areas": ["Missing requirement 1", "Missing requirement 2"],
 
-  "relevant_experience_summary": "3-5 sentence paragraph of candidate experience relevant to this JD",
+  "relevant_experience_summary": "3-5 sentence paragraph summarizing the candidate's relevant experience for this specific role",
 
   "breakdown": {{
-    "experience_match": "Assessment of experience years + domain fit",
-    "skills_match": "Assessment of skills overlap using semantic matching",
-    "tech_stack_alignment": "Specific tools/tech overlap analysis",
-    "role_alignment": "How past roles map to JD responsibilities"
+    "experience_match": "Assessment of experience years + domain relevance",
+    "skills_match": "Assessment of skills alignment using semantic matching",
+    "tech_stack_alignment": "Tools, platforms, and ecosystem overlap",
+    "role_alignment": "How past roles and responsibilities map to JD expectations"
   }},
 
-  "reasoning_points": ["Key observation 1", "Key observation 2"],
-  "verdict": "One-line hiring recommendation"
+  "reasoning_points": [
+    "Key observation 1 — specific evidence from resume",
+    "Key observation 2 — what makes this candidate strong or weak for this role"
+  ],
+  "verdict": "One-line hiring recommendation (e.g., 'Strong functional fit for Sr. Consultant role — recommend interview')"
 }}
 
 ---
 
 SCORING BANDS:
-- high   (75-100): Strong match — most required skills present, experience aligns, clear role fit
-- medium (45-74):  Partial match — some gaps but transferable skills present
-- low    (0-44):   Poor match — critical requirements missing
+- high   (75-100): Strong match — most JD requirements covered, right experience level, clear role alignment
+- medium (45-74):  Partial match — some gaps but transferable skills and relevant domain experience
+- low    (0-44):   Poor match — critical requirements missing or wrong domain/seniority
 
 ---
 
 CRITICAL RULES:
+- NEVER rely on exact keyword matching. Use SEMANTIC understanding.
+  "Worked on Microsoft Dynamics CRM" MATCHES "D365 experience required"
+  "Conducted client workshops" MATCHES "Requirement gathering"
+  "Implemented CRM solutions" MATCHES "End-to-end implementation"
 - NEVER hallucinate — only report what is IN the resume
-- NEVER inflate scores — be strict but FAIR
-- Match EQUIVALENT skills even if wording differs (semantic matching)
-- DO NOT penalize for missing exact keywords if equivalent experience is demonstrated
-- DO reward transferable/equivalent experience inferred from context
-- DO NOT mark a skill as missing if it can be reasonably inferred from projects/experience
-- Penalize ONLY if a required competency is truly absent
-- If experience says "performed ITGC audits, SOX testing, PCI-DSS reviews" → those ARE matched skills
-- fit_percentage = sum of all dimension scores (must equal the total)
+- NEVER deflate scores because keywords differ — if the MEANING matches, it's a match
+- DO reward equivalent/transferable experience demonstrated through project descriptions
+- DO consider the full resume context — project descriptions, responsibilities, not just skills sections
+- A candidate who has "8.7 years of Microsoft Dynamics CRM Development" clearly has "Extensive D365 experience"
+- fit_percentage MUST equal the sum of all score_breakdown dimension values
+- The score_breakdown dimensions must sum to fit_percentage exactly
 - Output MUST be valid JSON only
-
-IMPORTANT: The fit_percentage MUST equal the sum of score_breakdown values.
-Map the 4-dimension model (Skills 40 + Experience 30 + Role 20 + Education 10 = 100)
-to the 6-dimension output by splitting Skills into core_skills + tools_technology + compliance_domain,
-and Experience into experience_fit + responsibility_match + leadership_ownership.
 """
 
-    result = await _ask_with_usage(prompt, model=SONNET, max_tokens=3000)
+    result = await _ask_with_usage(prompt, model=SONNET, max_tokens=3500)
     log_usage(result, feature="fit_score")
-    data = _parse_json(result.text)
+    try:
+        data = _parse_json(result.text)
+    except json.JSONDecodeError:
+        # Try to fix truncated JSON by closing open braces/brackets
+        raw = result.text.strip()
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            raw = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
+        # Count open vs close braces/brackets and close them
+        open_braces = raw.count("{") - raw.count("}")
+        open_brackets = raw.count("[") - raw.count("]")
+        # Remove trailing incomplete string/value
+        raw = raw.rstrip()
+        if raw and raw[-1] not in "]}\"0123456789":
+            # Truncated mid-value — try to close the current string
+            if '"' in raw:
+                last_quote = raw.rfind('"')
+                # Check if we're inside an unclosed string
+                before_last = raw[:last_quote]
+                if before_last.count('"') % 2 == 0:
+                    raw = raw[:last_quote + 1]  # keep up to last complete string
+            raw = raw.rstrip(",: \n\t")
+        raw += "]" * max(0, open_brackets) + "}" * max(0, open_braces)
+        try:
+            data = json.loads(raw)
+            logger.warning("Fixed truncated JSON for fit score (closed %d braces, %d brackets)", open_braces, open_brackets)
+        except json.JSONDecodeError:
+            logger.error("Could not parse fit score JSON even after fix attempt")
+            raise
 
     raw_pct = data.get("fit_percentage", 0)
     try:

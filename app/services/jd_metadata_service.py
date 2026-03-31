@@ -28,8 +28,30 @@ def build_job_metadata_fast(db: Session, job_id: int) -> Optional[JobMetadata]:
     if not job:
         return None
 
-    skills = [s.skill for s in db.query(JobSkill).filter(JobSkill.job_id == job_id).all() if s.skill]
+    raw_skills = [s.skill for s in db.query(JobSkill).filter(JobSkill.job_id == job_id).all() if s.skill]
     responsibilities = [r.description for r in db.query(JobResponsibility).filter(JobResponsibility.job_id == job_id).all()]
+
+    # Normalize compound skills into shorter matchable terms
+    # e.g., "Microsoft Dynamics 365 Customer Engagement" → also add "Dynamics 365", "CRM"
+    skills = list(raw_skills)  # keep originals
+    for s in raw_skills:
+        # Break skills at common connectors
+        lower = s.lower()
+        # Add sub-terms split by "and", commas, parentheses
+        for sep in [" and ", ", ", " / ", " or "]:
+            if sep in lower:
+                for part in s.split(sep if sep != lower else sep):
+                    part = part.strip().strip("()[]")
+                    if len(part) > 2 and part not in skills:
+                        skills.append(part)
+        # Extract parenthetical content as separate skills
+        import re as _re
+        paren_match = _re.findall(r'\(([^)]+)\)', s)
+        for pm in paren_match:
+            for sub in pm.split(","):
+                sub = sub.strip()
+                if len(sub) > 2 and sub not in skills:
+                    skills.append(sub)
 
     # Build keywords from title, skills, department, responsibilities
     keywords = set()
@@ -179,9 +201,11 @@ async def _extract_jd_metadata_llm(
     resp_str = "\n".join(f"- {r}" for r in responsibilities) if responsibilities else "Not specified"
     jd_section = f"\n\nFull JD Text:\n\"\"\"\n{raw_jd_text[:5000]}\n\"\"\"" if raw_jd_text else ""
 
-    prompt = f"""You are an expert HR metadata extractor.
-Given the following job description data, extract structured metadata for candidate matching.
-Return ONLY valid JSON — no markdown fences, no extra text.
+    prompt = f"""You are an expert HR metadata extractor for an ATS (Applicant Tracking System).
+Your job is to extract structured metadata from a job description for CANDIDATE MATCHING.
+
+The skills you extract will be matched against skills parsed from candidate resumes.
+Therefore, you MUST normalize skills to SHORT, STANDARD forms that match how resumes list them.
 
 Job Title: {job_title}
 Experience: {experience_min}-{experience_max} years
@@ -191,7 +215,8 @@ Responsibilities:
 {resp_str}
 {jd_section}
 
-Return JSON in EXACTLY this format:
+Return ONLY valid JSON — no markdown fences, no extra text.
+
 {{
   "parsed_title": "Clean, standardized job title",
   "required_skills": ["skill1", "skill2", ...],
@@ -203,11 +228,47 @@ Return JSON in EXACTLY this format:
   "responsibilities_summary": "2-3 sentence summary of key responsibilities"
 }}
 
-Rules:
-- required_skills: comprehensive list including both explicit skills and implied ones from responsibilities
-- keywords: 10-20 searchable terms (technologies, domains, certifications, soft skills, industry terms)
-- education_requirements: infer from role level if not explicitly stated
-- designation: infer from title and experience range
+CRITICAL RULES FOR required_skills:
+
+1. NORMALIZE to SHORT labels (1-3 words max) that match how resumes list skills:
+   BAD:  "Microsoft Dynamics 365 Customer Engagement"
+   GOOD: "Dynamics 365", "CRM"
+
+   BAD:  "D365 Sales Configuration and Customization"
+   GOOD: "D365 Sales", "CRM Customization"
+
+   BAD:  "End-to-End CRM Implementation"
+   GOOD: "CRM Implementation"
+
+   BAD:  "Proficiency in configuring and customizing D365 Sales business application"
+   GOOD: "D365 Sales", "CRM Configuration"
+
+   BAD:  "Strong understanding of data integration and migration processes"
+   GOOD: "Data Integration", "Data Migration"
+
+2. BREAK compound skills into individual matchable terms:
+   "D365 CRM Model Apps (Sales, Customer Insight, Services)" → "Dynamics 365", "CRM", "D365 Sales", "Customer Insights", "D365 Customer Service"
+
+3. Extract skills from ALL sections — not just the skills list:
+   - From responsibilities: "Gather requirements" → "Requirement Gathering"
+   - From responsibilities: "Deliver end-user training" → "Training Delivery"
+   - From responsibilities: "Act as trusted advisor" → "Client Advisory"
+
+4. Include BOTH the specific AND the general form:
+   "React.js" → include both "React" AND "React.js"
+   "D365 Customer Insights" → include both "Customer Insights" AND "Dynamics 365"
+
+5. Include professional/consulting skills if required:
+   "Stakeholder Management", "Solution Design", "Project Management", etc.
+
+6. Target 15-30 skills for a typical JD
+7. Each skill should be 1-3 words (occasionally 4 for specific tech names)
+
+RULES FOR keywords:
+- 15-25 searchable terms (technologies, domains, certifications, methodologies, industries)
+- Include variations: "D365" AND "Dynamics 365" AND "CRM"
+- Include certifications mentioned in JD
+- Include industry/domain terms
 """
 
     raw = await _ask(prompt, model=SONNET, max_tokens=1024)
