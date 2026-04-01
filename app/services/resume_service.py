@@ -252,19 +252,25 @@ RESUME:
 {resume_text}
 \"\"\"
 
-SCORING RULES:
-- Score generously for RELEVANT experience. If candidate has done similar work, give credit.
-- Transferable skills count. Bookkeeping in US context transfers to bookkeeping in other contexts.
-- Experience meeting or exceeding the range = full experience score.
-- Matching 60%+ of required skills = HIGH FIT territory.
-- Use semantic matching: "QuickBooks" = "QBO", "month-end close" = "monthly closing", etc.
-- DO NOT penalize for missing 1-2 nice-to-have skills if core competencies are strong.
-- A candidate with 3+ years in the SAME domain doing SIMILAR work should score 65%+.
+SCORING PHILOSOPHY — Score like a REAL recruiter who wants to FILL the role:
+- If the candidate can DO the job with minimal training → HIGH FIT (75%+)
+- Core domain experience matters most. A bookkeeper with 3+ years = strong candidate.
+- Transferable skills ALWAYS count. US accounting → Canadian accounting = transferable.
+- Similar tools count. QuickBooks experience covers QBO requirement.
+- Missing 1-3 specific skills is NORMAL and trainable — do NOT heavily penalize.
+- Experience at or above the required range = FULL experience credit (25/25).
+- If candidate has 50%+ of listed skills + right experience → score 70%+.
+
+CALIBRATION EXAMPLES (follow these score levels):
+- 3+ years same domain + most skills + right tools → 75-85% HIGH
+- 3+ years same domain + some skill gaps → 60-74% MEDIUM
+- Related experience + major gaps → 45-59% MEDIUM
+- Wrong domain or very junior → below 45% LOW
 
 SCORING BANDS:
-- 75-100 HIGH FIT: Has most required skills, right experience level, domain match
-- 50-74 MEDIUM FIT: Has core skills, some gaps but trainable
-- 0-49 LOW FIT: Missing critical requirements, wrong domain
+- 75-100 HIGH FIT: Can do the job, has domain experience + most skills
+- 50-74 MEDIUM FIT: Relevant background, some trainable gaps
+- 0-49 LOW FIT: Wrong domain or missing critical competencies
 
 Return ONLY valid JSON:
 {{
