@@ -1108,28 +1108,43 @@ def log_violation(
 
 
 async def _run_evaluation_background(session_id: int):
-    """Background task: generate evaluation using a fresh DB session."""
-    db = SessionLocal()
-    try:
-        logging.info(f"[Evaluation] Starting background evaluation for session {session_id}")
-        session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
-        if not session:
-            logging.error(f"[Evaluation] Session {session_id} not found in DB")
-            return
-        if session.evaluation:
-            logging.info(f"[Evaluation] Session {session_id} already has evaluation — skipping")
-            return
-        messages_count = db.query(InterviewMessage).filter(InterviewMessage.session_id == session_id).count()
-        logging.info(f"[Evaluation] Session {session_id} — {messages_count} messages found, calling AI...")
-        await svc.generate_evaluation(session, db)
-        logging.info(f"[Evaluation] Session {session_id} — evaluation saved successfully")
-    except Exception as e:
-        logging.error(
-            f"[Evaluation] FAILED for session {session_id}: {type(e).__name__}: {e}\n"
-            f"{traceback.format_exc()}"
-        )
-    finally:
-        db.close()
+    """Background task: generate evaluation with automatic retry."""
+    MAX_RETRIES = 3
+
+    for attempt in range(MAX_RETRIES):
+        db = SessionLocal()
+        try:
+            logging.info(f"[Evaluation] Attempt {attempt + 1}/{MAX_RETRIES} for session {session_id}")
+            session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+            if not session:
+                logging.error(f"[Evaluation] Session {session_id} not found in DB")
+                return
+            if session.evaluation:
+                logging.info(f"[Evaluation] Session {session_id} already has evaluation — skipping")
+                return
+
+            messages_count = db.query(InterviewMessage).filter(InterviewMessage.session_id == session_id).count()
+            if messages_count == 0:
+                logging.error(f"[Evaluation] Session {session_id} has NO messages — cannot evaluate")
+                return
+
+            logging.info(f"[Evaluation] Session {session_id} — {messages_count} messages, calling AI...")
+            await svc.generate_evaluation(session, db)
+            logging.info(f"[Evaluation] Session {session_id} — evaluation saved successfully")
+            return  # success — exit retry loop
+
+        except Exception as e:
+            logging.error(
+                f"[Evaluation] FAILED attempt {attempt + 1} for session {session_id}: {type(e).__name__}: {e}"
+            )
+            if attempt < MAX_RETRIES - 1:
+                wait_secs = 5 * (attempt + 1)
+                logging.info(f"[Evaluation] Retrying in {wait_secs}s...")
+                await asyncio.sleep(wait_secs)
+            else:
+                logging.error(f"[Evaluation] ALL {MAX_RETRIES} RETRIES FAILED for session {session_id}")
+        finally:
+            db.close()
 
 
 @router.post(
