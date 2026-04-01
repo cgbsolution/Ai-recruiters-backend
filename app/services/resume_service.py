@@ -261,15 +261,20 @@ SCORING PHILOSOPHY — Score like a REAL recruiter who wants to FILL the role:
 - Experience at or above the required range = FULL experience credit (25/25).
 - If candidate has 50%+ of listed skills + right experience → score 70%+.
 
-CALIBRATION EXAMPLES (follow these score levels):
-- 3+ years same domain + most skills + right tools → 75-85% HIGH
-- 3+ years same domain + some skill gaps → 60-74% MEDIUM
-- Related experience + major gaps → 45-59% MEDIUM
-- Wrong domain or very junior → below 45% LOW
+CALIBRATION — you MUST follow these score ranges:
+- Candidate with required experience + 60%+ skills match → 78-90% HIGH FIT
+- Candidate with required experience + 40-60% skills match → 65-77% MEDIUM-HIGH
+- Candidate with some experience + some skills → 50-64% MEDIUM FIT
+- Wrong domain or missing most requirements → below 50% LOW FIT
+
+IMPORTANT: Most real candidates who apply for a job have RELEVANT experience.
+A bookkeeper applying for a bookkeeping role should score 70%+ by default.
+Only penalize significantly for CRITICAL missing requirements, not nice-to-haves.
+If candidate has the core job function experience (e.g. bookkeeping for a bookkeeping role), start at 70% and adjust from there.
 
 SCORING BANDS:
-- 75-100 HIGH FIT: Can do the job, has domain experience + most skills
-- 50-74 MEDIUM FIT: Relevant background, some trainable gaps
+- 70-100 HIGH FIT: Has domain experience + most core skills
+- 50-69 MEDIUM FIT: Relevant background, notable gaps but trainable
 - 0-49 LOW FIT: Wrong domain or missing critical competencies
 
 Return ONLY valid JSON:

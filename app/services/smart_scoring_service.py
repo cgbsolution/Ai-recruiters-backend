@@ -117,7 +117,7 @@ def _score(features: FeatureVector, resume: ResumeData, job: JobData) -> Scoring
     if percentage > max_allowed:
         percentage = max_allowed
 
-    fit_level = "high" if percentage >= 75 else ("medium" if percentage >= 40 else "low")
+    fit_level = "high" if percentage >= 70 else ("medium" if percentage >= 50 else "low")
 
     # Per-dimension breakdown for the hover tooltip
     breakdown = {}
