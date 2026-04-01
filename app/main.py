@@ -46,12 +46,13 @@ try:
     logging.info("Alembic migrations applied successfully")
 except Exception as e:
     logging.warning(f"Alembic migration failed: {e}")
-    # Fallback: create missing tables via SQLAlchemy, then apply critical columns via raw SQL
     Base.metadata.create_all(bind=engine)
     logging.info("Fallback: Base.metadata.create_all() completed")
 
-    # Apply critical missing columns that create_all won't add to existing tables
-    _raw_migrations = [
+# Always run raw SQL migrations — ensures columns exist even if Alembic succeeded
+# (Alembic may not have the latest column additions)
+import sqlalchemy as sa
+_raw_migrations = [
         "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS resume_metadata_id INTEGER REFERENCES resume_metadata(id)",
         "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS parsing_status VARCHAR(20)",
         "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS mail_contact_history BOOLEAN DEFAULT FALSE",
@@ -108,18 +109,18 @@ except Exception as e:
         # secondary camera verification
         "CREATE TABLE IF NOT EXISTS secondary_cam_sessions (id SERIAL PRIMARY KEY, session_id INTEGER REFERENCES interview_sessions(id) ON DELETE CASCADE UNIQUE, pairing_code VARCHAR(32) UNIQUE NOT NULL, status VARCHAR(20) DEFAULT 'pending', device_info TEXT, last_heartbeat TIMESTAMP, positioning_snapshot VARCHAR(500), created_at TIMESTAMP DEFAULT NOW(), verified_at TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS secondary_cam_snapshots (id SERIAL PRIMARY KEY, secondary_session_id INTEGER REFERENCES secondary_cam_sessions(id) ON DELETE CASCADE, file_path VARCHAR(500) NOT NULL, captured_at TIMESTAMP DEFAULT NOW())",
-    ]
-    try:
-        with engine.connect() as conn:
-            for sql in _raw_migrations:
-                try:
-                    conn.execute(sa.text(sql))
-                except Exception:
-                    pass  # column/type already exists — safe to skip
-            conn.commit()
-        logging.info("Fallback: raw SQL migrations applied")
-    except Exception as e2:
-        logging.warning(f"Fallback raw SQL also failed: {e2}")
+]
+try:
+    with engine.connect() as conn:
+        for sql in _raw_migrations:
+            try:
+                conn.execute(sa.text(sql))
+            except Exception:
+                pass  # column/type already exists — safe to skip
+        conn.commit()
+    logging.info("Raw SQL migrations applied successfully")
+except Exception as e2:
+    logging.warning(f"Raw SQL migrations failed: {e2}")
 
 _DESCRIPTION = """
 ## CGB Solutions — AI Recruiters API
