@@ -185,8 +185,11 @@ def login(body: SignInRequest, db: Session = Depends(get_db)):
     # Fetch org name if user belongs to one
     org_name = None
     if user.organization_id:
-        org = db.query(Organization).filter(Organization.id == user.organization_id).first()
-        org_name = org.name if org else None
+        try:
+            org = db.query(Organization).filter(Organization.id == user.organization_id).first()
+            org_name = org.name if org else None
+        except Exception:
+            pass  # org columns may not exist yet — don't crash login
 
     return TokenResponse(
         access_token=token,

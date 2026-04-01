@@ -14,8 +14,9 @@ logger = logging.getLogger("startup")
 REQUIRED_COLUMNS = [
     # Migration: a1b2c3d4e5f6_add_candidate_extended_fields
     ("candidates", "resume_fit_score", "VARCHAR(20)", None),
-    ("candidates", "resume_fit_reason", "TEXT", None),
-    ("candidates", "resume_metadata", "TEXT", None),
+    ("candidates", "fit_score_reasoning", "TEXT", None),
+    ("candidates", "fit_score_details", "TEXT", None),
+    ("candidates", "resume_metadata_id", "INTEGER", None),
     ("candidates", "interview_date", "TIMESTAMP", None),
     ("candidates", "interview_link", "VARCHAR(500)", None),
     ("candidates", "interview_status", "VARCHAR(30)", "'New'"),
@@ -27,7 +28,7 @@ REQUIRED_COLUMNS = [
     ("candidates", "joining_flexibility", "VARCHAR(20)", "'anytime'"),
     ("candidates", "allow_candidate_reschedule", "BOOLEAN", "FALSE"),
     # Migration: f6g7h8i9j0k1_add_selected_hired_status
-    ("candidates", "video_duration", "FLOAT", None),
+    ("candidates", "video_duration", "VARCHAR(50)", None),
     # Migration: h8i9j0k1l2m3_add_annual_package
     ("resume_metadata", "annual_package", "FLOAT", None),
     # Migration: i9j0k1l2m3n4_add_allow_joining_early

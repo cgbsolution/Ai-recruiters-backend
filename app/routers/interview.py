@@ -252,9 +252,9 @@ def verify_access(
     )
     # Common scheduling fields for all "granted" responses
     sched_fields = dict(
-        interview_date=candidate.interview_date,
-        interview_timezone=candidate.interview_timezone,
-        joining_flexibility=candidate.joining_flexibility,
+        interview_date=getattr(candidate, "interview_date", None),
+        interview_timezone=getattr(candidate, "interview_timezone", None),
+        joining_flexibility=getattr(candidate, "joining_flexibility", "anytime"),
         allow_joining_early=getattr(candidate, "allow_joining_early", False),
     )
 

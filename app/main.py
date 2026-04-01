@@ -92,6 +92,7 @@ _raw_migrations = [
         "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS conciseness_score FLOAT",
         "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS clarity_score FLOAT",
         # organizations — feature flags
+        "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS allow_resume_database BOOLEAN DEFAULT FALSE",
         "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS allow_code_editor BOOLEAN DEFAULT FALSE",
         "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS allow_whatsapp BOOLEAN DEFAULT FALSE",
         # interview_screenshots table
