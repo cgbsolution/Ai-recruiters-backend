@@ -211,11 +211,13 @@ def get_me(user: User = Depends(get_current_user), db: Session = Depends(get_db)
     org_name = None
     allow_code_editor = False
     allow_whatsapp = False
+    allow_fit_score = False
     if user.organization_id:
         org = db.query(Organization).filter(Organization.id == user.organization_id).first()
         org_name = org.name if org else None
         allow_code_editor = getattr(org, "allow_code_editor", False) if org else False
         allow_whatsapp = getattr(org, "allow_whatsapp", False) if org else False
+        allow_fit_score = getattr(org, "allow_fit_score", False) if org else False
 
     return {
         "id": user.id,
@@ -230,6 +232,7 @@ def get_me(user: User = Depends(get_current_user), db: Session = Depends(get_db)
         "organization_name": org_name,
         "allow_code_editor": allow_code_editor,
         "allow_whatsapp": allow_whatsapp,
+        "allow_fit_score": allow_fit_score,
         "google_connected": bool(getattr(user, "google_refresh_token", None)),
         "google_email": getattr(user, "google_email", None),
         "created_at": user.created_at,

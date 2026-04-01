@@ -23,6 +23,7 @@ class Organization(Base):
     allow_resume_database = Column(Boolean, default=False, nullable=False, server_default="false")
     allow_code_editor = Column(Boolean, default=False, nullable=False, server_default="false")
     allow_whatsapp = Column(Boolean, default=False, nullable=False, server_default="false")
+    allow_fit_score = Column(Boolean, default=False, nullable=False, server_default="false")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

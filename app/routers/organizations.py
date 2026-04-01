@@ -36,6 +36,7 @@ class OrgCreateRequest(BaseModel):
     allow_resume_database: bool = False
     allow_code_editor: bool = False
     allow_whatsapp: bool = False
+    allow_fit_score: bool = False
 
 
 class OrgUpdateRequest(BaseModel):
@@ -47,6 +48,7 @@ class OrgUpdateRequest(BaseModel):
     allow_resume_database: bool | None = None
     allow_code_editor: bool | None = None
     allow_whatsapp: bool | None = None
+    allow_fit_score: bool | None = None
 
 
 class OrgOut(BaseModel):
@@ -114,6 +116,7 @@ def list_organizations(
             "allow_resume_database": o.allow_resume_database,
             "allow_code_editor": o.allow_code_editor,
             "allow_whatsapp": o.allow_whatsapp,
+            "allow_fit_score": o.allow_fit_score,
             "created_at": o.created_at,
             "updated_at": o.updated_at,
             "user_count": user_counts.get(o.id, 0),
@@ -224,6 +227,7 @@ def create_organization(body: OrgCreateRequest, db: Session = Depends(get_db)):
         allow_resume_database=body.allow_resume_database,
         allow_code_editor=body.allow_code_editor,
         allow_whatsapp=body.allow_whatsapp,
+        allow_fit_score=body.allow_fit_score,
     )
     db.add(org)
     db.commit()
@@ -284,6 +288,8 @@ def update_organization(
         org.allow_code_editor = body.allow_code_editor
     if body.allow_whatsapp is not None:
         org.allow_whatsapp = body.allow_whatsapp
+    if body.allow_fit_score is not None:
+        org.allow_fit_score = body.allow_fit_score
 
     org.updated_at = datetime.utcnow()
     db.commit()
