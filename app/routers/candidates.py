@@ -310,21 +310,11 @@ async def _compute_fit_score_with_fallback(
     candidate: Candidate, db: Session, job_id: int, resume_text: str | None = None
 ):
     """
-    Compute fit score using AI semantic scoring (accurate, with full reasoning).
-    Falls back to smart scoring only if AI fails.
+    Instant smart scoring + background AI scoring.
+    Smart score saves immediately. AI score overwrites when ready.
+    Frontend polls parsing-status to detect when AI score arrives.
     """
-    # Try AI scoring first — produces full reasoning, verdict, strength mapping
-    try:
-        logger.info("Running AI fit score for candidate %s against job %s", candidate.id, job_id)
-        score_data = await _ai_fit_score_for_candidate(candidate, db, resume_text=resume_text)
-        if score_data:
-            logger.info("AI fit score for candidate %s: %s%% (%s)",
-                        candidate.id, score_data.get("fit_percentage"), score_data.get("fit_level"))
-            return
-    except Exception as ai_exc:
-        logger.warning("AI scoring failed for candidate %s, falling back to smart scoring: %s", candidate.id, ai_exc)
-
-    # Fallback: smart scoring (instant, keyword-based, less detailed)
+    # Phase 1: Smart scoring — instant (<50ms)
     try:
         from app.services.smart_scoring_service import compute_fit_score_for_candidate as smart_score
         result = smart_score(db, candidate.id, job_id)
@@ -337,9 +327,35 @@ async def _compute_fit_score_with_fallback(
             })
             db.commit()
             db.refresh(candidate)
-            logger.info("Smart scoring fallback for candidate %s: %s%% (%s)", candidate.id, result.fit_percentage, result.fit_level)
-    except Exception as smart_exc:
-        logger.warning("Smart scoring also failed for candidate %s: %s", candidate.id, smart_exc)
+            logger.info("Smart scoring for candidate %s: %s%% (%s)", candidate.id, result.fit_percentage, result.fit_level)
+    except Exception as e:
+        logger.warning("Smart scoring failed for candidate %s: %s", candidate.id, e)
+
+    # Phase 2: AI scoring in background — overwrites smart score when done
+    _cid = candidate.id
+    _jid = job_id
+    _rtxt = resume_text
+
+    async def _bg():
+        from app.database import SessionLocal as _SL
+        _db = _SL()
+        try:
+            _c = _db.query(Candidate).filter(Candidate.id == _cid).first()
+            if _c:
+                result = await _ai_fit_score_for_candidate(_c, _db, resume_text=_rtxt)
+                if result:
+                    logger.info("AI score for candidate %s: %s%% — updated", _cid, result.get("fit_percentage"))
+        except Exception as exc:
+            logger.warning("AI background score failed for candidate %s: %s", _cid, exc)
+        finally:
+            _db.close()
+
+    try:
+        task = asyncio.ensure_future(_bg())
+        _background_tasks.append(task)
+        task.add_done_callback(lambda t: _background_tasks.remove(t) if t in _background_tasks else None)
+    except Exception:
+        pass
 
 
 _background_tasks: list[asyncio.Task] = []  # prevent GC of fire-and-forget tasks
@@ -777,26 +793,30 @@ async def upload_resumes(
             return_exceptions=True,
         )
 
+    # Save IDs and paths BEFORE expire_all (avoids ObjectDeletedError)
+    candidate_refs = [(c.id, c.resume_path) for c in created_candidates]
+
     # Re-fetch candidates to return final parsed state
-    # Some placeholders may have been deleted during dedup (merged into existing),
-    # so also look up by the resume file path to find the surviving candidate.
-    db.expire_all()  # clear stale cache from the outer session
+    db.expire_all()
     result = []
-    seen_ids = set()
-    for c in created_candidates:
-        refreshed = db.query(Candidate).filter(Candidate.id == c.id).first()
-        if refreshed and refreshed.id not in seen_ids:
-            result.append(refreshed)
-            seen_ids.add(refreshed.id)
-        elif c.resume_path:
-            # Placeholder was deleted (dedup) — find the surviving candidate by resume path
-            surviving = db.query(Candidate).filter(
-                Candidate.resume_path == c.resume_path,
-                Candidate.job_id == job_id,
-            ).first()
-            if surviving and surviving.id not in seen_ids:
-                result.append(surviving)
-                seen_ids.add(surviving.id)
+    seen_ids: set[int] = set()
+    for cid, cpath in candidate_refs:
+        try:
+            refreshed = db.query(Candidate).filter(Candidate.id == cid).first()
+            if refreshed and refreshed.id not in seen_ids:
+                result.append(refreshed)
+                seen_ids.add(refreshed.id)
+            elif cpath:
+                # Placeholder was deleted (dedup) — find surviving candidate
+                surviving = db.query(Candidate).filter(
+                    Candidate.resume_path == cpath,
+                    Candidate.job_id == job_id,
+                ).first()
+                if surviving and surviving.id not in seen_ids:
+                    result.append(surviving)
+                    seen_ids.add(surviving.id)
+        except Exception:
+            pass  # candidate was deleted during parse — skip
 
     return result
 
