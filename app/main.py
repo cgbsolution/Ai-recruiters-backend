@@ -19,7 +19,7 @@ logging.basicConfig(
 # Keep app-level loggers at INFO so our own messages still appear
 logging.getLogger("app").setLevel(logging.INFO)
 from app.database import Base, engine
-from app.routers import ai, auth, candidates, credits, file_manager, interview, jobs, organizations, questions, resume_database, secondary_cam, uploads
+from app.routers import ai, auth, candidates, credits, file_manager, interview, jobs, organizations, questions, resume_database, secondary_cam, tts, uploads
 
 import app.models  # noqa: F401 — ensure all models are registered with Base
 
@@ -343,6 +343,7 @@ app.include_router(credits.router, prefix="/credits", tags=["AI Credits"])
 app.include_router(organizations.router, prefix="/organizations", tags=["Organizations"])
 app.include_router(file_manager.router, prefix="/file-manager", tags=["File Manager"])
 app.include_router(secondary_cam.router, tags=["Secondary Camera"])
+app.include_router(tts.router, tags=["Text-to-Speech"])
 
 
 @app.get("/health", tags=["Health"])

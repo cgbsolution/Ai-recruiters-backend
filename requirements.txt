@@ -44,3 +44,4 @@ opencv-python-headless>=4.8.0
 
 # ── Timezone data (required for zoneinfo on slim Docker images) ─────────────
 tzdata>=2024.1
+edge-tts>=7.0.0
