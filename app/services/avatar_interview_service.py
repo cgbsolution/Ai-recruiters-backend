@@ -400,7 +400,7 @@ async def conduct_turn(
                 session_id=session.id,
                 role="ai",
                 content=closing,
-                question_index=session.current_question_index,
+                question_index=None,  # closing message is NOT a question
             )
             db.add(closing_msg)
             session.status = SessionStatus.completed
@@ -429,7 +429,7 @@ async def conduct_turn(
             session_id=session.id,
             role="ai",
             content=closing,
-            question_index=session.current_question_index,
+            question_index=None,  # closing message is NOT a question
         )
         db.add(closing_msg)
         session.status = SessionStatus.completed
@@ -686,10 +686,28 @@ async def generate_evaluation(session: InterviewSession, db: Session) -> Evaluat
         .all()
     )
 
-    transcript = "\n".join([
-        f"[{'AI' if m.role == 'ai' else 'CANDIDATE'}]: {m.content}"
-        for m in messages
-    ])
+    # Build structured transcript with clear Q&A pairs
+    # Group messages by question_index for accurate per-question evaluation
+    from collections import OrderedDict
+    qa_groups: OrderedDict[int, dict] = OrderedDict()
+    for m in messages:
+        if m.question_index is None:
+            continue  # skip closing/greeting messages
+        qi = m.question_index
+        if qi not in qa_groups:
+            qa_groups[qi] = {"questions": [], "answers": []}
+        if m.role == "ai":
+            qa_groups[qi]["questions"].append(m.content)
+        else:
+            qa_groups[qi]["answers"].append(m.content)
+
+    transcript_parts = []
+    for qi, qa in qa_groups.items():
+        q_text = " ".join(qa["questions"])
+        a_text = " ".join(qa["answers"]) if qa["answers"] else "[No answer provided — skipped]"
+        transcript_parts.append(f"--- Question {qi} ---\n[AI INTERVIEWER]: {q_text}\n[CANDIDATE]: {a_text}")
+
+    transcript = "\n\n".join(transcript_parts)
 
     skills = ", ".join([s.skill for s in job.skills]) if job and job.skills else "general"
 
@@ -772,7 +790,7 @@ Then provide:
 - strengths: List of 3-5 specific strengths observed
 - weaknesses: List of 2-4 specific areas for improvement
 - detailed_feedback: 1-2 paragraphs of detailed assessment including how the scoring mode influenced the evaluation
-- per_question_evaluations: For EACH question in the transcript, provide an individual evaluation with score (0-100), list of positives, and list of negatives. CRITICAL: evaluate each question in COMPLETE ISOLATION — the positives and negatives for question N must be based ONLY on the candidate's answer to question N. Do NOT carry over strengths or weaknesses from other questions. Each question's evaluation must stand alone.
+- per_question_evaluations: The transcript has {len(qa_groups)} questions (numbered as "--- Question N ---"). You MUST evaluate ALL {len(qa_groups)} questions — do NOT skip any. For EACH question, provide: index (the question number), score (0-100), list of positives, and list of negatives. Evaluate each question in COMPLETE ISOLATION — do NOT carry over strengths or weaknesses from other questions.
 - skills_ratings: Rate the candidate on 3 key skill areas relevant to the position. For each skill provide: skill name, rating (1-5 stars), and a short evaluation paragraph
 
 Return ONLY valid JSON:
