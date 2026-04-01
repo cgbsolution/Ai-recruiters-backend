@@ -631,11 +631,13 @@ async def conduct_turn(
     if not message_text:
         message_text = "Thank you. Let's continue."
 
+    # If this is the closing message (is_complete=true), save with question_index=None
+    # so it doesn't appear as a scored question in the evaluation
     db.add(InterviewMessage(
         session_id=session.id,
         role="ai",
         content=message_text,
-        question_index=question_index,
+        question_index=None if is_complete else question_index,
     ))
 
     session.current_question_index = question_index
@@ -694,7 +696,7 @@ async def generate_evaluation(session: InterviewSession, db: Session) -> Evaluat
     qa_groups: OrderedDict[int, dict] = OrderedDict()
     for m in messages:
         if m.question_index is None:
-            continue  # skip closing/greeting messages
+            continue  # skip closing messages
         qi = m.question_index
         if qi not in qa_groups:
             qa_groups[qi] = {"questions": [], "answers": []}
@@ -703,11 +705,18 @@ async def generate_evaluation(session: InterviewSession, db: Session) -> Evaluat
         else:
             qa_groups[qi]["answers"].append(m.content)
 
+    # Build transcript — question_index=0 is intro (not evaluated), real questions start at 1
     transcript_parts = []
+    eval_question_count = 0
     for qi, qa in qa_groups.items():
         q_text = " ".join(qa["questions"])
         a_text = " ".join(qa["answers"]) if qa["answers"] else "[No answer provided — skipped]"
-        transcript_parts.append(f"--- Question {qi} ---\n[AI INTERVIEWER]: {q_text}\n[CANDIDATE]: {a_text}")
+        if qi == 0:
+            # Intro exchange — include for context but mark as non-evaluated
+            transcript_parts.append(f"--- Introduction (not scored) ---\n[AI INTERVIEWER]: {q_text}\n[CANDIDATE]: {a_text}")
+        else:
+            eval_question_count += 1
+            transcript_parts.append(f"--- Question {qi} ---\n[AI INTERVIEWER]: {q_text}\n[CANDIDATE]: {a_text}")
 
     transcript = "\n\n".join(transcript_parts)
 
@@ -792,7 +801,7 @@ Then provide:
 - strengths: List of 3-5 specific strengths observed
 - weaknesses: List of 2-4 specific areas for improvement
 - detailed_feedback: 1-2 paragraphs of detailed assessment including how the scoring mode influenced the evaluation
-- per_question_evaluations: The transcript has {len(qa_groups)} questions (numbered as "--- Question N ---"). You MUST evaluate ALL {len(qa_groups)} questions — do NOT skip any. For EACH question, provide: index (the question number), score (0-100), list of positives, and list of negatives. Evaluate each question in COMPLETE ISOLATION — do NOT carry over strengths or weaknesses from other questions.
+- per_question_evaluations: The transcript has {eval_question_count} scored questions (numbered as "--- Question N ---"). Do NOT evaluate the Introduction — it is not scored. You MUST evaluate ALL {eval_question_count} questions — do NOT skip any. For EACH question, provide: index (the question number matching "--- Question N ---"), score (0-100), list of positives, and list of negatives. Evaluate each question in COMPLETE ISOLATION.
 - skills_ratings: Rate the candidate on 3 key skill areas relevant to the position. For each skill provide: skill name, rating (1-5 stars), and a short evaluation paragraph
 
 Return ONLY valid JSON:
