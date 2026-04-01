@@ -1411,8 +1411,6 @@ async def upload_recording(
     duration: str = Form(default=""),
     db: Session = Depends(get_db),
 ):
-    MAX_RECORDING_SIZE = 200 * 1024 * 1024  # 200 MB
-
     session = _get_session_or_404(session_id, db)
 
     _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
@@ -1426,16 +1424,10 @@ async def upload_recording(
     try:
         total_size = 0
         with open(file_path, "wb") as f:
-            while chunk := await file.read(8192):
+            while chunk := await file.read(65536):  # 64KB chunks for faster streaming
                 total_size += len(chunk)
-                if total_size > MAX_RECORDING_SIZE:
-                    f.close()
-                    os.remove(file_path)
-                    raise HTTPException(status_code=413, detail="Recording too large (max 200 MB)")
                 f.write(chunk)
-        logging.info(f"[Recording] Saved {total_size} bytes for session {session_id} at {file_path}")
-    except HTTPException:
-        raise
+        logging.info(f"[Recording] Saved {total_size / (1024*1024):.1f} MB for session {session_id}")
     except Exception as e:
         logging.error(f"[Recording] FAILED to save for session {session_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to save recording: {str(e)}")
