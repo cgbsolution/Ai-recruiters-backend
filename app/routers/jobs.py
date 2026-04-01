@@ -830,7 +830,7 @@ async def add_matched_candidates(
             role=meta.current_designation or "",
             resume_path=meta.resume_file_path,
             job_id=job_id,
-            interview_status="New",
+            interview_status="Added from Database",
             candidate_stage="Candidates",
             resume_metadata_id=meta.id,
             parsing_status="completed",
