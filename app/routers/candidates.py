@@ -310,11 +310,26 @@ async def _compute_fit_score_with_fallback(
     candidate: Candidate, db: Session, job_id: int, resume_text: str | None = None
 ):
     """
-    Instant smart scoring + background AI scoring.
-    Smart score saves immediately. AI score overwrites when ready.
-    Frontend polls parsing-status to detect when AI score arrives.
+    Run AI scoring directly (awaited). Falls back to smart scoring if AI fails.
+    This runs inside _parse_one which is already concurrent, so the upload
+    endpoint shows "Parsing..." while this completes (~30-40s per candidate).
     """
-    # Phase 1: Smart scoring — instant (<50ms)
+    # Try AI scoring — produces accurate score with reasoning
+    try:
+        score_data = await asyncio.wait_for(
+            _ai_fit_score_for_candidate(candidate, db, resume_text=resume_text),
+            timeout=90,
+        )
+        if score_data:
+            logger.info("AI fit score for candidate %s: %s%% (%s)",
+                        candidate.id, score_data.get("fit_percentage"), score_data.get("fit_level"))
+            return
+    except asyncio.TimeoutError:
+        logger.warning("AI scoring timed out for candidate %s", candidate.id)
+    except Exception as e:
+        logger.warning("AI scoring failed for candidate %s: %s", candidate.id, e)
+
+    # Fallback: smart scoring (instant)
     try:
         from app.services.smart_scoring_service import compute_fit_score_for_candidate as smart_score
         result = smart_score(db, candidate.id, job_id)
@@ -327,35 +342,9 @@ async def _compute_fit_score_with_fallback(
             })
             db.commit()
             db.refresh(candidate)
-            logger.info("Smart scoring for candidate %s: %s%% (%s)", candidate.id, result.fit_percentage, result.fit_level)
+            logger.info("Smart scoring fallback for candidate %s: %s%%", candidate.id, result.fit_percentage)
     except Exception as e:
-        logger.warning("Smart scoring failed for candidate %s: %s", candidate.id, e)
-
-    # Phase 2: AI scoring in background — overwrites smart score when done
-    _cid = candidate.id
-    _jid = job_id
-    _rtxt = resume_text
-
-    async def _bg():
-        from app.database import SessionLocal as _SL
-        _db = _SL()
-        try:
-            _c = _db.query(Candidate).filter(Candidate.id == _cid).first()
-            if _c:
-                result = await _ai_fit_score_for_candidate(_c, _db, resume_text=_rtxt)
-                if result:
-                    logger.info("AI score for candidate %s: %s%% — updated", _cid, result.get("fit_percentage"))
-        except Exception as exc:
-            logger.warning("AI background score failed for candidate %s: %s", _cid, exc)
-        finally:
-            _db.close()
-
-    try:
-        task = asyncio.ensure_future(_bg())
-        _background_tasks.append(task)
-        task.add_done_callback(lambda t: _background_tasks.remove(t) if t in _background_tasks else None)
-    except Exception:
-        pass
+        logger.warning("Smart scoring also failed for candidate %s: %s", candidate.id, e)
 
 
 _background_tasks: list[asyncio.Task] = []  # prevent GC of fire-and-forget tasks
