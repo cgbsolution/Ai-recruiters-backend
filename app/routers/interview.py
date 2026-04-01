@@ -1159,7 +1159,7 @@ async def _run_evaluation_background(session_id: int):
     ),
     tags=["Interview"],
 )
-@limiter.limit("3/minute")
+@limiter.limit("10/minute")
 async def complete_interview(
     session_id: int,
     request: Request,
@@ -1403,7 +1403,7 @@ def schedule_meeting(
     description="Stores the candidate's interview video recording and updates the candidate record with the link and duration.",
     tags=["Interview"],
 )
-@limiter.limit("3/minute")
+@limiter.limit("10/minute")
 async def upload_recording(
     session_id: int,
     request: Request,
@@ -1411,7 +1411,7 @@ async def upload_recording(
     duration: str = Form(default=""),
     db: Session = Depends(get_db),
 ):
-    MAX_RECORDING_SIZE = 100 * 1024 * 1024  # 100 MB
+    MAX_RECORDING_SIZE = 200 * 1024 * 1024  # 200 MB
 
     session = _get_session_or_404(session_id, db)
 
@@ -1423,15 +1423,22 @@ async def upload_recording(
         ext = "." + file.filename.rsplit(".", 1)[-1]
     file_path = f"{_upload_root}/recordings/{session_id}{ext}"
 
-    total_size = 0
-    with open(file_path, "wb") as f:
-        while chunk := await file.read(8192):
-            total_size += len(chunk)
-            if total_size > MAX_RECORDING_SIZE:
-                f.close()
-                os.remove(file_path)
-                raise HTTPException(status_code=413, detail="Recording too large (max 100 MB)")
-            f.write(chunk)
+    try:
+        total_size = 0
+        with open(file_path, "wb") as f:
+            while chunk := await file.read(8192):
+                total_size += len(chunk)
+                if total_size > MAX_RECORDING_SIZE:
+                    f.close()
+                    os.remove(file_path)
+                    raise HTTPException(status_code=413, detail="Recording too large (max 200 MB)")
+                f.write(chunk)
+        logging.info(f"[Recording] Saved {total_size} bytes for session {session_id} at {file_path}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"[Recording] FAILED to save for session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save recording: {str(e)}")
 
     recording_link = f"/uploads/recordings/{session_id}{ext}"
 

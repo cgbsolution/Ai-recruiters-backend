@@ -310,7 +310,16 @@ app.add_middleware(
 @app.middleware("http")
 async def add_cors_on_error(request: Request, call_next):
     origin = request.headers.get("origin", "")
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        # Unhandled exception — return 500 WITH CORS headers
+        logging.error(f"UNHANDLED {request.method} {request.url}: {exc}", exc_info=True)
+        from starlette.responses import JSONResponse
+        response = JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error"},
+        )
     if origin:
         if "*" in _cors_origins:
             response.headers["Access-Control-Allow-Origin"] = "*"
