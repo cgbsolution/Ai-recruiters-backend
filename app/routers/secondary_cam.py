@@ -46,14 +46,17 @@ def init_pairing(session_id: int, db: Session = Depends(get_db)):
     if not session:
         raise HTTPException(404, "Interview session not found")
 
-    # Check if pairing already exists
+    # Check if pairing already exists — reset to pending so desktop starts fresh
     existing = db.query(SecondaryCamSession).filter(
         SecondaryCamSession.session_id == session_id
     ).first()
     if existing:
+        existing.status = "pending"
+        existing.last_heartbeat = None
+        db.commit()
         return {
             "pairing_code": existing.pairing_code,
-            "status": existing.status,
+            "status": "pending",
         }
 
     pairing_code = uuid.uuid4().hex[:16]
