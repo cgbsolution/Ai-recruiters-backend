@@ -310,14 +310,21 @@ async def _compute_fit_score_with_fallback(
     candidate: Candidate, db: Session, job_id: int, resume_text: str | None = None
 ):
     """
-    Two-phase fit scoring:
-    1. Try AI semantic scoring first (accurate, ~15-20s) — the definitive scorer
-    2. Fall back to smart scoring if AI fails (instant but less accurate)
-
-    AI scoring uses LLM to understand meaning across ALL job types and domains.
-    Smart scoring uses keyword matching — only as a fallback.
+    Compute fit score using AI semantic scoring (accurate, with full reasoning).
+    Falls back to smart scoring only if AI fails.
     """
-    # Phase 1: Smart scoring — instant feedback for UI (<50ms)
+    # Try AI scoring first — produces full reasoning, verdict, strength mapping
+    try:
+        logger.info("Running AI fit score for candidate %s against job %s", candidate.id, job_id)
+        score_data = await _ai_fit_score_for_candidate(candidate, db, resume_text=resume_text)
+        if score_data:
+            logger.info("AI fit score for candidate %s: %s%% (%s)",
+                        candidate.id, score_data.get("fit_percentage"), score_data.get("fit_level"))
+            return
+    except Exception as ai_exc:
+        logger.warning("AI scoring failed for candidate %s, falling back to smart scoring: %s", candidate.id, ai_exc)
+
+    # Fallback: smart scoring (instant, keyword-based, less detailed)
     try:
         from app.services.smart_scoring_service import compute_fit_score_for_candidate as smart_score
         result = smart_score(db, candidate.id, job_id)
@@ -330,38 +337,9 @@ async def _compute_fit_score_with_fallback(
             })
             db.commit()
             db.refresh(candidate)
-            logger.info("Smart scoring for candidate %s: %s%% (%s)", candidate.id, result.fit_percentage, result.fit_level)
+            logger.info("Smart scoring fallback for candidate %s: %s%% (%s)", candidate.id, result.fit_percentage, result.fit_level)
     except Exception as smart_exc:
-        logger.warning("Smart scoring failed for candidate %s: %s", candidate.id, smart_exc)
-
-    # Phase 2: AI semantic scoring in background — overwrites smart score with accurate result
-    # Runs as fire-and-forget task so it doesn't block upload response
-    _candidate_id = candidate.id
-    _job_id = job_id
-    _resume_text = resume_text
-
-    async def _bg_ai_score():
-        from app.database import SessionLocal as _SL
-        _db = _SL()
-        try:
-            _cand = _db.query(Candidate).filter(Candidate.id == _candidate_id).first()
-            if not _cand:
-                return
-            score_data = await _ai_fit_score_for_candidate(_cand, _db, resume_text=_resume_text)
-            if score_data:
-                logger.info("AI background score for candidate %s: %s%% (%s)",
-                            _candidate_id, score_data.get("fit_percentage"), score_data.get("fit_level"))
-        except Exception as exc:
-            logger.warning("AI background scoring failed for candidate %s: %s", _candidate_id, exc)
-        finally:
-            _db.close()
-
-    try:
-        task = asyncio.ensure_future(_bg_ai_score())
-        _background_tasks.append(task)
-        task.add_done_callback(lambda t: _background_tasks.remove(t) if t in _background_tasks else None)
-    except Exception:
-        pass  # best-effort background scoring
+        logger.warning("Smart scoring also failed for candidate %s: %s", candidate.id, smart_exc)
 
 
 _background_tasks: list[asyncio.Task] = []  # prevent GC of fire-and-forget tasks
