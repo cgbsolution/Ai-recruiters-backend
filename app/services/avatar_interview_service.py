@@ -233,10 +233,12 @@ H. QUESTION COUNTING (CRITICAL FOR ALL MODES):
    - Turn 3: question_index=2, ask Q2
    - Turn 4: question_index=3, ask Q3
    - ...
-   - Turn 8: question_index=7, ask Q7 (the FINAL question)
+   - Turn 8: question_index=7, ask Q7 — ANNOUNCE: "This is your last question."
    - Turn 9: question_index=7 (no change), set is_complete=true with closing message
 
-I. If candidate asks "how many questions left" — tell them exactly: "You have {max_q} - [current_index] + 1 questions remaining."
+I. LAST QUESTION ANNOUNCEMENT: When asking the FINAL question (question_index={max_q}), START with "Alright, this is your last question." or "One final question for you." BEFORE asking the question. This gives the candidate a heads-up.
+
+J. If candidate asks "how many questions left" — tell them exactly: "You have {max_q} - [current_index] + 1 questions remaining."
 
 ═══════════════════════════════════════════════════════════════
 CODING QUESTIONS
