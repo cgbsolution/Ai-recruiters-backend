@@ -1448,11 +1448,16 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User 
                 qa_map[qi]["question"] = _extract_question(msg.content)
             elif msg.role == "candidate" and qa_map[qi]["answer"] is None:
                 qa_map[qi]["answer"] = msg.content
-        transcript = [
-            {**v, "answer": v["answer"] or "[No answer provided — skipped]"}
-            for _, v in sorted(qa_map.items())
-            if v["question"]
-        ]
+        # Build transcript with SEQUENTIAL indices (1,2,3...) to match
+        # the per_question_evaluations from the AI evaluator
+        sorted_pairs = [v for _, v in sorted(qa_map.items()) if v["question"]]
+        transcript = []
+        for seq_idx, pair in enumerate(sorted_pairs, start=1):
+            transcript.append({
+                "question": pair["question"],
+                "answer": pair["answer"] or "[No answer provided — skipped]",
+                "index": seq_idx,  # sequential, matches evaluation indices
+            })
 
         # ── Violations for this session ───────────────────────────────────────
         violations = (
@@ -1764,9 +1769,9 @@ def download_evaluation_pdf(candidate_id: int, db: Session = Depends(get_db), us
             pdf.set_font("Helvetica", "B", 13)
             pdf.cell(0, 8, "Interview Transcript", new_x="LMARGIN", new_y="NEXT")
             pdf.ln(3)
-            for pair in transcript_pairs:
+            for seq_idx, pair in enumerate(transcript_pairs, start=1):
                 pdf.set_font("Helvetica", "B", 10)
-                pdf.multi_cell(0, 5, f"Q{pair['index']}: {pair['question']}")
+                pdf.multi_cell(0, 5, f"Q{seq_idx}: {pair['question']}")
                 pdf.set_font("Helvetica", "", 10)
                 pdf.multi_cell(0, 5, f"A: {pair['answer']}")
                 pdf.ln(3)
@@ -1911,9 +1916,9 @@ def download_evaluation_docx(candidate_id: int, db: Session = Depends(get_db), u
         if transcript_pairs:
             doc.add_page_break()
             doc.add_heading("Interview Transcript", level=2)
-            for pair in transcript_pairs:
+            for seq_idx, pair in enumerate(transcript_pairs, start=1):
                 p = doc.add_paragraph()
-                run = p.add_run(f"Q{pair['index']}: {pair['question']}")
+                run = p.add_run(f"Q{seq_idx}: {pair['question']}")
                 run.bold = True
                 doc.add_paragraph(f"A: {pair['answer']}")
                 doc.add_paragraph("")  # spacer

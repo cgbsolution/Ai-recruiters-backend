@@ -61,6 +61,7 @@ def _build_system_prompt(job: Job, candidate: Candidate, settings_obj: Optional[
     special = settings_obj.special_instructions if settings_obj and settings_obj.special_instructions else "None"
 
     resume_based = settings_obj.resume_based if settings_obj else True
+    code_editor_enabled = settings_obj.code_editor_required if settings_obj else False
 
     predefined, ai_count, max_q, q_mode = _build_question_plan(job, settings_obj)
 
@@ -243,8 +244,12 @@ J. If candidate asks "how many questions left" — tell them exactly: "You have 
 ═══════════════════════════════════════════════════════════════
 CODING QUESTIONS
 ═══════════════════════════════════════════════════════════════
-
-For technical roles, include 1-2 coding questions (around question_index 3-5).
+{"" if code_editor_enabled else """CODE EDITOR IS DISABLED for this interview.
+- Do NOT ask any practical coding questions that require writing code.
+- Do NOT include a "coding_question" object in your response — always set it to null.
+- Keep all questions verbal/conceptual: ask about concepts, approaches, design patterns, debugging strategies, etc.
+- You may ask the candidate to EXPLAIN how they would write code or describe an algorithm, but NEVER ask them to actually write or type code."""}
+{"" if not code_editor_enabled else """For technical roles, include 1-2 coding questions (around question_index 3-5).
 Include a "coding_question" object in your JSON response.
 Spoken message MUST be EXACTLY: "Please click on the top-left button to start the coding test."
 Do NOT read the problem title, description, or any part of the coding question aloud — the candidate will see it in the code editor.
@@ -257,7 +262,7 @@ coding_question format:
   "test_cases": [{{"input": "...", "expected_output": "...", "description": "..."}}],
   "time_limit": 15,
   "difficulty": "medium"
-}}
+}}"""}
 
 ═══════════════════════════════════════════════════════════════
 RESPONSE FORMAT — STRICT RULES
@@ -706,17 +711,21 @@ async def generate_evaluation(session: InterviewSession, db: Session) -> Evaluat
             qa_groups[qi]["answers"].append(m.content)
 
     # Build transcript — question_index=0 is intro (not evaluated), real questions start at 1
+    # IMPORTANT: Use sequential numbering (1,2,3...) instead of raw question_index
+    # to prevent evaluation index mismatches when AI skips indices
     transcript_parts = []
     eval_question_count = 0
+    # Map from sequential number → original question_index (for DB cross-reference)
+    seq_to_original: dict[int, int] = {}
     for qi, qa in qa_groups.items():
         q_text = " ".join(qa["questions"])
         a_text = " ".join(qa["answers"]) if qa["answers"] else "[No answer provided — skipped]"
         if qi == 0:
-            # Intro exchange — include for context but mark as non-evaluated
             transcript_parts.append(f"--- Introduction (not scored) ---\n[AI INTERVIEWER]: {q_text}\n[CANDIDATE]: {a_text}")
         else:
             eval_question_count += 1
-            transcript_parts.append(f"--- Question {qi} ---\n[AI INTERVIEWER]: {q_text}\n[CANDIDATE]: {a_text}")
+            seq_to_original[eval_question_count] = qi
+            transcript_parts.append(f"--- Question {eval_question_count} ---\n[AI INTERVIEWER]: {q_text}\n[CANDIDATE]: {a_text}")
 
     transcript = "\n\n".join(transcript_parts)
 
@@ -801,7 +810,7 @@ Then provide:
 - strengths: List of 3-5 specific strengths observed
 - weaknesses: List of 2-4 specific areas for improvement
 - detailed_feedback: 1-2 paragraphs of detailed assessment including how the scoring mode influenced the evaluation
-- per_question_evaluations: The transcript has {eval_question_count} scored questions (numbered as "--- Question N ---"). Do NOT evaluate the Introduction — it is not scored. You MUST evaluate ALL {eval_question_count} questions — do NOT skip any. For EACH question, provide: index (the question number matching "--- Question N ---"), score (0-100), list of positives, and list of negatives. Evaluate each question in COMPLETE ISOLATION.
+- per_question_evaluations: The transcript has EXACTLY {eval_question_count} scored questions numbered sequentially as "--- Question 1 ---" through "--- Question {eval_question_count} ---". Do NOT evaluate the Introduction — it is not scored. You MUST return EXACTLY {eval_question_count} evaluations, one for each question. The "index" field MUST be the sequential number: 1, 2, 3, ..., {eval_question_count}. For EACH: index (integer 1-{eval_question_count}), score (0-100), list of positives, list of negatives. Evaluate each question in COMPLETE ISOLATION.
 - skills_ratings: Rate the candidate on 3 key skill areas relevant to the position. For each skill provide: skill name, rating (1-5 stars), and a short evaluation paragraph
 
 Return ONLY valid JSON:
