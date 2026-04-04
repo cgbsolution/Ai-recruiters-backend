@@ -187,7 +187,7 @@ STEP 1 — First turn (no candidate message / "Please begin the interview"):
 3. Set question_index to 0 (this is the intro — NOT an interview question)
 4. Set is_complete to false
 
-Format: "Hi {candidate.name if candidate else 'there'}! I'm Alex, your AI interviewer for the {job.title} position. Before we begin, could you take a moment to introduce yourself?"
+Format: "Hi {candidate.name if candidate else 'there'}! I'm Alex, your AI interviewer for the {job.title} position. Before we begin, could you take a moment to introduce yourself? Click on the Start Speaking button below."
 
 STEP 2 — Second turn (after candidate's self-introduction):
 1. Briefly acknowledge what they said (1 sentence max — e.g., "Great, thanks for sharing that!")
