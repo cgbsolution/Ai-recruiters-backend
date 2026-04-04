@@ -1082,8 +1082,8 @@ async def schedule_interview(
     if payload.interview_url:
         candidate.interview_link = payload.interview_url
 
-    # Update token expiry if set
-    if payload.link_expiry and candidate.job_id:
+    # Update token expiry based on recruiter's choice.
+    if candidate.job_id:
         from app.models.interview import InterviewToken
         from datetime import timedelta
         token_row = (
@@ -1092,10 +1092,22 @@ async def schedule_interview(
             .first()
         )
         if token_row:
-            if payload.link_expiry.unit == "hours":
-                token_row.expires_at = datetime.utcnow() + timedelta(hours=payload.link_expiry.value)
+            if payload.link_expiry:
+                # Recruiter chose "Expires after X hours/days"
+                if payload.link_expiry.unit == "hours":
+                    new_expiry = datetime.utcnow() + timedelta(hours=payload.link_expiry.value)
+                else:
+                    new_expiry = datetime.utcnow() + timedelta(days=payload.link_expiry.value)
+                # Ensure token lives at least 24h past the scheduled interview
+                if payload.interview_date:
+                    min_expiry = payload.interview_date + timedelta(hours=24)
+                    if new_expiry < min_expiry:
+                        new_expiry = min_expiry
+                token_row.expires_at = new_expiry
             else:
-                token_row.expires_at = datetime.utcnow() + timedelta(days=payload.link_expiry.value)
+                # Recruiter chose "No expiry (link stays active)" —
+                # CLEAR any existing expires_at so the link never expires
+                token_row.expires_at = None
 
     template_data = {
         "subject": payload.email_subject,

@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile, status
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -82,15 +82,50 @@ VIOLATION_TERMINATE_THRESHOLD = 5
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get_token_or_404(token: str, db: Session) -> InterviewToken:
+    from datetime import timedelta
+
     obj = db.query(InterviewToken).filter(
         InterviewToken.token == token,
         InterviewToken.is_active == True,
     ).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Interview link not found or no longer active")
+
     # Check if token has expired
     if obj.expires_at and obj.expires_at < datetime.utcnow():
-        raise HTTPException(status_code=410, detail="This interview link has expired")
+        # Before rejecting, check if any candidate for this job still has a
+        # "Scheduled" status (meaning they haven't taken the interview yet).
+        # This covers:
+        #   - Future interviews (scheduled for later today or tomorrow)
+        #   - Interviews scheduled for "right now" (within the last few hours)
+        #   - Candidates who were scheduled but haven't started yet
+        # We give a generous 24-hour grace window past the scheduled time.
+        has_pending_candidate = (
+            db.query(Candidate)
+            .filter(
+                Candidate.job_id == obj.job_id,
+                Candidate.interview_status == "Scheduled",
+            )
+            .first()
+        )
+        if has_pending_candidate:
+            # Extend token to cover all scheduled interviews + 24h buffer
+            latest_scheduled = (
+                db.query(func.max(Candidate.interview_date))
+                .filter(
+                    Candidate.job_id == obj.job_id,
+                    Candidate.interview_status == "Scheduled",
+                    Candidate.interview_date != None,
+                )
+                .scalar()
+            )
+            new_expiry = datetime.utcnow() + timedelta(hours=24)
+            if latest_scheduled:
+                new_expiry = max(new_expiry, latest_scheduled + timedelta(hours=24))
+            obj.expires_at = new_expiry
+            db.commit()
+        else:
+            raise HTTPException(status_code=410, detail="This interview link has expired")
     return obj
 
 
