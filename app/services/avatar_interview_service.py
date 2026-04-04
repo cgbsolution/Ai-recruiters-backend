@@ -576,8 +576,23 @@ async def conduct_turn(
     message_text = result.get("message", "Thank you for your time.")
     is_complete = result.get("is_complete", False)
     is_off_topic = result.get("is_off_topic", False)
-    question_index = result.get("question_index", session.current_question_index + 1)
+    raw_question_index = result.get("question_index", session.current_question_index + 1)
     coding_question = result.get("coding_question")
+
+    # ── Validate question_index — the AI model sometimes returns the same
+    # index for multiple different questions, causing them to collapse in
+    # evaluation. Force forward progress when a candidate message was received
+    # (meaning a new question should follow).
+    current_qi = session.current_question_index or 0
+    if candidate_message is not None and not is_complete:
+        if raw_question_index is not None and raw_question_index <= current_qi:
+            logger.warning(
+                f"[conduct_turn] AI returned question_index={raw_question_index} "
+                f"<= current={current_qi} for session {session.id}. "
+                f"Force-incrementing to {current_qi + 1}."
+            )
+            raw_question_index = current_qi + 1
+    question_index = raw_question_index if raw_question_index is not None else current_qi + 1
 
     # Sanitize: strip any embedded JSON / code blocks from the spoken message
     # This prevents the AI from leaking raw JSON structure into the chat

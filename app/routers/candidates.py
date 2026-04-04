@@ -1412,15 +1412,15 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User 
                 "timestamp": (msg.created_at.isoformat() + "Z") if msg.created_at else None,
             })
 
-        # Group by question_index into Q&A pairs
-        qa_map: dict = {}
+        # Build Q&A pairs from CHRONOLOGICAL message order.
+        # We cannot trust question_index from the AI model — it sometimes
+        # returns the same index for multiple different questions, collapsing
+        # them into one entry. Instead, pair each AI message (after the
+        # intro) with the next candidate message in sequence.
 
         def _extract_question(text: str) -> str:
             """Strip conversational preamble to isolate the actual question."""
             import re as _re
-            # Common AI transition patterns before the question
-            # e.g., "Great, thanks! So let's get started. Can you explain..."
-            # Split on patterns like "Let's get started.", "Moving on,", "Next question —"
             separators = [
                 r"(?:So |Now )?[Ll]et(?:'s| us) (?:get started|begin|move on|dive in)[.!]?\s*",
                 r"(?:Great|Good|Thanks|Thank you|Interesting|That's (?:great|good|fair|interesting))[^.?!]*[.!]\s*",
@@ -1429,34 +1429,84 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User 
                 r"Let me ask you[.:\s—–-]+",
                 r"Here's (?:the next|another|my next) question[.:\s—–-]+",
             ]
-            # Try each separator — take the part AFTER the last preamble match
             best = text
             for sep in separators:
                 parts = _re.split(sep, text, maxsplit=1)
                 if len(parts) > 1 and len(parts[-1].strip()) > 20:
                     best = parts[-1].strip()
-                    text = best  # chain — strip multiple preambles
+                    text = best
             return best
 
+        def _is_closing_message(text: str) -> bool:
+            """Detect AI closing messages that are not real questions."""
+            lower = text.lower()
+            closing_phrases = [
+                "that concludes our interview",
+                "concludes our interview",
+                "thank you for your time",
+                "we'll be in touch",
+                "we will be in touch",
+                "interview is now complete",
+            ]
+            return any(p in lower for p in closing_phrases) and "?" not in text
+
+        # Step 1: Build pairs from chronological order
+        # Skip the first AI message (intro, qi=0) and any closing messages
+        pairs: list = []
+        current_ai_msg = None
+        is_first_ai = True
+        is_first_candidate = True
+
         for msg in messages:
-            qi = msg.question_index or 0
-            if qi == 0:
-                continue  # skip opening/closing system turns without index
-            if qi not in qa_map:
-                qa_map[qi] = {"question": None, "answer": None, "index": qi}
-            if msg.role == "ai" and qa_map[qi]["question"] is None:
-                qa_map[qi]["question"] = _extract_question(msg.content)
-            elif msg.role == "candidate" and qa_map[qi]["answer"] is None:
-                qa_map[qi]["answer"] = msg.content
-        # Build transcript with SEQUENTIAL indices (1,2,3...) to match
-        # the per_question_evaluations from the AI evaluator
-        sorted_pairs = [v for _, v in sorted(qa_map.items()) if v["question"]]
+            if msg.role == "ai":
+                if is_first_ai:
+                    is_first_ai = False
+                    # First AI message is the intro — skip it
+                    continue
+                if _is_closing_message(msg.content):
+                    continue
+                # This is a new question from AI
+                # If there's a pending AI question without a candidate answer,
+                # save it as unanswered
+                if current_ai_msg is not None:
+                    pairs.append({"question": current_ai_msg, "answer": None})
+                current_ai_msg = _extract_question(msg.content)
+            elif msg.role == "candidate":
+                if is_first_candidate:
+                    is_first_candidate = False
+                    # First candidate message is self-intro — skip it
+                    continue
+                if current_ai_msg is not None:
+                    pairs.append({"question": current_ai_msg, "answer": msg.content})
+                    current_ai_msg = None
+                # else: candidate message without a preceding AI question — ignore
+
+        # Don't forget the last pending AI question
+        if current_ai_msg is not None:
+            pairs.append({"question": current_ai_msg, "answer": None})
+
+        # Step 2: Fallback to question_index grouping if chronological
+        # pairing produced fewer results (e.g., edge cases)
+        if not pairs:
+            qa_map: dict = {}
+            for msg in messages:
+                qi = msg.question_index
+                if qi is None or qi == 0:
+                    continue
+                if qi not in qa_map:
+                    qa_map[qi] = {"question": None, "answer": None}
+                if msg.role == "ai" and qa_map[qi]["question"] is None:
+                    qa_map[qi]["question"] = _extract_question(msg.content)
+                elif msg.role == "candidate" and qa_map[qi]["answer"] is None:
+                    qa_map[qi]["answer"] = msg.content
+            pairs = [v for _, v in sorted(qa_map.items()) if v["question"]]
+
         transcript = []
-        for seq_idx, pair in enumerate(sorted_pairs, start=1):
+        for seq_idx, pair in enumerate(pairs, start=1):
             transcript.append({
                 "question": pair["question"],
                 "answer": pair["answer"] or "[No answer provided — skipped]",
-                "index": seq_idx,  # sequential, matches evaluation indices
+                "index": seq_idx,
             })
 
         # ── Violations for this session ───────────────────────────────────────
@@ -1670,6 +1720,26 @@ def download_evaluation_pdf(candidate_id: int, db: Session = Depends(get_db), us
     pdf.cell(0, 12, "Interview Evaluation Report", new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.ln(5)
 
+    # Candidate Photo + Info (side by side)
+    photo_rendered = False
+    if candidate.image:
+        _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+        _upload_root = "/tmp/uploads" if _is_serverless else "uploads"
+        # candidate.image is like "/uploads/photos/123.jpg"
+        photo_path = candidate.image.lstrip("/")
+        if _is_serverless:
+            photo_path = photo_path.replace("uploads/", f"{_upload_root}/", 1)
+        if os.path.isfile(photo_path):
+            try:
+                # Place photo on the right, text on the left
+                x_before = pdf.get_x()
+                y_before = pdf.get_y()
+                pdf.image(photo_path, x=155, y=y_before, w=35, h=43)
+                pdf.set_xy(x_before, y_before)
+                photo_rendered = True
+            except Exception:
+                pass
+
     # Candidate Info
     pdf.set_font("Helvetica", "B", 14)
     pdf.cell(0, 8, candidate.name or "Unknown", new_x="LMARGIN", new_y="NEXT")
@@ -1743,7 +1813,8 @@ def download_evaluation_pdf(candidate_id: int, db: Session = Depends(get_db), us
             pdf.set_font("Helvetica", "", 10)
             pdf.multi_cell(0, 5, ev.detailed_feedback)
 
-    # Transcript
+    # Transcript — use chronological message order (not question_index which
+    # the AI model does not reliably increment, causing questions to collapse)
     if latest_session:
         messages = (
             db.query(InterviewMessage)
@@ -1751,29 +1822,48 @@ def download_evaluation_pdf(candidate_id: int, db: Session = Depends(get_db), us
             .order_by(InterviewMessage.created_at)
             .all()
         )
-        qa_map: dict = {}
-        for msg in messages:
-            qi = msg.question_index or 0
-            if qi == 0:
-                continue
-            if qi not in qa_map:
-                qa_map[qi] = {"question": None, "answer": None, "index": qi}
-            if msg.role == "ai" and qa_map[qi]["question"] is None:
-                qa_map[qi]["question"] = msg.content
-            elif msg.role == "candidate" and qa_map[qi]["answer"] is None:
-                qa_map[qi]["answer"] = msg.content
-        transcript_pairs = [v for _, v in sorted(qa_map.items()) if v["question"] and v["answer"]]
 
-        if transcript_pairs:
+        def _is_closing(text: str) -> bool:
+            lower = text.lower()
+            phrases = ["that concludes our interview", "concludes our interview",
+                       "thank you for your time", "we'll be in touch", "we will be in touch"]
+            return any(p in lower for p in phrases) and "?" not in text
+
+        pdf_pairs: list = []
+        current_q = None
+        is_first_ai = True
+        is_first_candidate = True
+        for msg in messages:
+            if msg.role == "ai":
+                if is_first_ai:
+                    is_first_ai = False
+                    continue
+                if _is_closing(msg.content):
+                    continue
+                if current_q is not None:
+                    pdf_pairs.append({"question": current_q, "answer": None})
+                current_q = msg.content
+            elif msg.role == "candidate":
+                if is_first_candidate:
+                    is_first_candidate = False
+                    continue
+                if current_q is not None:
+                    pdf_pairs.append({"question": current_q, "answer": msg.content})
+                    current_q = None
+        if current_q is not None:
+            pdf_pairs.append({"question": current_q, "answer": None})
+
+        if pdf_pairs:
             pdf.add_page()
             pdf.set_font("Helvetica", "B", 13)
             pdf.cell(0, 8, "Interview Transcript", new_x="LMARGIN", new_y="NEXT")
             pdf.ln(3)
-            for seq_idx, pair in enumerate(transcript_pairs, start=1):
+            for seq_idx, pair in enumerate(pdf_pairs, start=1):
                 pdf.set_font("Helvetica", "B", 10)
                 pdf.multi_cell(0, 5, f"Q{seq_idx}: {pair['question']}")
                 pdf.set_font("Helvetica", "", 10)
-                pdf.multi_cell(0, 5, f"A: {pair['answer']}")
+                answer_text = pair['answer'] or "[No answer provided - skipped]"
+                pdf.multi_cell(0, 5, f"A: {answer_text}")
                 pdf.ln(3)
 
     buf = BytesIO()
@@ -1892,7 +1982,7 @@ def download_evaluation_docx(candidate_id: int, db: Session = Depends(get_db), u
             doc.add_heading("Detailed Feedback", level=3)
             doc.add_paragraph(ev.detailed_feedback)
 
-    # Transcript
+    # Transcript — chronological pairing (same approach as PDF and evaluation API)
     if latest_session:
         messages = (
             db.query(InterviewMessage)
@@ -1900,27 +1990,46 @@ def download_evaluation_docx(candidate_id: int, db: Session = Depends(get_db), u
             .order_by(InterviewMessage.created_at)
             .all()
         )
-        qa_map: dict = {}
-        for msg in messages:
-            qi = msg.question_index or 0
-            if qi == 0:
-                continue
-            if qi not in qa_map:
-                qa_map[qi] = {"question": None, "answer": None, "index": qi}
-            if msg.role == "ai" and qa_map[qi]["question"] is None:
-                qa_map[qi]["question"] = msg.content
-            elif msg.role == "candidate" and qa_map[qi]["answer"] is None:
-                qa_map[qi]["answer"] = msg.content
-        transcript_pairs = [v for _, v in sorted(qa_map.items()) if v["question"] and v["answer"]]
 
-        if transcript_pairs:
+        def _is_closing_docx(text: str) -> bool:
+            lower = text.lower()
+            phrases = ["that concludes our interview", "concludes our interview",
+                       "thank you for your time", "we'll be in touch", "we will be in touch"]
+            return any(p in lower for p in phrases) and "?" not in text
+
+        docx_pairs: list = []
+        current_q = None
+        is_first_ai = True
+        is_first_candidate = True
+        for msg in messages:
+            if msg.role == "ai":
+                if is_first_ai:
+                    is_first_ai = False
+                    continue
+                if _is_closing_docx(msg.content):
+                    continue
+                if current_q is not None:
+                    docx_pairs.append({"question": current_q, "answer": None})
+                current_q = msg.content
+            elif msg.role == "candidate":
+                if is_first_candidate:
+                    is_first_candidate = False
+                    continue
+                if current_q is not None:
+                    docx_pairs.append({"question": current_q, "answer": msg.content})
+                    current_q = None
+        if current_q is not None:
+            docx_pairs.append({"question": current_q, "answer": None})
+
+        if docx_pairs:
             doc.add_page_break()
             doc.add_heading("Interview Transcript", level=2)
-            for seq_idx, pair in enumerate(transcript_pairs, start=1):
+            for seq_idx, pair in enumerate(docx_pairs, start=1):
                 p = doc.add_paragraph()
                 run = p.add_run(f"Q{seq_idx}: {pair['question']}")
                 run.bold = True
-                doc.add_paragraph(f"A: {pair['answer']}")
+                answer_text = pair['answer'] or "[No answer provided - skipped]"
+                doc.add_paragraph(f"A: {answer_text}")
                 doc.add_paragraph("")  # spacer
 
     buf = BytesIO()
