@@ -35,6 +35,9 @@ class JobConfig(BaseModel):
     special_instructions: Optional[str]
     auto_skip_timeout: int
     skills: List[str]
+    organization_name: Optional[str] = None
+    manager_name: Optional[str] = None
+    manager_email: Optional[str] = None
 
 
 # ── Registration ──────────────────────────────────────────────────────────────

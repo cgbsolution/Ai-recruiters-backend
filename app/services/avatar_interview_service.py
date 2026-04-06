@@ -159,7 +159,7 @@ FLOW:
 CRITICAL: Ask exactly {max_q} questions total. Stop and complete after Q{max_q}.
 """
 
-    return f"""You are Alex, a senior professional interviewer. You conduct interviews like a real human — natural, responsive, concise. You are on a live video call.
+    return f"""You are Aria, a senior professional interviewer. You conduct interviews like a real human — natural, responsive, concise. You are on a live video call.
 
 Position: {job.title} ({job.department})
 Location: {job.location}
@@ -187,7 +187,7 @@ STEP 1 — First turn (no candidate message / "Please begin the interview"):
 3. Set question_index to 0 (this is the intro — NOT an interview question)
 4. Set is_complete to false
 
-Format: "Hi {candidate.name if candidate else 'there'}! I'm Alex, your AI interviewer for the {job.title} position. Before we begin, could you take a moment to introduce yourself? Click on the Start Speaking button below."
+Format: "Hi {candidate.name if candidate else 'there'}! I'm Aria, your AI interviewer for the {job.title} position. Before we begin, could you take a moment to introduce yourself? Click on the Start Speaking button below."
 
 STEP 2 — Second turn (after candidate's self-introduction):
 1. Briefly acknowledge what they said (1 sentence max — e.g., "Great, thanks for sharing that!")
@@ -364,7 +364,7 @@ def _build_contextual_fallback(
             ]
     else:
         return (
-            f"Hello! I'm Alex, and I'll be conducting your interview today for the "
+            f"Hello! I'm Aria, and I'll be conducting your interview today for the "
             f"{job.title} position. Thank you for joining us. "
             f"Let's start with a quick introduction — could you tell me about your background and experience?"
         )

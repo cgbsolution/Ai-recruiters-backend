@@ -82,3 +82,16 @@ class Candidate(Base):
     __table_args__ = (
         UniqueConstraint('email', 'job_id', name='uq_candidate_email_job'),
     )
+
+
+class EmailLog(Base):
+    """Tracks every email sent to a candidate."""
+    __tablename__ = "email_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    candidate_id = Column(Integer, ForeignKey("candidates.id"), nullable=False, index=True)
+    subject = Column(String(500), nullable=False)
+    triggered_by = Column(String(100), nullable=True, default="SYSTEM")  # "SYSTEM" | user email
+    trigger_event = Column(String(100), nullable=True)  # "schedule" | "reschedule" | "cancel" | "candidate-end" | "drop" | "complete"
+    sent_at = Column(DateTime, default=datetime.utcnow)
+    status = Column(String(20), nullable=True, default="sent")  # "sent" | "failed"

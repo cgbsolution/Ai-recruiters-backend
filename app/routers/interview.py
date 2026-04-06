@@ -181,6 +181,9 @@ def get_interview_config(token: str, db: Session = Depends(get_db)):
         special_instructions=settings_obj.special_instructions if settings_obj else None,
         auto_skip_timeout=settings_obj.auto_skip_timeout if settings_obj else 0,
         skills=skills,
+        organization_name=job.organization.name if job.organization else None,
+        manager_name=job.manager_name,
+        manager_email=job.manager_email,
     )
 
 

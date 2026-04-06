@@ -29,6 +29,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _log_email(db: "Session", candidate_id: int, subject: str, trigger_event: str, triggered_by: str = "SYSTEM", status: str = "sent"):
+    """Record an email in the email_logs table."""
+    try:
+        from app.models.candidate import EmailLog
+        log = EmailLog(
+            candidate_id=candidate_id,
+            subject=subject,
+            triggered_by=triggered_by,
+            trigger_event=trigger_event,
+            status=status,
+        )
+        db.add(log)
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Failed to log email for candidate {candidate_id}: {e}")
+
+
 # ── Email ─────────────────────────────────────────────────────────────────────
 
 _TZ_LABELS = {
@@ -357,7 +374,10 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
     msg.attach(MIMEText(html_body, "html"))
 
     recipients = [candidate.email] + cc_emails
-    return await asyncio.to_thread(_send_email_sync, msg, recipients)
+    success = await asyncio.to_thread(_send_email_sync, msg, recipients)
+    trigger = "reschedule" if is_reschedule else "schedule"
+    _log_email(db, candidate.id, subject, trigger, status="sent" if success else "failed")
+    return success
 
 
 async def send_cancel_email(candidate, db: "Session") -> bool:
@@ -402,7 +422,9 @@ async def send_cancel_email(candidate, db: "Session") -> bool:
     msg["To"] = candidate.email
     msg.attach(MIMEText(html_body, "html"))
 
-    return await asyncio.to_thread(_send_email_sync, msg, [candidate.email])
+    success = await asyncio.to_thread(_send_email_sync, msg, [candidate.email])
+    _log_email(db, candidate.id, subject, "cancel", status="sent" if success else "failed")
+    return success
 
 
 # ── WhatsApp Business Cloud API ───────────────────────────────────────────────

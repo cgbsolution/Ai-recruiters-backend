@@ -2129,3 +2129,37 @@ def _build_whatsapp_message(candidate: Candidate, job_title: str, org_name: str 
         f"Please ensure you're ready.\n\n"
         f"Interview Link: {link}"
     )
+
+
+# ── Email Contact History ────────────────────────────────────────────────────
+
+@router.get(
+    "/candidates/{candidate_id}/email-history",
+    summary="Get email contact history for a candidate",
+    tags=["Candidates"],
+)
+def get_email_history(candidate_id: int, db: Session = Depends(get_db)):
+    from app.models.candidate import EmailLog
+    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    logs = (
+        db.query(EmailLog)
+        .filter(EmailLog.candidate_id == candidate_id)
+        .order_by(EmailLog.sent_at.desc())
+        .all()
+    )
+    return {
+        "candidate_name": candidate.name,
+        "emails": [
+            {
+                "id": log.id,
+                "subject": log.subject,
+                "triggered_by": log.triggered_by,
+                "trigger_event": log.trigger_event,
+                "sent_at": log.sent_at.isoformat() if log.sent_at else None,
+                "status": log.status,
+            }
+            for log in logs
+        ],
+    }
