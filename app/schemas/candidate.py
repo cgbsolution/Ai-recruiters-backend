@@ -120,6 +120,8 @@ class CandidateRead(BaseModel):
     video_duration: Optional[str] = None
     # Contact
     mail_contact_history: Optional[bool] = None
+    # Added by
+    added_by: Optional[str] = None
     # Resume metadata
     resume_metadata_id: Optional[int] = None
     parsing_status: Optional[str] = None

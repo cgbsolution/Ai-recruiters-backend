@@ -76,6 +76,9 @@ class Candidate(Base):
     # ── Contact History ──────────────────────────────────────────────────────
     mail_contact_history = Column(Boolean, nullable=True, default=False)
 
+    # ── Added By (email of the user who added this candidate) ────────────
+    added_by = Column(String(255), nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

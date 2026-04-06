@@ -435,6 +435,9 @@ def create_candidate(payload: CandidateCreate, db: Session = Depends(get_db), us
     if payload.job_id:
         _check_and_increment_candidate_quota(db, payload.job_id)
     candidate = candidate_service.create_candidate(db, payload)
+    candidate.added_by = user.email
+    db.commit()
+    db.refresh(candidate)
 
     # Auto-compute fit score if candidate is linked to a job
     if candidate.job_id:
@@ -758,6 +761,7 @@ async def upload_resumes(
             interview_status="New",
             candidate_stage="Candidates",
             parsing_status="pending",
+            added_by=user.email,
         )
         db.add(candidate)
         db.commit()
