@@ -30,9 +30,9 @@ logger = logging.getLogger(__name__)
 
 
 def _log_email(db: "Session", candidate_id: int, subject: str, trigger_event: str, triggered_by: str = "SYSTEM", status: str = "sent"):
-    """Record an email in the email_logs table."""
+    """Record an email in the email_logs table and set mail_contact_history flag."""
     try:
-        from app.models.candidate import EmailLog
+        from app.models.candidate import EmailLog, Candidate
         log = EmailLog(
             candidate_id=candidate_id,
             subject=subject,
@@ -41,9 +41,17 @@ def _log_email(db: "Session", candidate_id: int, subject: str, trigger_event: st
             status=status,
         )
         db.add(log)
+        # Mark the candidate as having email contact history
+        candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+        if candidate:
+            candidate.mail_contact_history = True
         db.commit()
     except Exception as e:
         logger.warning(f"Failed to log email for candidate {candidate_id}: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 # ── Email ─────────────────────────────────────────────────────────────────────

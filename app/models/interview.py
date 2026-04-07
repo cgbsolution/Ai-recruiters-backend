@@ -64,6 +64,7 @@ class InterviewSession(Base):
     current_question_index = Column(Integer, default=0)
     violation_count = Column(Integer, default=0)
     session_metadata = Column(Text, nullable=True)  # JSON: device info, user agent
+    interview_language = Column(String(20), nullable=True, default="en")  # "en" | "hi" | "ar" | "hinglish"
     created_at = Column(DateTime, default=datetime.utcnow)
 
     token = relationship("InterviewToken", back_populates="sessions")

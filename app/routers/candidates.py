@@ -2138,7 +2138,7 @@ def _build_whatsapp_message(candidate: Candidate, job_title: str, org_name: str 
 # ── Email Contact History ────────────────────────────────────────────────────
 
 @router.get(
-    "/candidates/{candidate_id}/email-history",
+    "/{candidate_id}/email-history",
     summary="Get email contact history for a candidate",
     tags=["Candidates"],
 )

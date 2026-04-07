@@ -55,7 +55,34 @@ def _build_question_plan(job: Job, settings_obj: Optional[InterviewSettings]) ->
         return [], max_q, max_q, "ALL_AI"
 
 
-def _build_system_prompt(job: Job, candidate: Candidate, settings_obj: Optional[InterviewSettings]) -> str:
+LANGUAGE_INSTRUCTIONS = {
+    "en": "",
+    "hi": (
+        "⚠️ CRITICAL LANGUAGE RULE — THIS OVERRIDES EVERYTHING ELSE:\n"
+        "You MUST speak ONLY in Hindi (हिन्दी) using Devanagari script for this ENTIRE interview.\n"
+        "EVERY single message you send — introduction, questions, follow-ups, transitions — MUST be in Hindi.\n"
+        "DO NOT use English at all. Even your very first greeting must be in Hindi.\n"
+        "Example first message: 'नमस्ते! मैं नीरा हूँ, और आज मैं आपका इंटरव्यू लूँगी...'\n\n"
+    ),
+    "ar": (
+        "⚠️ CRITICAL LANGUAGE RULE — THIS OVERRIDES EVERYTHING ELSE:\n"
+        "You MUST speak ONLY in Arabic (العربية) using Arabic script for this ENTIRE interview.\n"
+        "EVERY single message you send — introduction, questions, follow-ups, transitions — MUST be in Arabic.\n"
+        "DO NOT use English at all. Even your very first greeting must be in Arabic.\n"
+        "Example first message: 'مرحبا! أنا نيرا، وسأجري مقابلتك اليوم...'\n\n"
+    ),
+    "hinglish": (
+        "⚠️ CRITICAL LANGUAGE RULE — THIS OVERRIDES EVERYTHING ELSE:\n"
+        "You MUST speak ONLY in Hinglish (Hindi-English mix in Roman/Latin script) for this ENTIRE interview.\n"
+        "EVERY single message you send — introduction, questions, follow-ups, transitions — MUST be in Hinglish.\n"
+        "DO NOT use pure English. Mix Hindi and English naturally using Roman script.\n"
+        "Example first message: 'Hello! Main Nira hoon, aur aaj main aapka interview loongi...'\n"
+        "Example question: 'Aapka React mein kitna experience hai? Koi challenging project batayein.'\n\n"
+    ),
+}
+
+
+def _build_system_prompt(job: Job, candidate: Candidate, settings_obj: Optional[InterviewSettings], language: str = "en") -> str:
     skills = ", ".join([s.skill for s in job.skills]) if job.skills else "general skills"
     mode = settings_obj.mode.value if settings_obj else "TRADITIONAL"
     special = settings_obj.special_instructions if settings_obj and settings_obj.special_instructions else "None"
@@ -159,7 +186,8 @@ FLOW:
 CRITICAL: Ask exactly {max_q} questions total. Stop and complete after Q{max_q}.
 """
 
-    return f"""You are Aria, a senior professional interviewer. You conduct interviews like a real human — natural, responsive, concise. You are on a live video call.
+    lang_instruction = LANGUAGE_INSTRUCTIONS.get(language, "")
+    return f"""{lang_instruction}You are Nira, a senior professional interviewer. You conduct interviews like a real human — natural, responsive, concise. You are on a live video call.
 
 Position: {job.title} ({job.department})
 Location: {job.location}
@@ -187,7 +215,7 @@ STEP 1 — First turn (no candidate message / "Please begin the interview"):
 3. Set question_index to 0 (this is the intro — NOT an interview question)
 4. Set is_complete to false
 
-Format: "Hi {candidate.name if candidate else 'there'}! I'm Aria, your AI interviewer for the {job.title} position. Before we begin, could you take a moment to introduce yourself? Click on the Start Speaking button below."
+Format: "Hi {candidate.name if candidate else 'there'}! I'm Nira, your AI interviewer for the {job.title} position. Before we begin, could you take a moment to introduce yourself? Click on the Start Speaking button below."
 
 STEP 2 — Second turn (after candidate's self-introduction):
 1. Briefly acknowledge what they said (1 sentence max — e.g., "Great, thanks for sharing that!")
@@ -321,6 +349,82 @@ def _count_recent_fallbacks(db: Session, session_id: int, limit: int = 5) -> int
     return count
 
 
+FALLBACK_RESPONSES = {
+    "en": {
+        "intro": "Hello! I'm Nira, and I'll be conducting your interview today for the {title} position. Thank you for joining us. Let's start with a quick introduction — could you tell me about your background and experience?",
+        "short_1": "I didn't quite catch that. Could you elaborate a bit more on your answer?",
+        "short_2": "It seems there may be an audio issue. Could you please speak a bit more clearly and give me a detailed answer?",
+        "follow_ups": [
+            "That's an interesting perspective. Let me ask you something related — can you tell me about your experience with {skills}?",
+            "Thank you for sharing that. Moving on, could you describe a challenging project you've worked on recently?",
+            "I appreciate your answer. Let's explore another area — how do you approach problem-solving when you encounter an unfamiliar technical challenge?",
+            "Good to know. Let me shift to a different topic — can you walk me through your experience with team collaboration and code reviews?",
+            "Thanks for that. Tell me, how do you stay updated with new technologies and best practices in your field?",
+        ],
+        "move_on": [
+            "No worries, let's move on. Can you tell me about your experience with {skills}?",
+            "Let's try a different question. What's a technical challenge you've solved recently that you're proud of?",
+            "Let me ask something else. How do you handle debugging when you encounter a complex issue in production?",
+            "Let's switch topics. Can you describe your ideal development workflow and the tools you use daily?",
+        ],
+    },
+    "hi": {
+        "intro": "नमस्ते! मैं नीरा हूँ, और आज मैं {title} पद के लिए आपका इंटरव्यू ले रही हूँ। जुड़ने के लिए धन्यवाद। चलिए शुरू करते हैं — क्या आप अपने बारे में और अपने अनुभव के बारे में बता सकते हैं?",
+        "short_1": "मैं ठीक से सुन नहीं पाई। क्या आप अपने जवाब को थोड़ा और विस्तार से बता सकते हैं?",
+        "short_2": "लगता है कुछ ऑडियो समस्या है। कृपया थोड़ा स्पष्ट रूप से बोलें और विस्तृत जवाब दें।",
+        "follow_ups": [
+            "बहुत अच्छा। अब मुझे बताइए — {skills} के साथ आपका अनुभव कैसा रहा है?",
+            "धन्यवाद। आगे बढ़ते हैं — क्या आप हाल ही में किसी चुनौतीपूर्ण प्रोजेक्ट के बारे में बता सकते हैं?",
+            "अच्छा जवाब। एक और सवाल — जब आपको कोई अपरिचित तकनीकी समस्या मिलती है तो आप कैसे हल करते हैं?",
+            "समझ गई। अब बताइए — टीम के साथ काम करने और कोड रिव्यू का आपका अनुभव कैसा है?",
+            "धन्यवाद। बताइए, आप नई तकनीकों से कैसे अपडेट रहते हैं?",
+        ],
+        "move_on": [
+            "कोई बात नहीं, आगे बढ़ते हैं। {skills} के बारे में बताइए।",
+            "चलिए दूसरा सवाल पूछते हैं। हाल ही में कोई तकनीकी चुनौती जो आपने हल की हो?",
+            "कुछ और पूछते हैं। प्रोडक्शन में जटिल बग मिलने पर आप कैसे डिबग करते हैं?",
+            "विषय बदलते हैं। अपने आदर्श डेवलपमेंट वर्कफ्लो के बारे में बताइए।",
+        ],
+    },
+    "ar": {
+        "intro": "مرحباً! أنا نيرا، وسأجري مقابلتك اليوم لمنصب {title}. شكراً لانضمامك. لنبدأ بمقدمة سريعة — هل يمكنك إخباري عن خلفيتك وخبرتك؟",
+        "short_1": "لم أسمع ذلك جيداً. هل يمكنك التوضيح أكثر؟",
+        "short_2": "يبدو أن هناك مشكلة في الصوت. يرجى التحدث بوضوح أكثر وإعطاء إجابة مفصلة.",
+        "follow_ups": [
+            "منظور مثير للاهتمام. أخبرني عن خبرتك في {skills}؟",
+            "شكراً لمشاركتك. هل يمكنك وصف مشروع صعب عملت عليه مؤخراً؟",
+            "إجابة جيدة. كيف تتعامل مع حل المشكلات عندما تواجه تحدياً تقنياً غير مألوف؟",
+            "جيد. أخبرني عن تجربتك في العمل الجماعي ومراجعة الكود؟",
+            "شكراً. كيف تبقى محدثاً بأحدث التقنيات وأفضل الممارسات؟",
+        ],
+        "move_on": [
+            "لا بأس، لننتقل. أخبرني عن خبرتك في {skills}.",
+            "لنجرب سؤالاً آخر. ما هو التحدي التقني الذي حللته مؤخراً؟",
+            "سأسأل شيئاً آخر. كيف تتعامل مع الأخطاء المعقدة في الإنتاج؟",
+            "لنغير الموضوع. صف سير عملك المثالي في التطوير.",
+        ],
+    },
+    "hinglish": {
+        "intro": "Hello! Main Nira hoon, aur aaj main {title} position ke liye aapka interview le rahi hoon. Joining ke liye thank you. Chaliye shuru karte hain — apne baare mein aur apne experience ke baare mein bataiye?",
+        "short_1": "Main theek se sun nahi paayi. Kya aap apna answer thoda detail mein bata sakte hain?",
+        "short_2": "Lagta hai kuch audio issue hai. Please thoda clearly bolein aur detailed answer dein.",
+        "follow_ups": [
+            "Bahut accha. Ab mujhe bataiye — {skills} ke saath aapka experience kaisa raha hai?",
+            "Thank you. Aage badhte hain — kya aap recently kisi challenging project ke baare mein bata sakte hain?",
+            "Nice answer. Ek aur question — jab aapko koi unfamiliar technical problem milti hai toh aap kaise solve karte hain?",
+            "Samajh gayi. Ab bataiye — team ke saath kaam karne aur code review ka aapka experience kaisa hai?",
+            "Thanks. Bataiye, aap new technologies se kaise updated rehte hain?",
+        ],
+        "move_on": [
+            "Koi baat nahi, aage badhte hain. {skills} ke baare mein bataiye.",
+            "Chaliye doosra question puchte hain. Recently koi technical challenge jo aapne solve ki ho?",
+            "Kuch aur puchte hain. Production mein complex bug milne par aap kaise debug karte hain?",
+            "Topic change karte hain. Apne ideal development workflow ke baare mein bataiye.",
+        ],
+    },
+}
+
+
 def _build_contextual_fallback(
     candidate_message: Optional[str],
     consecutive_fallbacks: int,
@@ -330,44 +434,23 @@ def _build_contextual_fallback(
 ) -> str:
     """
     Generate a contextual, non-repetitive response when Claude API fails.
-    Uses the candidate's actual message and interview context to produce
-    something intelligent rather than a generic "repeat" request.
+    Language-aware — uses the session's interview_language.
     """
-    last_ai_msg = (
-        db.query(InterviewMessage)
-        .filter(InterviewMessage.session_id == session.id, InterviewMessage.role == "ai")
-        .order_by(InterviewMessage.created_at.desc())
-        .first()
-    )
-    last_question = last_ai_msg.content if last_ai_msg else ""
+    language = getattr(session, "interview_language", "en") or "en"
+    fb = FALLBACK_RESPONSES.get(language, FALLBACK_RESPONSES["en"])
     skills = ", ".join([s.skill for s in job.skills]) if job and job.skills else "the role"
 
     if candidate_message and len(candidate_message.strip()) > 5:
-        contextual_responses = [
-            f"That's an interesting perspective. Let me ask you something related — can you tell me about your experience with {skills}?",
-            f"Thank you for sharing that. Moving on, could you describe a challenging project you've worked on recently?",
-            f"I appreciate your answer. Let's explore another area — how do you approach problem-solving when you encounter an unfamiliar technical challenge?",
-            f"Good to know. Let me shift to a different topic — can you walk me through your experience with team collaboration and code reviews?",
-            f"Thanks for that. Tell me, how do you stay updated with new technologies and best practices in your field?",
-        ]
+        contextual_responses = [r.format(skills=skills, title=job.title) for r in fb["follow_ups"]]
     elif candidate_message and len(candidate_message.strip()) <= 5:
         if consecutive_fallbacks == 0:
-            return "I didn't quite catch that. Could you elaborate a bit more on your answer?"
+            return fb["short_1"]
         elif consecutive_fallbacks == 1:
-            return "It seems there may be an audio issue. Could you please speak a bit more clearly and give me a detailed answer?"
+            return fb["short_2"]
         else:
-            contextual_responses = [
-                f"No worries, let's move on. Can you tell me about your experience with {skills}?",
-                f"Let's try a different question. What's a technical challenge you've solved recently that you're proud of?",
-                f"Let me ask something else. How do you handle debugging when you encounter a complex issue in production?",
-                f"Let's switch topics. Can you describe your ideal development workflow and the tools you use daily?",
-            ]
+            contextual_responses = [r.format(skills=skills, title=job.title) for r in fb["move_on"]]
     else:
-        return (
-            f"Hello! I'm Aria, and I'll be conducting your interview today for the "
-            f"{job.title} position. Thank you for joining us. "
-            f"Let's start with a quick introduction — could you tell me about your background and experience?"
-        )
+        return fb["intro"].format(title=job.title, skills=skills)
 
     idx = consecutive_fallbacks % len(contextual_responses)
     return contextual_responses[idx]
@@ -396,7 +479,15 @@ async def conduct_turn(
             "want to leave", "need to leave",
         ]
         if any(phrase in lower_msg for phrase in end_phrases):
-            closing = f"Thank you for your time{', ' + candidate.name if candidate else ''}. It was great talking with you. We'll be in touch soon!"
+            lang = getattr(session, "interview_language", "en") or "en"
+            name_part = f", {candidate.name}" if candidate else ""
+            _closings = {
+                "en": f"Thank you for your time{name_part}. It was great talking with you. We'll be in touch soon!",
+                "hi": f"आपके समय के लिए धन्यवाद{name_part}। आपसे बात करके अच्छा लगा। हम जल्द ही संपर्क करेंगे!",
+                "ar": f"شكراً لوقتك{name_part}. كان من الرائع التحدث معك. سنتواصل معك قريباً!",
+                "hinglish": f"Aapke time ke liye thank you{name_part}. Aapse baat karke accha laga. Hum jaldi contact karenge!",
+            }
+            closing = _closings.get(lang, _closings["en"])
             db.add(InterviewMessage(
                 session_id=session.id,
                 role="candidate",
@@ -431,7 +522,15 @@ async def conduct_turn(
             content=candidate_message,
             question_index=session.current_question_index,
         ))
-        closing = f"Thank you for your time{', ' + candidate.name if candidate else ''}. That concludes our interview. We'll be in touch soon."
+        lang = getattr(session, "interview_language", "en") or "en"
+        name_part = f", {candidate.name}" if candidate else ""
+        _closings2 = {
+            "en": f"Thank you for your time{name_part}. That concludes our interview. We'll be in touch soon.",
+            "hi": f"आपके समय के लिए धन्यवाद{name_part}। हमारा इंटरव्यू पूरा हुआ। हम जल्द ही संपर्क करेंगे।",
+            "ar": f"شكراً لوقتك{name_part}. هذا يختتم مقابلتنا. سنتواصل معك قريباً.",
+            "hinglish": f"Aapke time ke liye thank you{name_part}. Humara interview complete hua. Hum jaldi contact karenge.",
+        }
+        closing = _closings2.get(lang, _closings2["en"])
         closing_msg = InterviewMessage(
             session_id=session.id,
             role="ai",
@@ -451,7 +550,8 @@ async def conduct_turn(
             "role": "ai",
         }
 
-    system_prompt = _build_system_prompt(job, candidate, interview_settings)
+    language = getattr(session, "interview_language", "en") or "en"
+    system_prompt = _build_system_prompt(job, candidate, interview_settings, language)
 
     past_messages = (
         db.query(InterviewMessage)

@@ -111,6 +111,7 @@ _raw_migrations = [
         "CREATE TABLE IF NOT EXISTS secondary_cam_sessions (id SERIAL PRIMARY KEY, session_id INTEGER REFERENCES interview_sessions(id) ON DELETE CASCADE UNIQUE, pairing_code VARCHAR(32) UNIQUE NOT NULL, status VARCHAR(20) DEFAULT 'pending', device_info TEXT, last_heartbeat TIMESTAMP, positioning_snapshot VARCHAR(500), created_at TIMESTAMP DEFAULT NOW(), verified_at TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS secondary_cam_snapshots (id SERIAL PRIMARY KEY, secondary_session_id INTEGER REFERENCES secondary_cam_sessions(id) ON DELETE CASCADE, file_path VARCHAR(500) NOT NULL, captured_at TIMESTAMP DEFAULT NOW())",
         "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS added_by VARCHAR(255)",
+        "ALTER TABLE interview_sessions ADD COLUMN IF NOT EXISTS interview_language VARCHAR(20) DEFAULT 'en'",
         # email logs
         "CREATE TABLE IF NOT EXISTS email_logs (id SERIAL PRIMARY KEY, candidate_id INTEGER REFERENCES candidates(id) ON DELETE CASCADE, subject VARCHAR(500) NOT NULL, triggered_by VARCHAR(100) DEFAULT 'SYSTEM', trigger_event VARCHAR(100), sent_at TIMESTAMP DEFAULT NOW(), status VARCHAR(20) DEFAULT 'sent')",
 ]

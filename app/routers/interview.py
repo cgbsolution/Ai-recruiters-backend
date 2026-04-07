@@ -1062,7 +1062,12 @@ async def interview_message(
     tags=["Interview"],
 )
 @limiter.limit("5/minute")
-async def start_interview(session_id: int, request: Request, db: Session = Depends(get_db)):
+async def start_interview(
+    session_id: int,
+    request: Request,
+    language: str = "en",
+    db: Session = Depends(get_db),
+):
     session = _get_session_or_404(session_id, db)
 
     if session.status not in (SessionStatus.pending, SessionStatus.in_progress):
@@ -1070,6 +1075,7 @@ async def start_interview(session_id: int, request: Request, db: Session = Depen
 
     session.status = SessionStatus.in_progress
     session.started_at = datetime.utcnow()
+    session.interview_language = language
     db.flush()
 
     result = await svc.conduct_turn(session, None, db)
