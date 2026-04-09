@@ -139,6 +139,19 @@ def _get_session_or_404(session_id: int, db: Session) -> InterviewSession:
 
 # ── Public Endpoints ──────────────────────────────────────────────────────────
 
+# Deepgram token — MUST be before /interview/{token} to avoid wildcard match
+@router.get(
+    "/interview/deepgram-token",
+    summary="Get Deepgram API key for STT",
+    tags=["Interview"],
+)
+async def get_deepgram_token():
+    from app.config import settings
+    if not settings.DEEPGRAM_API_KEY:
+        raise HTTPException(status_code=503, detail="Deepgram STT not configured")
+    return {"key": settings.DEEPGRAM_API_KEY}
+
+
 @router.get(
     "/interview/{token}",
     response_model=JobConfig,
@@ -1852,7 +1865,7 @@ WHISPER_LANG_MAP = {
     "en": "en",
     "hi": "hi",
     "ar": "ar",
-    "hinglish": "hi",  # Whisper uses Hindi model for Hinglish
+    "hinglish": "hi",
 }
 
 @router.post(
