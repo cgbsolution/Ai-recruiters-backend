@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 # "advanced" = powerful model for evaluation, scoring
 MODEL_MAP = {
     "anthropic": {
-        "fast": "claude-sonnet-4-6",
-        "advanced": "claude-opus-4-6",
+        "fast": "claude-haiku-4-5",
+        "advanced": "claude-sonnet-4-6",
     },
     "gemini": {
         "fast": "gemini-2.5-flash",
@@ -40,6 +40,7 @@ MODEL_MAP = {
 
 # Approximate cost per 1M tokens (USD) — used for estimated_cost
 COST_PER_1M = {
+    "claude-haiku-4-5":   {"input": 0.25, "output": 1.25},
     "claude-sonnet-4-6":  {"input": 3.0,  "output": 15.0},
     "claude-opus-4-6":    {"input": 15.0, "output": 75.0},
     "gemini-2.5-flash":   {"input": 0.15, "output": 0.60},
@@ -158,12 +159,14 @@ async def _anthropic_ask_with_system(
             )
         except anthropic.APIStatusError as exc:
             if exc.status_code == 529 and attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)
+                wait = min(3, 1 + attempt)  # 1s, 2s, 3s max — don't block server
+                logger.warning(f"[LLM] Anthropic 529 overloaded (attempt {attempt + 1}/{retries}), retry in {wait}s")
+                await asyncio.sleep(wait)
                 continue
             raise
         except anthropic.APITimeoutError:
             if attempt < retries - 1:
-                wait = 5 * (attempt + 1)  # 5s, 10s, ...
+                wait = min(5, 2 * (attempt + 1))  # 2s, 4s, 5s max
                 logger.warning(f"[LLM] Anthropic timeout (attempt {attempt + 1}/{retries}), retrying in {wait}s...")
                 await asyncio.sleep(wait)
                 continue

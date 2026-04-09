@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -1152,43 +1153,49 @@ def log_violation(
 
 
 async def _run_evaluation_background(session_id: int):
-    """Background task: generate evaluation with automatic retry."""
-    MAX_RETRIES = 3
+    """Background task: generate evaluation with automatic retry.
+    Wrapped in asyncio.wait_for to prevent blocking the server indefinitely."""
+    MAX_RETRIES = 2
+    TOTAL_TIMEOUT = 180  # 3 minutes max for entire evaluation process
 
-    for attempt in range(MAX_RETRIES):
-        db = SessionLocal()
-        try:
-            logging.info(f"[Evaluation] Attempt {attempt + 1}/{MAX_RETRIES} for session {session_id}")
-            session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
-            if not session:
-                logging.error(f"[Evaluation] Session {session_id} not found in DB")
+    async def _do_evaluation():
+        for attempt in range(MAX_RETRIES):
+            db = SessionLocal()
+            try:
+                logging.info(f"[Evaluation] Attempt {attempt + 1}/{MAX_RETRIES} for session {session_id}")
+                session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+                if not session:
+                    logging.error(f"[Evaluation] Session {session_id} not found in DB")
+                    return
+                if session.evaluation:
+                    logging.info(f"[Evaluation] Session {session_id} already has evaluation — skipping")
+                    return
+
+                messages_count = db.query(InterviewMessage).filter(InterviewMessage.session_id == session_id).count()
+                if messages_count == 0:
+                    logging.error(f"[Evaluation] Session {session_id} has NO messages — cannot evaluate")
+                    return
+
+                logging.info(f"[Evaluation] Session {session_id} — {messages_count} messages, calling AI...")
+                await svc.generate_evaluation(session, db)
+                logging.info(f"[Evaluation] Session {session_id} — evaluation saved successfully")
                 return
-            if session.evaluation:
-                logging.info(f"[Evaluation] Session {session_id} already has evaluation — skipping")
-                return
 
-            messages_count = db.query(InterviewMessage).filter(InterviewMessage.session_id == session_id).count()
-            if messages_count == 0:
-                logging.error(f"[Evaluation] Session {session_id} has NO messages — cannot evaluate")
-                return
+            except Exception as e:
+                logging.error(
+                    f"[Evaluation] FAILED attempt {attempt + 1} for session {session_id}: {type(e).__name__}: {e}"
+                )
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(3)  # Short retry delay — don't block server
+                else:
+                    logging.error(f"[Evaluation] ALL {MAX_RETRIES} RETRIES FAILED for session {session_id}")
+            finally:
+                db.close()
 
-            logging.info(f"[Evaluation] Session {session_id} — {messages_count} messages, calling AI...")
-            await svc.generate_evaluation(session, db)
-            logging.info(f"[Evaluation] Session {session_id} — evaluation saved successfully")
-            return  # success — exit retry loop
-
-        except Exception as e:
-            logging.error(
-                f"[Evaluation] FAILED attempt {attempt + 1} for session {session_id}: {type(e).__name__}: {e}"
-            )
-            if attempt < MAX_RETRIES - 1:
-                wait_secs = 5 * (attempt + 1)
-                logging.info(f"[Evaluation] Retrying in {wait_secs}s...")
-                await asyncio.sleep(wait_secs)
-            else:
-                logging.error(f"[Evaluation] ALL {MAX_RETRIES} RETRIES FAILED for session {session_id}")
-        finally:
-            db.close()
+    try:
+        await asyncio.wait_for(_do_evaluation(), timeout=TOTAL_TIMEOUT)
+    except asyncio.TimeoutError:
+        logging.error(f"[Evaluation] TOTAL TIMEOUT ({TOTAL_TIMEOUT}s) for session {session_id} — giving up")
 
 
 @router.post(
@@ -1837,6 +1844,67 @@ async def get_languages():
     """Return list of supported languages for the code editor."""
     from app.services.code_execution_service import get_supported_languages
     return {"languages": get_supported_languages()}
+
+
+# ── Whisper STT Transcription ────────────────────────────────────────────────
+
+WHISPER_LANG_MAP = {
+    "en": "en",
+    "hi": "hi",
+    "ar": "ar",
+    "hinglish": "hi",  # Whisper uses Hindi model for Hinglish
+}
+
+@router.post(
+    "/interview/transcribe",
+    summary="Transcribe audio using OpenAI Whisper",
+    tags=["Interview"],
+)
+async def transcribe_audio(
+    audio: UploadFile = File(...),
+    language: str = Form("en"),
+):
+    """
+    Accepts an audio file (webm/wav/mp3) and returns the transcript using OpenAI Whisper.
+    No auth required — used by candidates during interviews.
+    """
+    from app.config import settings
+    import httpx
+
+    if not settings.OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="Whisper STT not configured")
+
+    whisper_lang = WHISPER_LANG_MAP.get(language, "en")
+
+    try:
+        audio_bytes = await audio.read()
+        if len(audio_bytes) < 100:
+            return {"text": "", "error": "Audio too short"}
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {settings.OPENAI_API_KEY}"},
+                data={
+                    "model": "whisper-1",
+                    "language": whisper_lang,
+                    "response_format": "json",
+                },
+                files={"file": (audio.filename or "audio.webm", audio_bytes, audio.content_type or "audio/webm")},
+            )
+
+        if response.status_code != 200:
+            logging.warning(f"[Whisper] API error {response.status_code}: {response.text[:200]}")
+            return {"text": "", "error": f"Whisper API error: {response.status_code}"}
+
+        result = response.json()
+        return {"text": result.get("text", "").strip()}
+
+    except httpx.TimeoutException:
+        return {"text": "", "error": "Whisper API timeout"}
+    except Exception as e:
+        logging.error(f"[Whisper] Transcription failed: {e}")
+        return {"text": "", "error": str(e)}
 
 
 @router.get(

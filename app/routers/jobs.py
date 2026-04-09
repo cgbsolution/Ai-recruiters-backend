@@ -408,6 +408,30 @@ def update_job(job_id: int, payload: JobUpdate, background_tasks: BackgroundTask
     return result.model_copy(update={"interview_token": _get_active_token(db, job_id)})
 
 
+@router.patch(
+    "/{job_id}/status",
+    response_model=JobRead,
+    summary="Change job status only",
+    tags=["Jobs"],
+)
+def change_job_status(
+    job_id: int,
+    new_status: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Change job status without touching other fields. Accepts: Open, Draft, Inactive, Finished."""
+    job = _get_job_with_org_check(db, job_id, user)
+    valid = {"Open", "Draft", "Inactive", "Finished"}
+    if new_status not in valid:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid)}")
+    job.status = new_status
+    db.commit()
+    db.refresh(job)
+    result = JobRead.model_validate(job)
+    return result.model_copy(update={"interview_token": _get_active_token(db, job_id)})
+
+
 @router.delete(
     "/{job_id}",
     status_code=status.HTTP_204_NO_CONTENT,

@@ -19,6 +19,7 @@ class JobStatus(str, enum.Enum):
 class MixOfQuestions(str, enum.Enum):
     mix = "MIX"
     only = "ONLY"
+    ai_only = "AI_ONLY"
 
 
 class InterviewMode(str, enum.Enum):

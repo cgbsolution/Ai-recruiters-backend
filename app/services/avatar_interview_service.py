@@ -82,6 +82,137 @@ LANGUAGE_INSTRUCTIONS = {
 }
 
 
+def _get_mode_instructions(mode: str, skills: str, max_q: int, exp_min: int = 0, exp_max: int = 2, title: str = "") -> str:
+    if mode == "TRADITIONAL":
+        return (
+            "TRADITIONAL MODE: Ask direct questions focused on experience, knowledge, and problem-solving. "
+            "Keep each question short and focused — one clear question at a time."
+        )
+
+    # Determine what to TEST based on experience level
+    if exp_max <= 2:
+        diff_label = "junior-level"
+        exp_focus = (
+            "WHAT TO TEST: Execution with known tools — can they DO X correctly?\n"
+            "- Can they debug a broken layout? Fix a plugin conflict? Set up a basic feature?\n"
+            "- Do NOT test architecture, system design, or leadership decisions.\n"
+            "- Questions should be simple, realistic, and answerable by someone with basic practical experience."
+        )
+        diff_dist = "40% Easy (basic debugging / UI issues), 40% Medium (integration / plugins / workflow), 20% Slightly Advanced (performance / optimization)"
+    elif exp_max <= 5:
+        diff_label = "mid-level"
+        exp_focus = (
+            "WHAT TO TEST: Problem ownership and decision-making.\n"
+            "- Can they own a problem end-to-end? Choose between approaches? Debug complex issues independently?\n"
+            "- Include scenarios where they must decide between two valid approaches and justify the trade-off.\n"
+            "- Questions should assume working knowledge. They should explain WHY, not just WHAT."
+        )
+        diff_dist = "20% Easy (warm-up), 50% Medium (real project scenarios), 30% Hard (multi-skill combined)"
+    else:
+        diff_label = "senior-level"
+        exp_focus = (
+            "WHAT TO TEST: System design, trade-offs, and team leadership.\n"
+            "- Can they design scalable architecture? Make trade-off decisions under constraints? Lead a team through a crisis?\n"
+            "- Include scenarios involving: production incidents, mentoring juniors, cross-team negotiation, technical debt decisions.\n"
+            "- Questions should challenge deep expertise and reveal strategic thinking."
+        )
+        diff_dist = "10% Easy (warm-up), 40% Medium, 50% Hard (architecture, scaling, leadership)"
+
+    return f"""SCENARIO-BASED MODE — CRITICAL INSTRUCTIONS:
+
+You are an expert technical interviewer designing questions for a **{exp_min}–{exp_max} years experience {title} role**.
+Your task is to generate TRUE scenario-based interview questions that reveal real hands-on experience — NOT theoretical or definition-based questions.
+
+════════════════════════════════════════════
+STRICT RULES — WHAT A SCENARIO QUESTION IS:
+════════════════════════════════════════════
+
+A scenario question places the candidate inside a SPECIFIC real-world situation with:
+- A practical problem or task to solve
+- Real constraints (client deadline, broken feature, team conflict, production issue)
+- Context that starts with: "A client calls...", "You are working on...", "Your site just...", "Your team lead asks you to...", "During a code review you notice..."
+
+Each question MUST:
+1. Start with a real-world situation (2-4 lines max)
+2. Describe a practical problem or task
+3. Ask the candidate what they would do step-by-step
+
+════════════════════════════════════════════
+WHAT A SCENARIO QUESTION IS NOT — ABSOLUTELY FORBIDDEN:
+════════════════════════════════════════════
+
+- "What is X?" — definition question. NEVER ASK THIS.
+- "How do you use X?" — procedural question. NEVER ASK THIS.
+- "Have you worked with X?" — yes/no opener. NEVER ASK THIS.
+- "Explain X" — knowledge recall. NEVER ASK THIS.
+- "Describe X" — theory recitation. NEVER ASK THIS.
+- "Can you tell me about X?" — open-ended theory. NEVER ASK THIS.
+
+If you catch yourself starting a question with "Explain", "Describe", "What is", or "How do you" — STOP and rewrite it as a scenario.
+
+════════════════════════════════════════════
+SCENARIO QUESTION FORMULA:
+════════════════════════════════════════════
+
+[Real context with specific situation] + [Constraint or problem] + [Ask for step-by-step action]
+
+EXAMPLES OF BAD VS GOOD:
+
+BAD: "Can you explain what Custom Post Types are and how you register them?"
+GOOD: "A client wants their photography agency site to have 'Photo Projects' separate from blog posts, each with a client name, shoot date, location, and a gallery. Walk me through how you'd set this up in WordPress — what function would you use, and how would you make it available in the REST API?"
+
+BAD: "How do you use Git in your workflow?"
+GOOD: "You pushed a hotfix directly to main at 6pm on Friday. Your colleague calls at 9pm saying the site layout is broken because of your changes. You need to revert just your commit without losing their changes from earlier. What Git commands would you run?"
+
+BAD: "Explain responsive design and plugin conflicts."
+GOOD: "A client tells you their WordPress site layout breaks on mobile after a plugin update. What steps would you take to identify and fix the issue?"
+
+════════════════════════════════════════════
+EXPERIENCE-CALIBRATED FOCUS ({exp_min}–{exp_max} years):
+════════════════════════════════════════════
+
+{exp_focus}
+
+════════════════════════════════════════════
+QUESTION GENERATION RULES:
+════════════════════════════════════════════
+
+1. SKILLS COVERAGE: Cover these mandatory skills — {skills}. Each mandatory skill must appear in at least one scenario.
+
+2. SKILL COMBINATION LIMIT (CRITICAL): NEVER combine more than 2 JD skills in a single question. If a scenario naturally requires 3+ skills, split into a PRIMARY question and a FOLLOW-UP. The follow-up is ONLY asked if the candidate answers the primary correctly. Example:
+   - Primary: Tests CSS + responsive design
+   - Follow-up (only if primary answered well): "Now, what if the client also needs this to work with their existing React component?"
+
+3. CV/RESUME ANCHORING (CRITICAL): At least 2 of your {max_q} questions MUST be anchored to a specific project, company, or technology from the candidate's background. Begin those questions with:
+   - "Looking at [project/company] from your background..."
+   - "You mentioned working on [X] at [company]..."
+   - "I see you have experience with [technology] — imagine you're back in that role and..."
+   This prevents candidates from answering about theoretical experience they don't actually have.
+   If the candidate hasn't shared their background yet (intro question), anchor to skills from the JD instead.
+
+4. DIFFICULTY ({diff_label}): {diff_dist}
+
+5. FOLLOW-UP RULE: Each question should naturally lead to ONE deeper follow-up that drills one level deeper. ONLY ask the follow-up if:
+   - The candidate answered the primary correctly but was vague on specifics, OR
+   - You need to verify depth (they gave a textbook answer — probe for real experience)
+   Do NOT ask the follow-up if the candidate already gave a detailed, specific answer.
+
+6. NO REPETITION: Never ask the same domain/skill twice unless it is critical. Each question should cover a different area of the JD.
+
+7. TONE: Natural, like a real interviewer on a video call. Not robotic. Keep questions concise (2-4 sentences max). Speak like a human, not a quiz master.
+
+8. TOTAL: Generate exactly {max_q} scenario questions across the interview.
+
+════════════════════════════════════════════
+SCORING GUIDANCE (internal — do not share with candidate):
+════════════════════════════════════════════
+
+- Names specific functions, hooks, commands, file names → STRONG answer
+- Describes correct process but vague on specifics → MEDIUM answer
+- Describes wrong process or conflates tools → WEAK answer
+- Skips or says "I don't know" → 0, flag as critical gap in evaluation"""
+
+
 def _build_system_prompt(job: Job, candidate: Candidate, settings_obj: Optional[InterviewSettings], language: str = "en") -> str:
     skills = ", ".join([s.skill for s in job.skills]) if job.skills else "general skills"
     mode = settings_obj.mode.value if settings_obj else "TRADITIONAL"
@@ -203,7 +334,7 @@ Special Instructions: {special}
 INTERVIEW MODE
 ═══════════════════════════════════════════════════════════════
 
-{"TRADITIONAL MODE: Ask direct questions focused on experience, knowledge, and problem-solving. Keep each question short and focused — one clear question at a time." if mode == "TRADITIONAL" else "SCENARIO-BASED MODE: Present real-world scenarios. Each question simulates challenges one might face on the job. Give the candidate time to think through their response."}
+{_get_mode_instructions(mode, skills, max_q, job.experience_min or 0, job.experience_max or 2, job.title)}
 
 ═══════════════════════════════════════════════════════════════
 OPENING (2-STEP INTRO — then interview questions)
@@ -440,7 +571,11 @@ def _build_contextual_fallback(
     fb = FALLBACK_RESPONSES.get(language, FALLBACK_RESPONSES["en"])
     skills = ", ".join([s.skill for s in job.skills]) if job and job.skills else "the role"
 
-    if candidate_message and len(candidate_message.strip()) > 5:
+    is_skip = candidate_message and "[SKIP]" in candidate_message
+    if is_skip:
+        # Skip — always move to a different question from the pool
+        contextual_responses = [r.format(skills=skills, title=job.title) for r in fb["move_on"]]
+    elif candidate_message and len(candidate_message.strip()) > 5:
         contextual_responses = [r.format(skills=skills, title=job.title) for r in fb["follow_ups"]]
     elif candidate_message and len(candidate_message.strip()) <= 5:
         if consecutive_fallbacks == 0:
@@ -452,7 +587,9 @@ def _build_contextual_fallback(
     else:
         return fb["intro"].format(title=job.title, skills=skills)
 
-    idx = consecutive_fallbacks % len(contextual_responses)
+    # Use question_index + fallback count to cycle through responses without repeating
+    q_idx = getattr(session, "current_question_index", 0) or 0
+    idx = (q_idx + consecutive_fallbacks) % len(contextual_responses)
     return contextual_responses[idx]
 
 
@@ -649,11 +786,13 @@ async def conduct_turn(
     # ── All attempts failed — use contextual fallback ──
     if result is None:
         consecutive_fallbacks = _count_recent_fallbacks(db, session.id)
+        is_skip = candidate_message and "[SKIP]" in candidate_message
         fallback_msg = _build_contextual_fallback(
             candidate_message, consecutive_fallbacks, session, job, db
         )
         q_index = session.current_question_index
-        if consecutive_fallbacks >= 2 and candidate_message is not None:
+        # Always advance question on skip, or after 2+ consecutive fallbacks
+        if candidate_message is not None and (is_skip or consecutive_fallbacks >= 2):
             q_index = (session.current_question_index or 0) + 1
             session.current_question_index = q_index
 
