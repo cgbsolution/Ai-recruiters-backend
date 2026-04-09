@@ -344,6 +344,20 @@ UPLOAD_ROOT = "/tmp/uploads" if IS_SERVERLESS else "uploads"
 os.makedirs(f"{UPLOAD_ROOT}/jd", exist_ok=True)
 os.makedirs(f"{UPLOAD_ROOT}/resumes", exist_ok=True)
 os.makedirs(f"{UPLOAD_ROOT}/recordings", exist_ok=True)
+# Serve static uploads with CORS headers (screenshots, recordings, resumes)
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class CORSStaticMiddleware(BaseHTTPMiddleware):
+    """Add CORS headers to /uploads/* responses (StaticFiles doesn't go through CORSMiddleware)."""
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/uploads/"):
+            origin = request.headers.get("origin", "*")
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+        return response
+
+app.add_middleware(CORSStaticMiddleware)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
 
 # ── Routers ──────────────────────────────────────────────────────────────────
