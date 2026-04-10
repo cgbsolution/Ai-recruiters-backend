@@ -267,15 +267,21 @@ def get_stats(db: Session, org_id: Optional[int] = None) -> List[Dict[str, Any]]
 
     # ── Current totals ───────────────────────────────────────────────────
     active_jobs = _job_filter(db.query(func.count(Job.id)).filter(Job.status == JobStatus.open)).scalar() or 0
-    finished_jobs = _job_filter(db.query(func.count(Job.id)).filter(Job.status == JobStatus.inactive)).scalar() or 0
+    # Finished jobs = jobs marked as Finished OR Inactive
+    finished_jobs = _job_filter(db.query(func.count(Job.id)).filter(
+        Job.status.in_([JobStatus.finished, JobStatus.inactive])
+    )).scalar() or 0
+    # Interview Schedule = candidates with interview_status == "Scheduled"
     interview_count = _cand_filter(db.query(func.count(Candidate.id)).filter(
-        Candidate.status == CandidateStatus.interview, Candidate.job_id.isnot(None)
+        Candidate.interview_status == "Scheduled", Candidate.job_id.isnot(None)
     )).scalar() or 0
+    # Hire Rates = candidates with interview_status == "Completed" (interviewed successfully)
     offered_count = _cand_filter(db.query(func.count(Candidate.id)).filter(
-        Candidate.status == CandidateStatus.offered, Candidate.job_id.isnot(None)
+        Candidate.interview_status == "Completed", Candidate.job_id.isnot(None)
     )).scalar() or 0
+    # Waiting Response = candidates added but interview_status is "New" (not yet scheduled)
     waiting_count = _cand_filter(db.query(func.count(Candidate.id)).filter(
-        Candidate.status == CandidateStatus.applied, Candidate.job_id.isnot(None)
+        Candidate.interview_status == "New", Candidate.job_id.isnot(None)
     )).scalar() or 0
 
     # ── Week boundaries ──────────────────────────────────────────────────
@@ -306,13 +312,13 @@ def get_stats(db: Session, org_id: Optional[int] = None) -> List[Dict[str, Any]]
             chart.append({"name": day_names[i], "value": by_date.get(d, 0)})
         return chart
 
-    def _daily_chart_candidate(status):
-        """Count candidates updated to a given status per day this week."""
+    def _daily_chart_candidate(interview_status_val):
+        """Count candidates with given interview_status per day this week."""
         day_col = cast(Candidate.updated_at, Date).label("day")
         q = (
             db.query(day_col, func.count(Candidate.id).label("cnt"))
             .filter(
-                Candidate.status == status,
+                Candidate.interview_status == interview_status_val,
                 Candidate.job_id.isnot(None),
                 Candidate.updated_at >= this_monday,
                 Candidate.updated_at < this_monday + timedelta(days=5),
@@ -334,19 +340,19 @@ def get_stats(db: Session, org_id: Optional[int] = None) -> List[Dict[str, Any]]
         Job.created_at >= last_monday, Job.created_at < last_friday_end,
     )).scalar() or 0
     prev_finished = _job_filter(db.query(func.count(Job.id)).filter(
-        Job.status == JobStatus.inactive,
+        Job.status.in_([JobStatus.finished, JobStatus.inactive]),
         Job.updated_at >= last_monday, Job.updated_at < last_friday_end,
     )).scalar() or 0
     prev_interview = _cand_filter(db.query(func.count(Candidate.id)).filter(
-        Candidate.status == CandidateStatus.interview, Candidate.job_id.isnot(None),
+        Candidate.interview_status == "Scheduled", Candidate.job_id.isnot(None),
         Candidate.updated_at >= last_monday, Candidate.updated_at < last_friday_end,
     )).scalar() or 0
     prev_offered = _cand_filter(db.query(func.count(Candidate.id)).filter(
-        Candidate.status == CandidateStatus.offered, Candidate.job_id.isnot(None),
+        Candidate.interview_status == "Completed", Candidate.job_id.isnot(None),
         Candidate.updated_at >= last_monday, Candidate.updated_at < last_friday_end,
     )).scalar() or 0
     prev_waiting = _cand_filter(db.query(func.count(Candidate.id)).filter(
-        Candidate.status == CandidateStatus.applied, Candidate.job_id.isnot(None),
+        Candidate.interview_status == "New", Candidate.job_id.isnot(None),
         Candidate.updated_at >= last_monday, Candidate.updated_at < last_friday_end,
     )).scalar() or 0
 
@@ -356,19 +362,19 @@ def get_stats(db: Session, org_id: Optional[int] = None) -> List[Dict[str, Any]]
         Job.created_at >= this_monday, Job.created_at < this_monday + timedelta(days=5),
     )).scalar() or 0
     curr_finished = _job_filter(db.query(func.count(Job.id)).filter(
-        Job.status == JobStatus.inactive,
+        Job.status.in_([JobStatus.finished, JobStatus.inactive]),
         Job.updated_at >= this_monday, Job.updated_at < this_monday + timedelta(days=5),
     )).scalar() or 0
     curr_interview = _cand_filter(db.query(func.count(Candidate.id)).filter(
-        Candidate.status == CandidateStatus.interview, Candidate.job_id.isnot(None),
+        Candidate.interview_status == "Scheduled", Candidate.job_id.isnot(None),
         Candidate.updated_at >= this_monday, Candidate.updated_at < this_monday + timedelta(days=5),
     )).scalar() or 0
     curr_offered = _cand_filter(db.query(func.count(Candidate.id)).filter(
-        Candidate.status == CandidateStatus.offered, Candidate.job_id.isnot(None),
+        Candidate.interview_status == "Completed", Candidate.job_id.isnot(None),
         Candidate.updated_at >= this_monday, Candidate.updated_at < this_monday + timedelta(days=5),
     )).scalar() or 0
     curr_waiting = _cand_filter(db.query(func.count(Candidate.id)).filter(
-        Candidate.status == CandidateStatus.applied, Candidate.job_id.isnot(None),
+        Candidate.interview_status == "New", Candidate.job_id.isnot(None),
         Candidate.updated_at >= this_monday, Candidate.updated_at < this_monday + timedelta(days=5),
     )).scalar() or 0
 
@@ -385,27 +391,27 @@ def get_stats(db: Session, org_id: Optional[int] = None) -> List[Dict[str, Any]]
             "value": finished_jobs,
             "change": _pct_change(curr_finished, prev_finished),
             "color": "success",
-            "chartData": _daily_chart_job(JobStatus.inactive),
+            "chartData": _daily_chart_job(JobStatus.finished),
         },
         {
             "label": "Interview Schedule",
             "value": interview_count,
             "change": _pct_change(curr_interview, prev_interview),
             "color": "success",
-            "chartData": _daily_chart_candidate(CandidateStatus.interview),
+            "chartData": _daily_chart_candidate("Scheduled"),
         },
         {
             "label": "Hire Rates",
             "value": offered_count,
             "change": _pct_change(curr_offered, prev_offered),
             "color": "brand",
-            "chartData": _daily_chart_candidate(CandidateStatus.offered),
+            "chartData": _daily_chart_candidate("Completed"),
         },
         {
             "label": "Waiting Response",
             "value": waiting_count,
             "change": _pct_change(curr_waiting, prev_waiting),
             "color": "warning",
-            "chartData": _daily_chart_candidate(CandidateStatus.applied),
+            "chartData": _daily_chart_candidate("New"),
         },
     ]
