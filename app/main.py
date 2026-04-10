@@ -83,6 +83,7 @@ _raw_migrations = [
         "DO $$ BEGIN ALTER TYPE candidatestatus ADD VALUE IF NOT EXISTS 'Selected'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
         "DO $$ BEGIN ALTER TYPE candidatestatus ADD VALUE IF NOT EXISTS 'Hired'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
         "DO $$ BEGIN ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'Finished'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+        "DO $$ BEGIN ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'finished'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
         # evaluations table — newer columns added after initial schema
         "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS per_question_evaluations TEXT",
         "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS skills_ratings TEXT",

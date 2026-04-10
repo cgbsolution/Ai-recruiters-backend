@@ -421,11 +421,18 @@ def change_job_status(
     user: User = Depends(get_current_user),
 ):
     """Change job status without touching other fields. Accepts: Open, Draft, Inactive, Finished."""
+    from app.models.job import JobStatus
     job = _get_job_with_org_check(db, job_id, user)
-    valid = {"Open", "Draft", "Inactive", "Finished"}
-    if new_status not in valid:
-        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid)}")
-    job.status = new_status
+    # Map the incoming string to the JobStatus enum member
+    status_map = {
+        "Open": JobStatus.open,
+        "Draft": JobStatus.draft,
+        "Inactive": JobStatus.inactive,
+        "Finished": JobStatus.finished,
+    }
+    if new_status not in status_map:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(status_map.keys())}")
+    job.status = status_map[new_status]
     db.commit()
     db.refresh(job)
     result = JobRead.model_validate(job)
