@@ -14,6 +14,7 @@ class JobStatus(str, enum.Enum):
     open = "Open"
     inactive = "Inactive"
     draft = "Draft"
+    finished = "Finished"
 
 
 class MixOfQuestions(str, enum.Enum):
