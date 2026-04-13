@@ -466,6 +466,56 @@ async def download_recording(filename: str, format: str = "original"):
         filename=safe_name,
     )
 
+@app.post("/recordings/fix-all", tags=["Recordings"])
+async def fix_all_recordings():
+    """
+    Remux all WebM recordings that are missing duration/seek metadata.
+    This fixes the seekbar in the video player for files recorded by
+    Chrome's MediaRecorder (which omits the WebM Cues element).
+    Run once after deploying the fix to repair existing recordings.
+    """
+    if not _FFMPEG:
+        raise HTTPException(status_code=501, detail="ffmpeg not available")
+
+    rec_dir = os.path.join(UPLOAD_ROOT, "recordings")
+    files = [f for f in os.listdir(rec_dir) if f.endswith(".webm") and not f.startswith(".")]
+    fixed = []
+    skipped = []
+    failed = []
+
+    for fname in files:
+        src = os.path.join(rec_dir, fname)
+        # Check if duration is already set
+        probe = subprocess.run([_FFMPEG, "-i", src], capture_output=True, text=True, timeout=10)
+        if "Duration: N/A" not in probe.stderr:
+            skipped.append(fname)
+            continue
+
+        tmp = src + ".fixed.webm"
+        try:
+            proc = subprocess.run(
+                [_FFMPEG, "-y", "-i", src, "-c", "copy", tmp],
+                capture_output=True, timeout=120,
+            )
+            if proc.returncode == 0 and os.path.isfile(tmp):
+                os.replace(tmp, src)
+                fixed.append(fname)
+            else:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+                failed.append(fname)
+        except Exception:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+            failed.append(fname)
+
+    return {
+        "total": len(files),
+        "fixed": fixed,
+        "skipped": skipped,
+        "failed": failed,
+    }
+
 app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
 
 # ── Routers ──────────────────────────────────────────────────────────────────
