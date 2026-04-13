@@ -42,6 +42,9 @@ google-api-python-client>=2.130.0
 slowapi>=0.1.9
 opencv-python-headless>=4.8.0
 
+# ── Video Conversion (bundled ffmpeg binary for WebM→MP4) ──────────────────
+imageio-ffmpeg>=0.5.1
+
 # ── Timezone data (required for zoneinfo on slim Docker images) ─────────────
 tzdata>=2024.1
 edge-tts>=7.0.0

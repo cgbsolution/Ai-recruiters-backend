@@ -152,6 +152,70 @@ async def get_deepgram_token():
     return {"key": settings.DEEPGRAM_API_KEY}
 
 
+# Google Cloud TTS — Indian female voice
+GOOGLE_TTS_VOICE_MAP = {
+    "en": {"languageCode": "en-IN", "name": "en-IN-Wavenet-A", "ssmlGender": "FEMALE"},
+    "hi": {"languageCode": "hi-IN", "name": "hi-IN-Wavenet-A", "ssmlGender": "FEMALE"},
+}
+
+
+@router.post(
+    "/interview/tts",
+    summary="Generate speech audio from text using Google Cloud TTS",
+    tags=["Interview"],
+)
+async def generate_tts(payload: dict):
+    """
+    Convert text to speech using Google Cloud Text-to-Speech.
+    Returns base64-encoded MP3 audio.
+    Request: { "text": "...", "language": "en" | "hi" }
+    Response: { "audio": "base64-encoded-mp3" }
+    """
+    from app.config import settings
+    import httpx
+
+    if not settings.GOOGLE_TTS_API_KEY:
+        raise HTTPException(status_code=503, detail="Google TTS not configured")
+
+    text = (payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is required")
+    if len(text) > 5000:
+        text = text[:5000]
+
+    language = payload.get("language", "en")
+    voice = GOOGLE_TTS_VOICE_MAP.get(language, GOOGLE_TTS_VOICE_MAP["en"])
+
+    url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={settings.GOOGLE_TTS_API_KEY}"
+    body = {
+        "input": {"text": text},
+        "voice": voice,
+        "audioConfig": {
+            "audioEncoding": "MP3",
+            "speakingRate": 0.95,
+            "pitch": 0.0,
+            "volumeGainDb": 0.0,
+        },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(url, json=body)
+
+        if response.status_code != 200:
+            logging.error(f"[GoogleTTS] API error {response.status_code}: {response.text[:300]}")
+            raise HTTPException(status_code=502, detail=f"Google TTS error: {response.status_code}")
+
+        data = response.json()
+        return {"audio": data.get("audioContent", "")}
+
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Google TTS timeout")
+    except Exception as e:
+        logging.error(f"[GoogleTTS] Failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get(
     "/interview/{token}",
     response_model=JobConfig,
@@ -272,7 +336,9 @@ def verify_access(
             message="You have already completed your interview for this position.",
         )
 
-    # 3. Check for terminated session
+    # 3. Check for terminated session (only block if it was an admin-initiated
+    #    termination, NOT a browser-drop that the candidate should be able to
+    #    rejoin from)
     terminated = (
         db.query(InterviewSession)
         .filter(
@@ -291,7 +357,21 @@ def verify_access(
             message="Your previous interview was terminated. Please contact HR.",
         )
 
-    # 4. Check for resumable session
+    # Common scheduling fields for all "granted" responses
+    sched_fields = dict(
+        interview_date=getattr(candidate, "interview_date", None),
+        interview_timezone=getattr(candidate, "interview_timezone", None),
+        joining_flexibility=getattr(candidate, "joining_flexibility", "anytime"),
+        allow_joining_early=getattr(candidate, "allow_joining_early", False),
+    )
+
+    # 4. Check for resumable session (pending / in_progress).
+    #    Also handle "dropped" sessions: if a candidate closed the tab, the
+    #    /drop endpoint records `dropped_at` in session_metadata but keeps the
+    #    session active so they can rejoin within a 10-minute grace window.
+    #    After 10 min the session is terminated and evaluation is triggered.
+    _DROP_GRACE_MINUTES = 10
+
     active_session = (
         db.query(InterviewSession)
         .filter(
@@ -302,15 +382,50 @@ def verify_access(
         .order_by(InterviewSession.created_at.desc())
         .first()
     )
-    # Common scheduling fields for all "granted" responses
-    sched_fields = dict(
-        interview_date=getattr(candidate, "interview_date", None),
-        interview_timezone=getattr(candidate, "interview_timezone", None),
-        joining_flexibility=getattr(candidate, "joining_flexibility", "anytime"),
-        allow_joining_early=getattr(candidate, "allow_joining_early", False),
-    )
 
     if active_session:
+        # Check if session was dropped and grace period has expired
+        _meta = {}
+        try:
+            _meta = json.loads(active_session.session_metadata or "{}")
+        except Exception:
+            pass
+        dropped_at_str = _meta.get("dropped_at")
+        if dropped_at_str:
+            from datetime import timedelta
+            try:
+                dropped_at = datetime.fromisoformat(dropped_at_str)
+                if datetime.utcnow() - dropped_at > timedelta(minutes=_DROP_GRACE_MINUTES):
+                    # Grace period expired — terminate the session
+                    active_session.status = SessionStatus.terminated
+                    active_session.completed_at = datetime.utcnow()
+                    _cand = db.query(Candidate).filter(Candidate.id == active_session.candidate_id).first()
+                    if _cand:
+                        _cand.interview_status = "Candidate Dropped Interview"
+                        log = InterviewStatusLog(
+                            candidate_id=_cand.id,
+                            previous_status="Disconnected – Awaiting Rejoin",
+                            new_status="Candidate Dropped Interview",
+                            changed_by="system",
+                            reason=f"Candidate did not rejoin within {_DROP_GRACE_MINUTES} minutes after disconnect",
+                        )
+                        db.add(log)
+                    db.commit()
+                    return VerifyAccessResponse(
+                        access="terminated",
+                        candidate_name=candidate.name,
+                        session_id=active_session.id,
+                        candidate_id=candidate.id,
+                        message="Your interview session timed out because you disconnected for too long. Please contact HR.",
+                    )
+            except Exception:
+                pass  # malformed date — allow resume
+
+            # Within grace period — clear the drop flag so candidate can resume cleanly
+            _meta.pop("dropped_at", None)
+            active_session.session_metadata = json.dumps(_meta)
+            db.commit()
+
         return VerifyAccessResponse(
             access="granted",
             candidate_name=candidate.name,
@@ -1288,8 +1403,10 @@ async def complete_interview(
     summary="Mark session as dropped (tab close / network disconnect)",
     description=(
         "Lightweight endpoint called via sendBeacon when the candidate closes the tab or disconnects.\n\n"
-        "Marks the session status as `terminated` and updates the candidate's interview_status to "
-        "`'Candidate Dropped Interview'`.\n\n"
+        "Records a `dropped_at` timestamp in `session_metadata` but **keeps the session in its "
+        "current status** (`pending` / `in_progress`) so the candidate can resume if they come back "
+        "within 10 minutes.  The `/verify-access` endpoint checks for stale drops and terminates "
+        "them only after the grace window expires.\n\n"
         "Does NOT generate an evaluation (fast — safe for use with navigator.sendBeacon).\n\n"
         "Idempotent: silently succeeds if session is already completed or terminated."
     ),
@@ -1300,23 +1417,29 @@ def drop_interview(session_id: int, db: Session = Depends(get_db)):
     if not session:
         return {"ok": False, "reason": "not_found"}
 
-    # Only act on active sessions
+    # Only act on active sessions — record the drop but do NOT terminate immediately.
+    # This gives the candidate a 10-minute window to refresh / rejoin.
     if session.status in (SessionStatus.pending, SessionStatus.in_progress):
-        session.status = SessionStatus.terminated
-        session.completed_at = datetime.utcnow()
+        try:
+            meta = json.loads(session.session_metadata or "{}")
+        except Exception:
+            meta = {}
+        meta["dropped_at"] = datetime.utcnow().isoformat()
+        meta["drop_count"] = meta.get("drop_count", 0) + 1
+        session.session_metadata = json.dumps(meta)
 
+        # Update candidate status to "Disconnected" (informational, not terminal)
         candidate = db.query(Candidate).filter(Candidate.id == session.candidate_id).first()
-        if candidate:
-            new_status = "Candidate Dropped Interview"
+        if candidate and candidate.interview_status not in ("Completed", "Candidate Terminated Prematurely"):
             log = InterviewStatusLog(
                 candidate_id=candidate.id,
                 previous_status=candidate.interview_status,
-                new_status=new_status,
+                new_status="Disconnected – Awaiting Rejoin",
                 changed_by="system",
                 reason="Tab closed or browser navigated away during interview",
             )
             db.add(log)
-            candidate.interview_status = new_status
+            candidate.interview_status = "Disconnected – Awaiting Rejoin"
 
         db.commit()
 
@@ -1497,6 +1620,32 @@ async def upload_recording(
         raise HTTPException(status_code=500, detail=f"Failed to save recording: {str(e)}")
 
     recording_link = f"/uploads/recordings/{session_id}{ext}"
+
+    # ── Fix WebM metadata ────────────────────────────────────────────────────
+    # Chrome's MediaRecorder writes WebM files WITHOUT duration metadata or a
+    # seek index (Cues).  This means browsers report duration=Infinity and the
+    # seekbar is broken.  A quick ffmpeg remux (copy, no re-encode) writes the
+    # proper headers in ~1-2 seconds even for long recordings.
+    if ext.lower() == ".webm":
+        try:
+            from app.main import _FFMPEG as _ff
+            if _ff:
+                fixed_path = file_path + ".fixed.webm"
+                proc = subprocess.run(
+                    [_ff, "-y", "-i", file_path, "-c", "copy", fixed_path],
+                    capture_output=True, timeout=60,
+                )
+                if proc.returncode == 0 and os.path.isfile(fixed_path):
+                    os.replace(fixed_path, file_path)
+                    logging.info("[Recording] Remuxed %s — seekbar metadata fixed", file_path)
+                else:
+                    # Remux failed — keep the original (seekbar won't work but video still plays)
+                    if os.path.isfile(fixed_path):
+                        os.remove(fixed_path)
+                    logging.warning("[Recording] Remux failed for %s: %s",
+                                    file_path, (proc.stderr or b"").decode(errors="replace")[-200:])
+        except Exception as exc:
+            logging.warning("[Recording] Remux skipped for %s: %s", file_path, exc)
 
     # Update candidate record
     if session.candidate_id:

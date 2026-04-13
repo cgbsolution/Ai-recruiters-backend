@@ -360,6 +360,112 @@ class CORSStaticMiddleware(BaseHTTPMiddleware):
         return response
 
 app.add_middleware(CORSStaticMiddleware)
+
+# ── Recording download with optional WebM → MP4 conversion ──────────────────
+import shutil
+import subprocess
+import tempfile
+from fastapi.responses import FileResponse
+
+def _find_ffmpeg() -> str | None:
+    """Find an ffmpeg binary: system PATH first, then the bundled one from imageio-ffmpeg."""
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    try:
+        import imageio_ffmpeg
+        path = imageio_ffmpeg.get_ffmpeg_exe()
+        if path and os.path.isfile(path):
+            return path
+    except Exception:
+        pass
+    return None
+
+_FFMPEG = _find_ffmpeg()
+logging.info("ffmpeg binary: %s", _FFMPEG or "NOT FOUND — MP4 conversion disabled")
+
+# Cache converted MP4s so repeated downloads don't re-convert every time
+_MP4_CACHE_DIR = os.path.join(UPLOAD_ROOT, "recordings", ".mp4_cache")
+os.makedirs(_MP4_CACHE_DIR, exist_ok=True)
+
+@app.get("/recordings/{filename}/download", tags=["Recordings"])
+async def download_recording(filename: str, format: str = "original"):
+    """
+    Download a recording file.
+
+    - **format=original** (default): returns the raw .webm file with a
+      Content-Disposition header so the browser saves instead of plays.
+    - **format=mp4**: converts the .webm to .mp4 using ffmpeg (system or
+      bundled via imageio-ffmpeg). Converted files are cached so subsequent
+      downloads are instant.
+    """
+    safe_name = os.path.basename(filename)          # prevent path traversal
+    src = os.path.join(UPLOAD_ROOT, "recordings", safe_name)
+    if not os.path.isfile(src):
+        raise HTTPException(status_code=404, detail="Recording not found")
+
+    stem = os.path.splitext(safe_name)[0]
+
+    if format == "mp4":
+        if not _FFMPEG:
+            raise HTTPException(
+                status_code=501,
+                detail="MP4 conversion unavailable — ffmpeg is not installed on the server.",
+            )
+
+        # Check cache first
+        cached = os.path.join(_MP4_CACHE_DIR, f"{stem}.mp4")
+        if os.path.isfile(cached):
+            return FileResponse(
+                cached,
+                media_type="video/mp4",
+                filename=f"{stem}.mp4",
+            )
+
+        # Convert to MP4 (H.264 + AAC, fast preset)
+        tmp_path = cached + ".tmp"
+        try:
+            proc = subprocess.run(
+                [
+                    _FFMPEG, "-y", "-i", src,
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart",
+                    tmp_path,
+                ],
+                capture_output=True, timeout=600,
+            )
+            if proc.returncode != 0:
+                stderr = proc.stderr.decode(errors="replace")[-500:]
+                logging.error("ffmpeg conversion failed: %s", stderr)
+                raise HTTPException(status_code=500, detail="MP4 conversion failed")
+            # Atomic rename into cache
+            os.replace(tmp_path, cached)
+        except subprocess.TimeoutExpired:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+            raise HTTPException(status_code=504, detail="Conversion timed out (video too long)")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+            logging.error("Unexpected conversion error: %s", exc)
+            raise HTTPException(status_code=500, detail="MP4 conversion failed")
+
+        return FileResponse(
+            cached,
+            media_type="video/mp4",
+            filename=f"{stem}.mp4",
+        )
+
+    # Default: serve the original .webm as a download
+    return FileResponse(
+        src,
+        media_type="video/webm",
+        filename=safe_name,
+    )
+
 app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
 
 # ── Routers ──────────────────────────────────────────────────────────────────

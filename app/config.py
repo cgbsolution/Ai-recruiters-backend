@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
     DEEPGRAM_API_KEY: str = ""
+    GOOGLE_TTS_API_KEY: str = ""
     CORS_ORIGINS: str = "*"
 
     @field_validator("CORS_ORIGINS", mode="before")

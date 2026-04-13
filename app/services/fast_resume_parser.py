@@ -244,14 +244,31 @@ DESIGNATION_PATTERNS = [
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_text_from_file(file_path: str) -> Optional[str]:
-    """Extract plain text from PDF or DOCX file. Returns None on failure."""
+    """Extract plain text from PDF or DOCX file. Returns None on failure.
+
+    For PDFs we apply ``page.dedupe_chars(tolerance=1)`` before extracting text.
+    This removes characters drawn twice at (near) identical coordinates — a
+    common artefact of Canva / InDesign "faux-bold" effects where the same
+    glyph is stamped twice with a tiny offset. Without this, every character
+    in the styled regions ends up doubled (e.g. ``yyuukkttii@@ggmmaaiill..ccoomm``),
+    which breaks email/phone regex extraction and confuses the LLM parser.
+    """
     import os
     ext = os.path.splitext(file_path)[1].lower()
     try:
         if ext == ".pdf":
             import pdfplumber
             with pdfplumber.open(file_path) as pdf:
-                return "\n".join(page.extract_text() or "" for page in pdf.pages)
+                parts: list[str] = []
+                for page in pdf.pages:
+                    try:
+                        deduped = page.dedupe_chars(tolerance=1)
+                        parts.append(deduped.extract_text() or "")
+                    except Exception:
+                        # dedupe_chars can fail on malformed pages — fall back
+                        # to the raw extraction rather than losing the page.
+                        parts.append(page.extract_text() or "")
+                return "\n".join(parts)
         elif ext in (".doc", ".docx"):
             from docx import Document
             doc = Document(file_path)

@@ -154,12 +154,19 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
                     logger.error("Regex parse also failed for candidate %s: %s", candidate_id, regex_exc)
                     parsed = {}
 
-            # Extract email from resume text if parser didn't find it
-            if not parsed.get("candidate_email"):
+            # Extract email from resume text if parser didn't find a usable one.
+            # Guard against Haiku returning empty strings or placeholder-looking values
+            # that would short-circuit the regex fallback.
+            _haiku_email = (parsed.get("candidate_email") or "").strip()
+            if not _haiku_email or "@" not in _haiku_email or _haiku_email.endswith("@resume.local"):
                 import re as _re
                 email_match = _re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', resume_text or "")
                 if email_match:
                     parsed["candidate_email"] = email_match.group(0)
+                elif _haiku_email and "@" in _haiku_email and not _haiku_email.endswith("@resume.local"):
+                    parsed["candidate_email"] = _haiku_email
+                else:
+                    parsed["candidate_email"] = None
 
             # Update candidate with parsed data
             parsed_email = parsed.get("candidate_email") or candidate.email
@@ -226,7 +233,15 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
                     return
 
             candidate.name = parsed.get("candidate_name") or candidate.name
-            candidate.email = real_email or candidate.email
+            if real_email:
+                candidate.email = real_email
+            elif candidate.email and candidate.email.startswith("pending_") and candidate.email.endswith("@resume.local"):
+                # Parser could not extract a real email. Rewrite the placeholder so the
+                # candidate is not silently hidden by the list-view filter at
+                # candidate_service.get_candidates (which excludes pending_%@resume.local).
+                # Use a stable per-candidate stub tied to the DB id so duplicate detection
+                # still has something to key on.
+                candidate.email = f"no-email-{candidate.id}@unknown.local"
             candidate.phone = parsed.get("phone") or candidate.phone
             candidate.location = parsed.get("location") or candidate.location
             candidate.role = parsed.get("current_designation") or candidate.role
@@ -242,8 +257,12 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
                 meta = meta_q.first()
 
             if not meta:
+                # Prefer the real parsed email; otherwise use the (possibly rewritten)
+                # candidate.email — never persist a pending_%@resume.local placeholder
+                # into ResumeMetadata, since the list-view filter hides those.
+                meta_email = real_email or candidate.email
                 meta = ResumeMetadata(
-                    candidate_email=parsed_email or candidate.email,
+                    candidate_email=meta_email,
                     organization_id=_org_id,
                 )
                 db.add(meta)
