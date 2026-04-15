@@ -124,6 +124,11 @@ class InterviewMessageResponse(BaseModel):
     is_complete: bool
     is_off_topic: bool = False
     role: str = "ai"
+    # When the AI (or server-side backstop) attaches a coding challenge, this
+    # object carries the problem + test cases to the candidate UI. The
+    # frontend's InterviewRoom reads `coding_question` and surfaces the
+    # "Switch to Coding Test" button when it's present.
+    coding_question: Optional[dict] = None
 
 
 # ── Violation ─────────────────────────────────────────────────────────────────
@@ -150,6 +155,7 @@ class EvaluationRead(BaseModel):
     communication_score: Optional[float]
     problem_solving_score: Optional[float]
     confidence_score: Optional[float]
+    coding_score: Optional[float] = None
     overall_score: Optional[float]
     recommendation: Optional[str]
     summary: Optional[str]

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.candidate import Candidate
 from app.models.interview import (
+    CodingSubmission,
     Evaluation,
     InterviewMessage,
     InterviewSession,
@@ -408,20 +409,44 @@ CODING QUESTIONS
 - Do NOT include a "coding_question" object in your response — always set it to null.
 - Keep all questions verbal/conceptual: ask about concepts, approaches, design patterns, debugging strategies, etc.
 - You may ask the candidate to EXPLAIN how they would write code or describe an algorithm, but NEVER ask them to actually write or type code."""}
-{"" if not code_editor_enabled else """For technical roles, include 1-2 coding questions (around question_index 3-5).
-Include a "coding_question" object in your JSON response.
-Spoken message MUST be EXACTLY: "Please click on the top-left button to start the coding test."
-Do NOT read the problem title, description, or any part of the coding question aloud — the candidate will see it in the code editor.
-Do NOT say anything about the problem content. Only say the button instruction above.
+{"" if not code_editor_enabled else (lambda _cc=max(1, round(max_q * 0.2)): f"""CODE EDITOR IS ENABLED — coding challenges are MANDATORY and happen at the END of the interview.
 
-coding_question format:
-{{
-  "title": "Problem Title",
-  "description": "Full problem description with examples and constraints",
-  "test_cases": [{{"input": "...", "expected_output": "...", "description": "..."}}],
+CODING PLAN for this session:
+- Total questions: {max_q}
+- Number of coding questions: {_cc}  (≈20% of total, minimum 1)
+- Theory/verbal questions: {max_q - _cc}  (turns 1 through {max_q - _cc})
+- Coding turns: {", ".join(str(i) for i in range(max_q - _cc + 1, max_q + 1))}  (last {_cc} turn{'s' if _cc > 1 else ''} of the interview)
+
+⚠️ HARD REQUIREMENT — NON-NEGOTIABLE:
+- On any turn where `question_index` is in the Coding turns list above, you MUST emit a `coding_question` object.
+- On every OTHER turn, `coding_question` MUST be null.
+- Do NOT ask coding questions before the theory round is complete.
+- Do NOT skip the coding round even if the candidate was skipping or giving weak answers — the coding round is mandatory.
+
+When emitting a coding question, the JSON response MUST be:
+- "message" EXACTLY: "Please click on the top-left button to start the coding test."
+- "coding_question": fully-populated object (see shape below).
+- Do NOT read the problem description aloud. The candidate reads it in the editor.
+
+AUTHORING RULES — tailor the problem to THIS candidate:
+- The problem MUST reflect the role ({skills}) and the candidate's resume (see Candidate Background above).
+- For a frontend / full-stack role, favour DOM-free JS logic problems (array/string/object manipulation, simple algorithms) that work via stdin/stdout.
+- For a backend / data role, favour parsing, sorting, counting, or simple graph/tree traversal.
+- For a senior candidate, pick "hard"; mid-level → "medium"; junior → "easy".
+- If {_cc} > 1, the problems MUST cover DIFFERENT skill areas (e.g., one on arrays, one on strings) — do not repeat the same pattern.
+- EVERY problem MUST include AT LEAST 3 test cases (normal + edge cases). Use stdin/stdout I/O only — no function signatures.
+
+coding_question format (ALL fields required):
+{{{{
+  "title": "Short problem title",
+  "description": "Full problem description with input/output format, constraints, and at least one worked example",
+  "test_cases": [
+    {{{{"input": "stdin text", "expected_output": "stdout text", "description": "what this test verifies"}}}},
+    {{{{"input": "...", "expected_output": "...", "description": "..."}}}}
+  ],
   "time_limit": 15,
-  "difficulty": "medium"
-}}"""}
+  "difficulty": "easy | medium | hard"
+}}}}""")()}
 
 ═══════════════════════════════════════════════════════════════
 RESPONSE FORMAT — STRICT RULES
@@ -604,6 +629,22 @@ async def conduct_turn(
 
     # ── Server-side guard: detect candidate requesting to end ──
     max_q = interview_settings.max_questions if interview_settings else 8
+
+    # One-shot diagnostic at the start of a session: confirms whether the
+    # code editor is wired up for this interview and which turns are the
+    # coding turns (the last ~20% of the interview). Helps debug
+    # "no coding question appeared" reports.
+    if (session.current_question_index or 0) == 0:
+        _code_enabled = bool(
+            interview_settings.code_editor_required if interview_settings else False
+        )
+        _cc = max(1, round(max_q * 0.2)) if _code_enabled else 0
+        _coding_turns = list(range(max_q - _cc + 1, max_q + 1)) if _code_enabled else []
+        logger.info(
+            f"[conduct_turn] session={session.id} job={getattr(job,'id',None)} "
+            f"code_editor_required={_code_enabled} max_q={max_q} "
+            f"coding_count={_cc} coding_turns={_coding_turns}"
+        )
     if candidate_message is not None:
         lower_msg = candidate_message.lower().strip()
         end_phrases = [
@@ -915,7 +956,48 @@ async def conduct_turn(
         "role": "ai",
     }
 
-    # Include coding question if AI decided to ask one
+    # ── Coding-question handling ─────────────────────────────────────────────
+    # Plan: coding questions are ~20% of total, placed at the END of the
+    # interview (after the theory round). Example:
+    #   max_q=5  → 1 coding (turn 5)
+    #   max_q=10 → 2 coding (turns 9, 10)
+    #   max_q=6  → 1 coding (turn 6)
+    # If the AI fails to emit a coding_question on a coding turn, the server
+    # injects a deterministic fallback so the candidate never silently misses
+    # the round.
+    code_editor_enabled = bool(
+        interview_settings.code_editor_required if interview_settings else False
+    )
+    coding_count = max(1, round(max_q * 0.2)) if code_editor_enabled else 0
+    coding_turns = (
+        set(range(max_q - coding_count + 1, max_q + 1)) if code_editor_enabled else set()
+    )
+
+    # Count coding questions already asked in this session so we don't
+    # double-inject if the AI already produced one on an earlier coding turn.
+    prior_coding_asked = 0
+    if code_editor_enabled:
+        prior_coding_asked = (
+            db.query(InterviewMessage)
+            .filter(
+                InterviewMessage.session_id == session.id,
+                InterviewMessage.role == "ai",
+                InterviewMessage.content.ilike("%Switch to Coding Test%"),
+            )
+            .count()
+        )
+
+    is_coding_turn = code_editor_enabled and question_index in coding_turns
+
+    if (not coding_question) and is_coding_turn and not is_complete \
+            and prior_coding_asked < coding_count:
+        logger.warning(
+            f"[conduct_turn] AI did not emit coding_question at turn "
+            f"{question_index} (coding_turns={sorted(coding_turns)}) "
+            f"for session {session.id} — injecting fallback."
+        )
+        coding_question = _fallback_coding_question(job, candidate, prior_coding_asked)
+
     if coding_question and isinstance(coding_question, dict):
         response["coding_question"] = {
             "title": coding_question.get("title", "Coding Challenge"),
@@ -934,8 +1016,117 @@ async def conduct_turn(
         if last_ai:
             last_ai.content = response["message"]
             db.commit()
+        logger.info(
+            f"[conduct_turn] Coding question delivered for session {session.id} "
+            f"at turn {question_index}: {response['coding_question'].get('title')}"
+        )
 
     return response
+
+
+_FALLBACK_PROBLEMS: list[dict] = [
+    {
+        "title": "Two Sum",
+        "description": (
+            "Given an array of integers and a target value, print the indices "
+            "(0-based, space-separated) of the two numbers that add up to the "
+            "target. Exactly one valid answer exists; you may not use the same "
+            "element twice.\n\n"
+            "Input:\n  Line 1: space-separated integers (the array)\n"
+            "  Line 2: target integer\n\n"
+            "Output:\n  Single line — the two indices separated by a space, smaller first.\n\n"
+            "Example:\n  Input:\n    2 7 11 15\n    9\n  Output:\n    0 1"
+        ),
+        "test_cases": [
+            {"input": "2 7 11 15\n9\n", "expected_output": "0 1", "description": "Answer at start"},
+            {"input": "3 2 4\n6\n", "expected_output": "1 2", "description": "Answer not first pair"},
+            {"input": "3 3\n6\n", "expected_output": "0 1", "description": "Duplicate values"},
+            {"input": "-1 -2 -3 -4 -5\n-8\n", "expected_output": "2 4", "description": "Negative numbers"},
+        ],
+        "difficulty": "medium",
+    },
+    {
+        "title": "Longest Word in a Sentence",
+        "description": (
+            "Given a sentence, print the longest word. If two words tie in "
+            "length, print the one that appears FIRST in the sentence. Words "
+            "are separated by single spaces; there is no punctuation.\n\n"
+            "Input:\n  A single line containing the sentence.\n\n"
+            "Output:\n  A single word — the longest one.\n\n"
+            "Example:\n  Input:\n    the quick brown fox\n  Output:\n    quick"
+        ),
+        "test_cases": [
+            {"input": "the quick brown fox\n", "expected_output": "quick", "description": "Simple case"},
+            {"input": "hello world\n", "expected_output": "hello", "description": "Tie — first wins"},
+            {"input": "a bb ccc dddd eeeee\n", "expected_output": "eeeee", "description": "Ascending lengths"},
+            {"input": "one\n", "expected_output": "one", "description": "Single word"},
+        ],
+        "difficulty": "easy",
+    },
+    {
+        "title": "Character Frequency",
+        "description": (
+            "Given a lowercase string, print each distinct character and its "
+            "count, one per line, in ASCENDING character order. Format: "
+            "`<char> <count>`.\n\n"
+            "Input:\n  One line — a lowercase string (no spaces).\n\n"
+            "Output:\n  Each distinct character and its count, ascending.\n\n"
+            "Example:\n  Input:\n    banana\n  Output:\n    a 3\n    b 1\n    n 2"
+        ),
+        "test_cases": [
+            {"input": "banana\n", "expected_output": "a 3\nb 1\nn 2", "description": "Mixed counts"},
+            {"input": "aaa\n", "expected_output": "a 3", "description": "Single char"},
+            {"input": "abc\n", "expected_output": "a 1\nb 1\nc 1", "description": "All unique"},
+            {"input": "abba\n", "expected_output": "a 2\nb 2", "description": "Palindrome"},
+        ],
+        "difficulty": "easy",
+    },
+    {
+        "title": "Balanced Parentheses",
+        "description": (
+            "Given a string containing only the characters `(`, `)`, `[`, `]`, "
+            "`{`, `}`, print `valid` if every opening bracket has a matching "
+            "closer in the correct order, otherwise `invalid`.\n\n"
+            "Input:\n  One line — the bracket string (may be empty).\n\n"
+            "Output:\n  `valid` or `invalid`.\n\n"
+            "Example:\n  Input:\n    ({[]})\n  Output:\n    valid"
+        ),
+        "test_cases": [
+            {"input": "({[]})\n", "expected_output": "valid", "description": "Correctly nested"},
+            {"input": "([)]\n", "expected_output": "invalid", "description": "Crossed brackets"},
+            {"input": "\n", "expected_output": "valid", "description": "Empty input"},
+            {"input": "(((\n", "expected_output": "invalid", "description": "Unclosed"},
+        ],
+        "difficulty": "medium",
+    },
+]
+
+
+def _fallback_coding_question(
+    job: Optional[Job],
+    candidate: Optional[Candidate],
+    index: int = 0,
+) -> dict:
+    """Deterministic coding problem used when the AI fails to emit one.
+
+    Problems read stdin and write stdout so they run across every Piston
+    runtime. For multi-coding interviews (`coding_count > 1`), we rotate
+    through the bank using `index` so the candidate gets different problems.
+
+    The `job` / `candidate` arguments are accepted for future personalisation
+    (e.g. picking a problem category from required skills) but the current
+    implementation is intentionally generic — this is the safety net, not the
+    happy path.
+    """
+    bank = _FALLBACK_PROBLEMS
+    picked = bank[index % len(bank)]
+    return {
+        "title": picked["title"],
+        "description": picked["description"],
+        "test_cases": picked["test_cases"],
+        "time_limit": 15,
+        "difficulty": picked.get("difficulty", "medium"),
+    }
 
 
 async def generate_evaluation(session: InterviewSession, db: Session) -> Evaluation:
@@ -982,6 +1173,35 @@ async def generate_evaluation(session: InterviewSession, db: Session) -> Evaluat
             transcript_parts.append(f"--- Question {eval_question_count} ---\n[AI INTERVIEWER]: {q_text}\n[CANDIDATE]: {a_text}")
 
     transcript = "\n\n".join(transcript_parts)
+
+    # ── Coding submissions block ─────────────────────────────────────────────
+    # When the candidate wrote code, surface it to the evaluator as a separate,
+    # structured section. The transcript-only path was good for verbal scoring
+    # but underweighted code quality. With this block we ask Opus for a
+    # dedicated `coding_score` based on test pass rate, code clarity, and
+    # approach — independent from the verbal `technical_score`.
+    coding_rows = (
+        db.query(CodingSubmission)
+        .filter(CodingSubmission.session_id == session.id)
+        .order_by(CodingSubmission.submitted_at.asc(), CodingSubmission.id.asc())
+        .all()
+    )
+    coding_block = ""
+    has_coding = bool(coding_rows)
+    if has_coding:
+        parts = ["", "═══ CODING SUBMISSIONS ═══"]
+        for i, cs in enumerate(coding_rows, start=1):
+            pass_ratio = (cs.test_cases_passed / cs.test_cases_total) if cs.test_cases_total else 0.0
+            parts.append(
+                f"\n--- Submission {i} ---\n"
+                f"Title: {cs.title or '(untitled)'}\n"
+                f"Difficulty: {cs.difficulty or 'unspecified'}\n"
+                f"Language: {cs.language}\n"
+                f"Test Cases: {cs.test_cases_passed}/{cs.test_cases_total} passed "
+                f"({pass_ratio * 100:.0f}%)\n"
+                f"Code:\n```{cs.language}\n{cs.code}\n```"
+            )
+        coding_block = "\n".join(parts)
 
     skills = ", ".join([s.skill for s in job.skills]) if job and job.skills else "general"
 
@@ -1040,13 +1260,14 @@ Candidate: {candidate.name if candidate else 'Unknown'}
 {scoring_guidance}{custom_section}
 
 TRANSCRIPT:
-{transcript}
+{transcript}{coding_block}
 
 Evaluate across these PRIMARY dimensions (score 0-100):
-1. technical_score: Depth and accuracy of technical knowledge
+1. technical_score: Depth and accuracy of technical knowledge (verbal answers)
 2. communication_score: Clarity, articulation, and professionalism
 3. problem_solving_score: Logical thinking and approach to problems
 4. confidence_score: Confidence and composure under questioning
+{f'5. coding_score: Quality of the code submissions in the CODING SUBMISSIONS block. Weight test pass rate heavily (60%), code clarity / structure (25%), and algorithmic approach (15%). Set to null if no submissions exist.' if has_coding else '5. coding_score: No coding submissions in this interview — set to null.'}
 
 Also evaluate these ADDITIONAL dimensions (score 0-100):
 5. pronunciation_score: Clarity of speech, proper word usage, articulation quality
@@ -1073,6 +1294,7 @@ Return ONLY valid JSON:
   "communication_score": 80,
   "problem_solving_score": 70,
   "confidence_score": 85,
+  "coding_score": {"72" if has_coding else "null"},
   "pronunciation_score": 75,
   "enthusiasm_score": 70,
   "grammar_score": 80,
@@ -1125,6 +1347,16 @@ Return ONLY valid JSON:
     }
     recommendation = rec_map.get(rec_str, Recommendation.maybe)
 
+    raw_coding_score = data.get("coding_score", None)
+    coding_score: float | None
+    if raw_coding_score is None or not has_coding:
+        coding_score = None
+    else:
+        try:
+            coding_score = float(raw_coding_score)
+        except (TypeError, ValueError):
+            coding_score = None
+
     evaluation = Evaluation(
         session_id=session.id,
         candidate_id=session.candidate_id,
@@ -1132,6 +1364,7 @@ Return ONLY valid JSON:
         communication_score=float(data.get("communication_score", 0)),
         problem_solving_score=float(data.get("problem_solving_score", 0)),
         confidence_score=float(data.get("confidence_score", 0)),
+        coding_score=coding_score,
         overall_score=overall,
         recommendation=recommendation,
         summary=data.get("summary", ""),

@@ -35,6 +35,8 @@ REQUIRED_COLUMNS = [
     ("candidates", "allow_joining_early", "BOOLEAN", "FALSE"),
     # Migration: m3n4o5p6q7r8_add_face_count_to_screenshots
     ("interview_screenshots", "face_count", "INTEGER", None),
+    # Migration: a4b5c6d7e8f9_add_coding_submissions
+    ("evaluations", "coding_score", "FLOAT", None),
 ]
 
 # Tables that need to be created if they don't exist.
@@ -116,6 +118,24 @@ REQUIRED_TABLES = [
         updated_at TIMESTAMP
     )
     """,
+    # Migration: a4b5c6d7e8f9_add_coding_submissions
+    """
+    CREATE TABLE IF NOT EXISTS coding_submissions (
+        id SERIAL PRIMARY KEY,
+        session_id INTEGER NOT NULL REFERENCES interview_sessions(id) ON DELETE CASCADE,
+        question_index INTEGER,
+        title VARCHAR(255),
+        description TEXT,
+        difficulty VARCHAR(20),
+        language VARCHAR(40) NOT NULL,
+        code TEXT NOT NULL,
+        test_cases_total INTEGER NOT NULL DEFAULT 0,
+        test_cases_passed INTEGER NOT NULL DEFAULT 0,
+        test_results TEXT,
+        execution_time_ms INTEGER,
+        submitted_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+    """,
 ]
 
 # Columns that need to be added for multi-tenancy
@@ -134,6 +154,7 @@ REQUIRED_INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_ai_credit_usage_id ON ai_credit_usage (id)",
     "CREATE INDEX IF NOT EXISTS ix_per_question_evaluations_session_id ON per_question_evaluations (session_id)",
     "CREATE INDEX IF NOT EXISTS ix_interview_screenshots_session_id ON interview_screenshots (session_id)",
+    "CREATE INDEX IF NOT EXISTS ix_coding_submissions_session_id ON coding_submissions (session_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email ON users (email)",
     "CREATE INDEX IF NOT EXISTS ix_users_id ON users (id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ix_organizations_domain ON organizations (domain)",

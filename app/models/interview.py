@@ -113,6 +113,7 @@ class Evaluation(Base):
     communication_score = Column(Float, nullable=True)
     problem_solving_score = Column(Float, nullable=True)
     confidence_score = Column(Float, nullable=True)
+    coding_score = Column(Float, nullable=True)  # 0-100, only set when coding submissions exist
     overall_score = Column(Float, nullable=True)
     recommendation = Column(Enum(Recommendation), nullable=True)
     summary = Column(Text, nullable=True)
@@ -196,3 +197,30 @@ class InterviewScreenshot(Base):
     face_count = Column(Integer, nullable=True)  # 0=no face, 1=single face, 2+=multiple faces
 
     session = relationship("InterviewSession", back_populates="screenshots")
+
+
+class CodingSubmission(Base):
+    """Structured record of a candidate's code answer for a coding challenge.
+
+    Each row is a single submission. We keep both the raw code and the
+    per-test-case execution results so the recruiter UI can show pass/fail
+    breakdowns and the evaluator LLM can score code separately from verbal
+    answers.
+    """
+    __tablename__ = "coding_submissions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("interview_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    question_index = Column(Integer, nullable=True)
+    title = Column(String(255), nullable=True)
+    description = Column(Text, nullable=True)
+    difficulty = Column(String(20), nullable=True)  # easy | medium | hard
+    language = Column(String(40), nullable=False)
+    code = Column(Text, nullable=False)
+    test_cases_total = Column(Integer, nullable=False, default=0)
+    test_cases_passed = Column(Integer, nullable=False, default=0)
+    test_results = Column(Text, nullable=True)   # JSON: full per-test results array
+    execution_time_ms = Column(Integer, nullable=True)
+    submitted_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    session = relationship("InterviewSession")

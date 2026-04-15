@@ -1,12 +1,88 @@
 version: "3.9"
 
 services:
+  # ── Piston code-execution sandbox ─────────────────────────────────────────
+  # Runs candidate submissions inside isolated jobs. Replaces the public
+  # emkc.org instance which went whitelist-only on 2026-02-15.
+  piston:
+    image: ghcr.io/engineer-man/piston:latest
+    container_name: piston
+    restart: unless-stopped
+    ports:
+      - "2000:2000"
+    volumes:
+      - piston_data:/piston/packages
+    tmpfs:
+      - /piston/jobs:exec
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:2000/api/v2/runtimes >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ── One-shot runtime installer ────────────────────────────────────────────
+  # Runs once when the stack starts. Installs the language runtimes the
+  # editor supports into Piston's persistent volume. After the first run,
+  # subsequent boots are a no-op (ppman skips already-installed runtimes).
+  # No manual SSH required — `docker compose up -d` is enough.
+  piston-init:
+    image: curlimages/curl:latest
+    container_name: piston-init
+    depends_on:
+      piston:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        API=http://piston:2000/api/v2
+        install() {
+          echo ">> installing $$1=$$2"
+          # /api/v2/packages takes JSON {language, version}. Returns 200 if
+          # newly installed, 400 "Requested package already installed" on
+          # re-run. We treat both as success.
+          code=$$(curl -sS -o /dev/null -w "%{http_code}" -X POST "$$API/packages" \
+              -H "content-type: application/json" \
+              -d "{\"language\":\"$$1\",\"version\":\"$$2\"}")
+          if [ "$$code" = "200" ] || [ "$$code" = "400" ]; then
+            echo "   ok ($$code)"
+          else
+            echo "   ⚠ unexpected HTTP $$code"
+          fi
+        }
+        install python 3.10.0
+        install node 18.15.0
+        install typescript 5.0.3
+        install java 15.0.2
+        install c++ 10.2.0
+        install c 10.2.0
+        install csharp 6.12.0
+        install go 1.16.2
+        install rust 1.68.2
+        install ruby 3.0.1
+        install php 8.2.3
+        install swift 5.3.3
+        install kotlin 1.8.20
+        install scala 3.2.2
+        install bash 5.2.0
+        echo "✅ piston-init done"
+
+  # ── FastAPI backend ───────────────────────────────────────────────────────
   backend:
     build: .
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
     env_file:
       - .env
+    environment:
+      # Inside the docker network, reach Piston by its service name. Override
+      # this in .env if you're pointing to an external Piston instance.
+      - PISTON_API_URL=http://piston:2000/api/v2
+    depends_on:
+      piston:
+        condition: service_healthy
     volumes:
       # Persistent volume — survives redeployments and container restarts.
       # All uploads (resumes, recordings, photos, screenshots) are stored here.
@@ -15,4 +91,6 @@ services:
 
 volumes:
   uploads_data:
+    driver: local
+  piston_data:
     driver: local

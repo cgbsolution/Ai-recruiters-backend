@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
+import time
 import traceback
 import uuid
 from datetime import datetime
@@ -16,6 +18,7 @@ from app.database import get_db
 from app.models.candidate import Candidate
 from app.models.interview import (
     CandidateFeedback,
+    CodingSubmission,
     InterviewMessage,
     InterviewScreenshot,
     InterviewSession,
@@ -1596,6 +1599,8 @@ async def upload_recording(
     request: Request,
     file: UploadFile = File(...),
     duration: str = Form(default=""),
+    recording_id: str = Form(default=""),
+    recovery: str = Form(default=""),
     db: Session = Depends(get_db),
 ):
     session = _get_session_or_404(session_id, db)
@@ -1606,19 +1611,69 @@ async def upload_recording(
     ext = ".webm"
     if file.filename and "." in file.filename:
         ext = "." + file.filename.rsplit(".", 1)[-1]
-    file_path = f"{_upload_root}/recordings/{session_id}{ext}"
+    final_path = f"{_upload_root}/recordings/{session_id}{ext}"
+    # Stream to a temp path first so a partial write never clobbers a good
+    # prior recording. We promote to the final path only after we've verified
+    # the upload is non-empty AND at least as big as what's already on disk.
+    tmp_path = f"{final_path}.incoming-{int(time.time())}"
 
+    tag = f"session={session_id} recording_id={recording_id or '-'} recovery={bool(recovery)}"
     try:
         total_size = 0
-        with open(file_path, "wb") as f:
+        with open(tmp_path, "wb") as f:
             while chunk := await file.read(65536):  # 64KB chunks for faster streaming
                 total_size += len(chunk)
                 f.write(chunk)
-        logging.info(f"[Recording] Saved {total_size / (1024*1024):.1f} MB for session {session_id}")
+        logging.info(f"[Recording] Wrote {total_size / (1024*1024):.2f} MB to {tmp_path} ({tag})")
     except Exception as e:
-        logging.error(f"[Recording] FAILED to save for session {session_id}: {e}")
+        logging.error(f"[Recording] FAILED to save for session {session_id}: {e} ({tag})")
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
         raise HTTPException(status_code=500, detail=f"Failed to save recording: {str(e)}")
 
+    # Guard rail: never accept a zero-byte upload. This has been a silent
+    # loss mode in the past — the client hit the endpoint but no bytes
+    # landed, and we'd still overwrite a good file with a blank one.
+    if total_size == 0:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        logging.error(f"[Recording] REJECTED empty upload ({tag})")
+        raise HTTPException(status_code=400, detail="Recording is empty (0 bytes)")
+
+    # Guard rail: if there's already a recording on disk that is larger than
+    # what we just received, keep the existing one. A re-upload that's
+    # smaller than the known-good copy almost always means a partial or a
+    # corrupted retry, and replacing would be a silent data loss. Operators
+    # can still inspect the `.incoming-*` sidecar if they need to recover.
+    if os.path.isfile(final_path):
+        try:
+            existing_size = os.path.getsize(final_path)
+        except OSError:
+            existing_size = 0
+        if existing_size > total_size:
+            logging.warning(
+                f"[Recording] Keeping existing {existing_size} bytes at {final_path}; "
+                f"rejected replacement of only {total_size} bytes. "
+                f"Sidecar preserved at {tmp_path} ({tag})"
+            )
+            return RecordingUploadResponse(
+                recording_link=f"/uploads/recordings/{session_id}{ext}",
+                video_duration=duration or "0:00",
+                message="Existing recording is larger — preserved; new upload kept as sidecar.",
+            )
+
+    try:
+        os.replace(tmp_path, final_path)
+    except OSError as e:
+        logging.error(f"[Recording] FAILED to promote tmp file: {e} ({tag})")
+        raise HTTPException(status_code=500, detail=f"Failed to finalise recording: {str(e)}")
+
+    file_path = final_path
     recording_link = f"/uploads/recordings/{session_id}{ext}"
 
     # ── Fix WebM metadata ────────────────────────────────────────────────────
@@ -1850,6 +1905,7 @@ def _format_evaluation(ev) -> EvaluationRead:
         communication_score=ev.communication_score,
         problem_solving_score=ev.problem_solving_score,
         confidence_score=ev.confidence_score,
+        coding_score=getattr(ev, "coding_score", None),
         overall_score=ev.overall_score,
         recommendation=ev.recommendation.value if ev.recommendation else None,
         summary=ev.summary,
@@ -1866,7 +1922,7 @@ def _format_evaluation(ev) -> EvaluationRead:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.post(
-    "/sessions/{session_id}/run-code",
+    "/interview/sessions/{session_id}/run-code",
     summary="Execute code against test cases during interview",
     description="Run candidate's code in a sandboxed environment. Returns test case results.",
 )
@@ -1920,7 +1976,7 @@ async def run_code(
 
 
 @router.post(
-    "/sessions/{session_id}/submit-code",
+    "/interview/sessions/{session_id}/submit-code",
     summary="Submit final code solution for evaluation",
     description="Submit the candidate's final code. Saves to transcript and returns test results.",
 )
@@ -1953,16 +2009,24 @@ async def submit_code(
     code = body.get("code", "")
     test_cases = body.get("test_cases", [])
     question_index = body.get("question_index", session.current_question_index)
+    # Optional metadata sent by the editor so we can render the question
+    # on the recruiter side without having to re-derive it from chat history.
+    title = (body.get("title") or "").strip() or None
+    description = (body.get("description") or "").strip() or None
+    difficulty = (body.get("difficulty") or "").strip() or None
 
     if not code.strip():
         raise HTTPException(status_code=400, detail="Code cannot be empty")
 
     from app.services.code_execution_service import run_test_cases
 
-    # Run against test cases
+    # Run against test cases (timed for the structured submission record)
+    exec_start = time.monotonic()
     test_result = await run_test_cases(language, code, test_cases, timeout=10)
+    exec_ms = int((time.monotonic() - exec_start) * 1000)
 
-    # Save candidate's code submission as a message
+    # Save candidate's code submission as a message (kept for backwards
+    # compatibility — the AI evaluator and chat transcript still use this)
     code_submission_text = (
         f"[CODE SUBMISSION]\n"
         f"Language: {language}\n"
@@ -1976,6 +2040,28 @@ async def submit_code(
         content=code_submission_text,
         question_index=question_index,
     ))
+
+    # Structured row: lets recruiters filter by pass rate, see the code in a
+    # dedicated tab, and lets the evaluator score coding separately from
+    # verbal answers. Failure to write this MUST NOT block the interview —
+    # we wrap defensively so a schema drift never breaks the candidate UX.
+    try:
+        db.add(CodingSubmission(
+            session_id=session.id,
+            question_index=question_index,
+            title=title,
+            description=description,
+            difficulty=difficulty,
+            language=language,
+            code=code,
+            test_cases_total=int(test_result.get("total", 0)),
+            test_cases_passed=int(test_result.get("passed", 0)),
+            test_results=json.dumps(test_result.get("results", [])),
+            execution_time_ms=exec_ms,
+        ))
+    except Exception as e:
+        logging.warning("[submit_code] failed to persist CodingSubmission: %s", e)
+
     db.commit()
 
     # Now get AI's response about the code
@@ -1998,8 +2084,114 @@ async def submit_code(
     }
 
 
+@router.post(
+    "/interview/sessions/{session_id}/save-coding-submission",
+    summary="Persist a structured coding submission record",
+    description=(
+        "Lightweight endpoint that ONLY stores a `coding_submissions` row. "
+        "Does not run code, does not trigger AI. The candidate UI calls "
+        "this alongside the existing `/run-code` + transcript flow so that "
+        "the recruiter dashboard has structured data (per-test results, "
+        "language, code, timing) without disturbing the live AI conversation."
+    ),
+)
+@limiter.limit("20/minute")
+async def save_coding_submission(
+    request: Request,
+    session_id: int,
+    db: Session = Depends(get_db),
+):
+    body = await request.json()
+
+    session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    code = (body.get("code") or "").strip()
+    language = body.get("language", "python")
+    if not code:
+        raise HTTPException(status_code=400, detail="Code cannot be empty")
+
+    test_result = body.get("test_result") or {}
+    title = (body.get("title") or "").strip() or None
+    description = (body.get("description") or "").strip() or None
+    difficulty = (body.get("difficulty") or "").strip() or None
+    question_index = body.get("question_index", session.current_question_index)
+
+    submission = CodingSubmission(
+        session_id=session.id,
+        question_index=question_index,
+        title=title,
+        description=description,
+        difficulty=difficulty,
+        language=language,
+        code=code,
+        test_cases_total=int(test_result.get("total", 0)),
+        test_cases_passed=int(test_result.get("passed", 0)),
+        test_results=json.dumps(test_result.get("results", [])),
+        execution_time_ms=body.get("execution_time_ms"),
+    )
+    db.add(submission)
+    db.commit()
+    db.refresh(submission)
+
+    return {
+        "id": submission.id,
+        "session_id": submission.session_id,
+        "question_index": submission.question_index,
+        "language": submission.language,
+        "test_cases_total": submission.test_cases_total,
+        "test_cases_passed": submission.test_cases_passed,
+        "submitted_at": submission.submitted_at.isoformat(),
+    }
+
+
 @router.get(
-    "/code/languages",
+    "/interview/sessions/{session_id}/coding-submissions",
+    summary="List coding submissions for a session",
+    description="Returns all coding submissions made by the candidate during the session, in chronological order. Used by the recruiter evaluation page.",
+)
+async def list_coding_submissions(
+    session_id: int,
+    db: Session = Depends(get_db),
+):
+    session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    rows = (
+        db.query(CodingSubmission)
+        .filter(CodingSubmission.session_id == session_id)
+        .order_by(CodingSubmission.submitted_at.asc(), CodingSubmission.id.asc())
+        .all()
+    )
+
+    out = []
+    for r in rows:
+        try:
+            test_results = json.loads(r.test_results) if r.test_results else []
+        except (TypeError, ValueError):
+            test_results = []
+        out.append({
+            "id": r.id,
+            "question_index": r.question_index,
+            "title": r.title,
+            "description": r.description,
+            "difficulty": r.difficulty,
+            "language": r.language,
+            "code": r.code,
+            "test_cases_total": r.test_cases_total,
+            "test_cases_passed": r.test_cases_passed,
+            "test_results": test_results,
+            "execution_time_ms": r.execution_time_ms,
+            "submitted_at": r.submitted_at.isoformat() if r.submitted_at else None,
+        })
+
+    return {"submissions": out, "count": len(out)}
+
+
+@router.get(
+    "/interview/code/languages",
     summary="Get supported programming languages",
 )
 async def get_languages():
@@ -2070,7 +2262,7 @@ async def transcribe_audio(
 
 
 @router.get(
-    "/code/starter/{language}",
+    "/interview/code/starter/{language}",
     summary="Get starter code template for a language",
 )
 async def get_starter_code(language: str):

@@ -1614,6 +1614,7 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User 
                 "communication_score": ev.communication_score,
                 "problem_solving_score": ev.problem_solving_score,
                 "confidence_score": ev.confidence_score,
+                "coding_score": getattr(ev, "coding_score", None),
                 "overall_score": ev.overall_score,
                 "per_question_evaluations": per_question,
                 "skills_ratings": skills_ratings,
