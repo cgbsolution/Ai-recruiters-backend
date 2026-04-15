@@ -176,8 +176,13 @@ async def execute_code(
         ],
         "stdin": stdin,
         "run_timeout": timeout * 1000,  # ms
-        "compile_timeout": 15000,       # 15s for compilation
-        "run_memory_limit": 256_000_000,  # 256 MB
+        # Piston's self-hosted default caps both compile_timeout at 10s and
+        # run_memory_limit at whatever PISTON_COMPILE_TIMEOUT /
+        # PISTON_RUN_MEMORY_LIMIT are set to (defaults: 10s / 128 MB). We omit
+        # `run_memory_limit` so Piston uses its own default — avoids 400s on
+        # out-of-the-box installs. The compile cap is set to exactly 10s to
+        # match Piston's ceiling without tripping it.
+        "compile_timeout": 10000,
     }
 
     headers: dict[str, str] = {}
