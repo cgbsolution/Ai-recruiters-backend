@@ -31,6 +31,21 @@ class Recommendation(str, enum.Enum):
     no_hire = "No Hire"
 
 
+class _CaseInsensitiveEnum(Enum):
+    # Legacy rows may store lowercase labels ("hire", "no hire"). The canonical
+    # values are title-case; normalize on read so those rows don't crash loading.
+    def _object_value_for_elem(self, elem):
+        try:
+            return self._object_lookup[elem]
+        except KeyError:
+            if isinstance(elem, str):
+                needle = elem.strip().lower()
+                for key, obj in self._object_lookup.items():
+                    if isinstance(key, str) and key.lower() == needle:
+                        return obj
+            return super()._object_value_for_elem(elem)
+
+
 class MeetingScheduleStatus(str, enum.Enum):
     scheduled = "scheduled"
     cancelled = "cancelled"
@@ -120,7 +135,7 @@ class Evaluation(Base):
     # enum *name* ("strong_hire", "no_hire") which the DB rejects with
     # InvalidTextRepresentation. values_callable forces it to use the .value.
     recommendation = Column(
-        Enum(Recommendation, values_callable=lambda x: [e.value for e in x]),
+        _CaseInsensitiveEnum(Recommendation, values_callable=lambda x: [e.value for e in x]),
         nullable=True,
     )
     summary = Column(Text, nullable=True)
