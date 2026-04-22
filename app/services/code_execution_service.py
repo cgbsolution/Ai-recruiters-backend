@@ -8,6 +8,7 @@ Supported languages: all mainstream Piston runtimes (40+ languages).
 """
 
 import asyncio
+import base64
 import logging
 import os
 import httpx
@@ -30,6 +31,49 @@ PISTON_API_URL = os.environ.get(
 # Optional bearer token for whitelisted public-API access.
 PISTON_API_KEY = os.environ.get("PISTON_API_KEY", "").strip()
 
+# ── Judge0 CE fallback ───────────────────────────────────────────────────────
+# When Piston is unreachable (the public emkc.org instance has been
+# whitelist-only since 2026-02-15), we fall back to Judge0 CE on RapidAPI.
+# Free tier covers ~50 execs/day — enough for occasional interviews.
+JUDGE0_RAPIDAPI_KEY = os.environ.get("JUDGE0_RAPIDAPI_KEY", "").strip()
+JUDGE0_RAPIDAPI_HOST = os.environ.get(
+    "JUDGE0_RAPIDAPI_HOST", "judge0-ce.p.rapidapi.com"
+).strip()
+
+# Judge0 uses numeric language IDs. Map our internal language keys to the
+# closest Judge0 CE language. Versions don't have to match Piston's exactly —
+# Judge0's catalogue is fixed. See: https://ce.judge0.com/languages/
+JUDGE0_LANGUAGE_IDS = {
+    "python": 71,        # Python 3.8.1
+    "python2": 70,       # Python 2.7.17
+    "javascript": 63,    # Node.js 12.14.0
+    "typescript": 74,    # TypeScript 3.7.4
+    "java": 62,          # OpenJDK 13.0.1
+    "kotlin": 78,        # Kotlin 1.3.70
+    "scala": 81,         # Scala 2.13.2
+    "cpp": 54,           # C++ (GCC 9.2.0)
+    "c": 50,             # C (GCC 9.2.0)
+    "csharp": 51,        # C# Mono 6.6.0.161
+    "fsharp": 87,        # F# .NET Core SDK 3.1.202
+    "vbnet": 84,         # VB.NET .NET Core SDK 3.1.202
+    "go": 60,            # Go 1.13.5
+    "rust": 73,          # Rust 1.40.0
+    "ruby": 72,          # Ruby 2.7.0
+    "php": 68,           # PHP 7.4.1
+    "swift": 83,         # Swift 5.2.3
+    "perl": 85,          # Perl 5.28.1
+    "lua": 64,           # Lua 5.3.5
+    "bash": 46,          # Bash 5.0.0
+    "r": 80,             # R 4.0.0
+    "haskell": 61,       # Haskell GHC 8.8.1
+    "ocaml": 65,         # OCaml 4.09.0
+    "pascal": 67,        # Pascal FPC 3.0.4
+    "fortran": 59,       # Fortran GFortran 9.2.0
+    "cobol": 77,         # COBOL GnuCOBOL 2.2
+    "prolog": 69,        # Prolog GNU Prolog 1.4.5
+    "sqlite3": 82,       # SQL (SQLite 3.27.2)
+}
+
 # Language config: runtime name + version for Piston API
 LANGUAGE_CONFIG = {
     "python": {"language": "python", "version": "3.10.0", "extension": "py"},
@@ -41,8 +85,8 @@ LANGUAGE_CONFIG = {
     "scala": {"language": "scala", "version": "3.2.2", "extension": "scala"},
     "groovy": {"language": "groovy", "version": "3.0.7", "extension": "groovy"},
     "cpp": {"language": "c++", "version": "10.2.0", "extension": "cpp"},
-    "c": {"language": "c", "version": "10.2.0", "extension": "c"},
-    "csharp": {"language": "csharp", "version": "6.12.0", "extension": "cs"},
+    "c": {"language": "gcc", "version": "10.2.0", "extension": "c"},
+    "csharp": {"language": "csharp.net", "version": "5.0.201", "extension": "cs"},
     "fsharp": {"language": "fsharp.net", "version": "5.0.201", "extension": "fs"},
     "vbnet": {"language": "basic.net", "version": "5.0.201", "extension": "vb"},
     "go": {"language": "go", "version": "1.16.2", "extension": "go"},
@@ -135,6 +179,190 @@ async def get_available_runtimes() -> list[dict]:
         return []
 
 
+class _SandboxUnavailable(Exception):
+    """Raised when the sandbox provider itself can't run the code (network,
+    auth, rate-limit, 5xx). Distinct from candidate-code failures (compile
+    errors, runtime errors, wrong output) which are returned as normal results.
+    A `_SandboxUnavailable` is what triggers a fallback to the next provider.
+    """
+    def __init__(self, message: str, body_preview: str = ""):
+        super().__init__(message)
+        self.message = message
+        self.body_preview = body_preview
+
+
+async def _execute_piston(
+    language: str, code: str, stdin: str, timeout: int, lang_config: dict,
+) -> dict:
+    """Run code on Piston. Raises _SandboxUnavailable on infra failure."""
+    # Cap run_timeout at the Piston instance's configured ceiling. The public
+    # emkc.org instance enforces 3000ms; sending more triggers HTTP 400
+    # "run_timeout cannot exceed the configured limit of 3000". Override via
+    # PISTON_RUN_TIMEOUT_MS when self-hosting with a higher PISTON_RUN_TIMEOUT.
+    max_run_timeout_ms = int(os.environ.get("PISTON_RUN_TIMEOUT_MS", "3000"))
+    run_timeout_ms = min(timeout * 1000, max_run_timeout_ms)
+
+    payload = {
+        "language": lang_config["language"],
+        "version": lang_config["version"],
+        "files": [{"name": f"main.{lang_config['extension']}", "content": code}],
+        "stdin": stdin,
+        "run_timeout": run_timeout_ms,
+        # Kotlin/Scala compilers routinely take 15-20s on first-run JVM warmup.
+        # Keep this generous; candidates shouldn't get "Time limit exceeded"
+        # from compiler startup rather than their code.
+        "compile_timeout": int(os.environ.get("PISTON_COMPILE_TIMEOUT_MS", "60000")),
+    }
+
+    headers: dict[str, str] = {}
+    if PISTON_API_KEY:
+        headers["Authorization"] = f"Bearer {PISTON_API_KEY}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{PISTON_API_URL}/execute", json=payload, headers=headers,
+            )
+            if resp.status_code >= 400:
+                body_preview = resp.text[:500] if resp.text else "(empty body)"
+                logger.error(
+                    "Piston HTTP %s for lang=%s url=%s: %s",
+                    resp.status_code, language, PISTON_API_URL, body_preview,
+                )
+                raise _SandboxUnavailable(
+                    f"Piston HTTP {resp.status_code}", body_preview,
+                )
+            data = resp.json()
+    except httpx.TimeoutException:
+        logger.error("Piston timed out for language=%s after %ss", language, timeout)
+        raise _SandboxUnavailable("Piston request timed out")
+    except httpx.ConnectError as e:
+        logger.error("Piston unreachable (connect error): %s", e)
+        raise _SandboxUnavailable(f"Piston unreachable: {e}")
+
+    run = data.get("run", {})
+    compile_result = data.get("compile", {})
+
+    # Compile or run status "TO" = timed-out (SIGKILL, code=null, empty output).
+    # Surface an explicit error so the candidate doesn't see a silent blank.
+    for phase, res in (("compile", compile_result), ("run", run)):
+        if res and res.get("status") == "TO":
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": res.get("stderr", ""),
+                "exit_code": -1,
+                "signal": res.get("signal"),
+                "error": f"{phase.capitalize()} time limit exceeded",
+            }
+
+    # Compilation errors are a CANDIDATE failure, not a sandbox failure —
+    # return normally so the candidate sees the compile output.
+    if compile_result and compile_result.get("code") != 0 and compile_result.get("stderr"):
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": compile_result.get("stderr", ""),
+            "exit_code": compile_result.get("code", 1),
+            "signal": compile_result.get("signal"),
+            "error": "Compilation failed",
+        }
+
+    return {
+        "success": run.get("code") == 0,
+        "stdout": (run.get("stdout") or "").strip(),
+        "stderr": (run.get("stderr") or "").strip(),
+        "exit_code": run.get("code") if run.get("code") is not None else -1,
+        "signal": run.get("signal"),
+        "error": None,
+    }
+
+
+async def _execute_judge0(
+    language: str, code: str, stdin: str, timeout: int,
+) -> dict:
+    """Run code on Judge0 CE (RapidAPI). Raises _SandboxUnavailable on infra
+    failure. Caller must check JUDGE0_RAPIDAPI_KEY before invoking.
+    """
+    lang_id = JUDGE0_LANGUAGE_IDS.get(language)
+    if lang_id is None:
+        raise _SandboxUnavailable(
+            f"Judge0 has no runtime mapping for language '{language}'"
+        )
+
+    # Judge0 expects base64 to safely transport unicode/binary.
+    def b64(s: str) -> str:
+        return base64.b64encode(s.encode("utf-8")).decode("ascii")
+
+    payload = {
+        "language_id": lang_id,
+        "source_code": b64(code),
+        "stdin": b64(stdin or ""),
+        # Judge0 CE caps cpu_time_limit at 15s; clamp our request to be safe.
+        "cpu_time_limit": min(max(timeout, 1), 15),
+        "memory_limit": 128000,
+    }
+    headers = {
+        "content-type": "application/json",
+        "X-RapidAPI-Key": JUDGE0_RAPIDAPI_KEY,
+        "X-RapidAPI-Host": JUDGE0_RAPIDAPI_HOST,
+    }
+    url = f"https://{JUDGE0_RAPIDAPI_HOST}/submissions?base64_encoded=true&wait=true"
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code >= 400:
+                body_preview = resp.text[:500] if resp.text else "(empty body)"
+                logger.error(
+                    "Judge0 HTTP %s for lang=%s: %s",
+                    resp.status_code, language, body_preview,
+                )
+                raise _SandboxUnavailable(
+                    f"Judge0 HTTP {resp.status_code}", body_preview,
+                )
+            data = resp.json()
+    except httpx.TimeoutException:
+        raise _SandboxUnavailable("Judge0 request timed out")
+    except httpx.ConnectError as e:
+        raise _SandboxUnavailable(f"Judge0 unreachable: {e}")
+
+    def b64dec(s) -> str:
+        if not s:
+            return ""
+        try:
+            return base64.b64decode(s).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    stdout = b64dec(data.get("stdout"))
+    stderr = b64dec(data.get("stderr"))
+    compile_output = b64dec(data.get("compile_output"))
+    status = data.get("status") or {}
+    status_id = status.get("id", 0)
+    status_desc = status.get("description", "")
+
+    # Judge0 status IDs: 3=Accepted, 5=TLE, 6=Compilation Error, 7-12=Runtime
+    if status_id == 6 and compile_output:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": compile_output.strip(),
+            "exit_code": 1,
+            "signal": None,
+            "error": "Compilation failed",
+        }
+
+    return {
+        "success": status_id == 3,
+        "stdout": stdout.strip(),
+        "stderr": (stderr or compile_output).strip(),
+        "exit_code": 0 if status_id == 3 else 1,
+        "signal": status_desc if status_id != 3 else None,
+        "error": None if status_id == 3 else status_desc,
+    }
+
+
 async def execute_code(
     language: str,
     code: str,
@@ -142,7 +370,9 @@ async def execute_code(
     timeout: int = 10,
 ) -> dict:
     """
-    Execute code using Piston API.
+    Execute code using Piston (primary) with Judge0 CE as fallback when
+    JUDGE0_RAPIDAPI_KEY is set. Candidate-code errors (compile/runtime) are
+    returned normally; only sandbox-infra failures trigger the fallback.
 
     Returns:
         {
@@ -151,7 +381,7 @@ async def execute_code(
             "stderr": str,
             "exit_code": int,
             "signal": str | None,
-            "error": str | None,   # Only if execution itself failed
+            "error": str | None,
         }
     """
     lang_config = LANGUAGE_CONFIG.get(language)
@@ -165,120 +395,60 @@ async def execute_code(
             "error": f"Unsupported language: {language}. Supported: {', '.join(LANGUAGE_CONFIG.keys())}",
         }
 
-    payload = {
-        "language": lang_config["language"],
-        "version": lang_config["version"],
-        "files": [
-            {
-                "name": f"main.{lang_config['extension']}",
-                "content": code,
-            }
-        ],
-        "stdin": stdin,
-        "run_timeout": timeout * 1000,  # ms
-        # Piston's self-hosted default caps both compile_timeout at 10s and
-        # run_memory_limit at whatever PISTON_COMPILE_TIMEOUT /
-        # PISTON_RUN_MEMORY_LIMIT are set to (defaults: 10s / 128 MB). We omit
-        # `run_memory_limit` so Piston uses its own default — avoids 400s on
-        # out-of-the-box installs. The compile cap is set to exactly 10s to
-        # match Piston's ceiling without tripping it.
-        "compile_timeout": 10000,
-    }
-
-    headers: dict[str, str] = {}
-    if PISTON_API_KEY:
-        headers["Authorization"] = f"Bearer {PISTON_API_KEY}"
-
+    piston_error: Optional[_SandboxUnavailable] = None
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{PISTON_API_URL}/execute", json=payload, headers=headers,
-            )
-            # Piston can reply 4xx/5xx with a human-readable error body. Surface
-            # it loudly instead of silently converting to a generic 0/N failure.
-            if resp.status_code >= 400:
-                body_preview = resp.text[:500] if resp.text else "(empty body)"
-                logger.error(
-                    "Piston HTTP %s for lang=%s url=%s: %s",
-                    resp.status_code, language, PISTON_API_URL, body_preview,
-                )
-                if resp.status_code == 401:
-                    friendly = (
-                        "The public Piston API is now whitelist-only. "
-                        "Either self-host Piston (docker run -d -p 2000:2000 "
-                        "ghcr.io/engineer-man/piston and set "
-                        "PISTON_API_URL=http://localhost:2000/api/v2) "
-                        "or set PISTON_API_KEY with a whitelisted bearer token."
-                    )
-                else:
-                    friendly = (
-                        f"Piston API returned HTTP {resp.status_code}. "
-                        f"The sandbox may be rate-limited or down."
-                    )
-                return {
-                    "success": False,
-                    "stdout": "",
-                    "stderr": body_preview,
-                    "exit_code": -1,
-                    "signal": None,
-                    "error": friendly,
-                }
-            data = resp.json()
+        return await _execute_piston(language, code, stdin, timeout, lang_config)
+    except _SandboxUnavailable as e:
+        piston_error = e
+        logger.warning("Piston unavailable, attempting fallback: %s", e.message)
+    except Exception as e:
+        logger.error("Piston unexpected failure: %s: %s", type(e).__name__, e)
+        piston_error = _SandboxUnavailable(f"{type(e).__name__}: {e}")
 
-        run = data.get("run", {})
-        compile_result = data.get("compile", {})
-
-        # Check for compilation errors first
-        if compile_result and compile_result.get("code") != 0 and compile_result.get("stderr"):
+    if JUDGE0_RAPIDAPI_KEY:
+        try:
+            result = await _execute_judge0(language, code, stdin, timeout)
+            logger.info("Fell back to Judge0 for lang=%s (Piston: %s)",
+                        language, piston_error.message)
+            return result
+        except _SandboxUnavailable as e:
+            logger.error("Judge0 fallback also failed: %s", e.message)
             return {
                 "success": False,
                 "stdout": "",
-                "stderr": compile_result.get("stderr", ""),
-                "exit_code": compile_result.get("code", 1),
-                "signal": compile_result.get("signal"),
-                "error": "Compilation failed",
+                "stderr": e.body_preview or e.message,
+                "exit_code": -1,
+                "signal": None,
+                "error": (
+                    f"Both sandboxes failed. Piston: {piston_error.message}. "
+                    f"Judge0: {e.message}."
+                ),
             }
+        except Exception as e:
+            logger.error("Judge0 unexpected failure: %s: %s", type(e).__name__, e)
 
-        return {
-            "success": run.get("code", 1) == 0,
-            "stdout": (run.get("stdout") or "").strip(),
-            "stderr": (run.get("stderr") or "").strip(),
-            "exit_code": run.get("code", 0),
-            "signal": run.get("signal"),
-            "error": None,
-        }
-
-    except httpx.TimeoutException:
-        logger.error("Piston timed out for language=%s after %ss", language, timeout)
-        return {
-            "success": False,
-            "stdout": "",
-            "stderr": "Code execution timed out",
-            "exit_code": -1,
-            "signal": "SIGTERM",
-            "error": "Execution timed out",
-        }
-    except httpx.ConnectError as e:
-        logger.error("Piston unreachable (connect error): %s", e)
-        return {
-            "success": False,
-            "stdout": "",
-            "stderr": str(e),
-            "exit_code": -1,
-            "signal": None,
-            "error": "Cannot reach Piston API (network unreachable). "
-                     "Check your internet connection or firewall.",
-        }
-    except Exception as e:
-        logger.error("Code execution failed: %s: %s", type(e).__name__, e)
-        return {
-            "success": False,
-            "stdout": "",
-            "stderr": str(e),
-            "exit_code": -1,
-            "signal": None,
-            "error": f"Execution service error: {type(e).__name__}: {e}",
-        }
+    # No fallback configured (or fallback raised non-_SandboxUnavailable) —
+    # return Piston's error with the original friendly message.
+    if "401" in piston_error.message or "whitelist" in (piston_error.body_preview or "").lower():
+        friendly = (
+            "Code sandbox is unreachable. The public Piston API is "
+            "whitelist-only as of 2026-02-15. Self-host Piston "
+            "(docker compose up -d) or set JUDGE0_RAPIDAPI_KEY in .env "
+            "to enable the Judge0 fallback."
+        )
+    else:
+        friendly = (
+            f"Code sandbox is unreachable: {piston_error.message}. "
+            f"Set JUDGE0_RAPIDAPI_KEY in .env to enable the Judge0 fallback."
+        )
+    return {
+        "success": False,
+        "stdout": "",
+        "stderr": piston_error.body_preview or piston_error.message,
+        "exit_code": -1,
+        "signal": None,
+        "error": friendly,
+    }
 
 
 async def run_test_cases(

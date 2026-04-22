@@ -8,14 +8,23 @@ services:
     image: ghcr.io/engineer-man/piston:latest
     container_name: piston
     restart: unless-stopped
+    privileged: true
     ports:
       - "2000:2000"
+    # Raise compile limits so slow JVM-based compilers (Kotlin, Scala) don't
+    # get SIGKILLed on cold start. Piston enforces both a wall-clock limit
+    # (PISTON_COMPILE_TIMEOUT) and a CPU-time limit (PISTON_COMPILE_CPU_TIME).
+    # kotlinc is multi-threaded — a 3-4s wall-clock compile can burn 10s+ of
+    # aggregate CPU time, triggering the default 10s CPU cap.
+    environment:
+      - PISTON_COMPILE_TIMEOUT=60000
+      - PISTON_COMPILE_CPU_TIME=60000
     volumes:
       - piston_data:/piston/packages
     tmpfs:
       - /piston/jobs:exec
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O- http://localhost:2000/api/v2/runtimes >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:2000/api/v2/runtimes',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -56,9 +65,8 @@ services:
         install node 18.15.0
         install typescript 5.0.3
         install java 15.0.2
-        install c++ 10.2.0
-        install c 10.2.0
-        install csharp 6.12.0
+        install gcc 10.2.0
+        install dotnet 5.0.201
         install go 1.16.2
         install rust 1.68.2
         install ruby 3.0.1

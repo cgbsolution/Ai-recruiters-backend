@@ -1,5 +1,17 @@
+import asyncio
 import logging
+import os
 import traceback
+from pathlib import Path
+
+# Load .env into os.environ BEFORE any module-level reads (e.g.
+# code_execution_service reads PISTON_API_URL / JUDGE0_RAPIDAPI_KEY at import
+# time). pydantic-settings populates only the `settings` object, not os.environ.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env", override=False)
+except ImportError:
+    pass
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -422,10 +434,13 @@ async def download_recording(filename: str, format: str = "original"):
                 filename=f"{stem}.mp4",
             )
 
-        # Convert to MP4 (H.264 + AAC, fast preset)
+        # Convert to MP4 (H.264 + AAC, fast preset). Runs in a thread so the
+        # event loop isn't blocked for minutes while ffmpeg works — other
+        # requests keep serving.
         tmp_path = cached + ".tmp"
         try:
-            proc = subprocess.run(
+            proc = await asyncio.to_thread(
+                subprocess.run,
                 [
                     _FFMPEG, "-y", "-i", src,
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
@@ -486,14 +501,19 @@ async def fix_all_recordings():
     for fname in files:
         src = os.path.join(rec_dir, fname)
         # Check if duration is already set
-        probe = subprocess.run([_FFMPEG, "-i", src], capture_output=True, text=True, timeout=10)
+        probe = await asyncio.to_thread(
+            subprocess.run,
+            [_FFMPEG, "-i", src],
+            capture_output=True, text=True, timeout=10,
+        )
         if "Duration: N/A" not in probe.stderr:
             skipped.append(fname)
             continue
 
         tmp = src + ".fixed.webm"
         try:
-            proc = subprocess.run(
+            proc = await asyncio.to_thread(
+                subprocess.run,
                 [_FFMPEG, "-y", "-i", src, "-c", "copy", tmp],
                 capture_output=True, timeout=120,
             )

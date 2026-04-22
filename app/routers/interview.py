@@ -1283,13 +1283,42 @@ def log_violation(
     )
 
 
+def _set_eval_state(session_id: int, state: str, error: Optional[str] = None) -> None:
+    """Persist evaluation status (`processing` / `failed` / `done`) on the
+    session's session_metadata so the frontend's GET /evaluation can return
+    a clear state instead of a vague 404 forever."""
+    db = SessionLocal()
+    try:
+        session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+        if not session:
+            return
+        try:
+            meta = json.loads(session.session_metadata or "{}")
+        except Exception:
+            meta = {}
+        meta["evaluation_state"] = state
+        meta["evaluation_state_at"] = datetime.utcnow().isoformat()
+        if error is not None:
+            meta["evaluation_error"] = error[:500]
+        elif state != "failed":
+            meta.pop("evaluation_error", None)
+        session.session_metadata = json.dumps(meta)
+        db.commit()
+    finally:
+        db.close()
+
+
 async def _run_evaluation_background(session_id: int):
     """Background task: generate evaluation with automatic retry.
     Wrapped in asyncio.wait_for to prevent blocking the server indefinitely."""
-    MAX_RETRIES = 2
-    TOTAL_TIMEOUT = 180  # 3 minutes max for entire evaluation process
+    MAX_RETRIES = 4
+    TOTAL_TIMEOUT = 360  # 6 minutes total — per-attempt LLM timeout is 90s
+
+    _set_eval_state(session_id, "processing")
+    last_error: Optional[str] = None
 
     async def _do_evaluation():
+        nonlocal last_error
         for attempt in range(MAX_RETRIES):
             db = SessionLocal()
             try:
@@ -1297,24 +1326,29 @@ async def _run_evaluation_background(session_id: int):
                 session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
                 if not session:
                     logging.error(f"[Evaluation] Session {session_id} not found in DB")
+                    last_error = "Session not found"
                     return
                 if session.evaluation:
                     logging.info(f"[Evaluation] Session {session_id} already has evaluation — skipping")
+                    _set_eval_state(session_id, "done")
                     return
 
                 messages_count = db.query(InterviewMessage).filter(InterviewMessage.session_id == session_id).count()
                 if messages_count == 0:
                     logging.error(f"[Evaluation] Session {session_id} has NO messages — cannot evaluate")
+                    last_error = "No interview transcript to evaluate"
                     return
 
                 logging.info(f"[Evaluation] Session {session_id} — {messages_count} messages, calling AI...")
                 await svc.generate_evaluation(session, db)
                 logging.info(f"[Evaluation] Session {session_id} — evaluation saved successfully")
+                _set_eval_state(session_id, "done")
                 return
 
             except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
                 logging.error(
-                    f"[Evaluation] FAILED attempt {attempt + 1} for session {session_id}: {type(e).__name__}: {e}"
+                    f"[Evaluation] FAILED attempt {attempt + 1} for session {session_id}: {last_error}"
                 )
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(3)  # Short retry delay — don't block server
@@ -1326,7 +1360,18 @@ async def _run_evaluation_background(session_id: int):
     try:
         await asyncio.wait_for(_do_evaluation(), timeout=TOTAL_TIMEOUT)
     except asyncio.TimeoutError:
+        last_error = f"Evaluation timed out after {TOTAL_TIMEOUT}s"
         logging.error(f"[Evaluation] TOTAL TIMEOUT ({TOTAL_TIMEOUT}s) for session {session_id} — giving up")
+
+    # If we got here without a `done` state already set, mark as failed so the
+    # frontend's polling sees the failure and shows the Retry button.
+    db = SessionLocal()
+    try:
+        session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+        if session and not session.evaluation:
+            _set_eval_state(session_id, "failed", error=last_error or "Unknown error")
+    finally:
+        db.close()
 
 
 @router.post(
@@ -1362,8 +1407,44 @@ async def complete_interview(
     """
     session = _get_session_or_404(session_id, db)
 
-    # If already completed/terminated and evaluation exists, nothing to do
+    # Decide the candidate-row status this completion call implies.
+    if not early_termination:
+        new_status = "Completed"
+    elif termination_reason == "ended_by_candidate":
+        new_status = "Ended by Candidate"
+    elif termination_reason == "network_disconnect":
+        new_status = "Disconnected – Network Issue"
+    else:
+        new_status = "Candidate Terminated Prematurely"
+
+    candidate = db.query(Candidate).filter(Candidate.id == session.candidate_id).first()
+
+    # Statuses that indicate the candidate is still mid-flow (not a final
+    # outcome). If the session was force-terminated while the candidate was
+    # mid-interview, these are the values the candidate row may be stuck on —
+    # so even on the early-return path below we must reconcile them.
+    TRANSITIONAL_STATUSES = {
+        "New",
+        "Scheduled",
+        "Disconnected – Awaiting Rejoin",
+    }
+
+    # Already completed/terminated → don't restart the session lifecycle, but
+    # DO reconcile candidate.interview_status if it's stuck on a transitional
+    # value (e.g. "Disconnected – Awaiting Rejoin" because /drop ran but the
+    # session got auto-terminated before the rejoined /complete landed).
     if session.status in (SessionStatus.completed, SessionStatus.terminated):
+        if candidate and candidate.interview_status in TRANSITIONAL_STATUSES:
+            log = InterviewStatusLog(
+                candidate_id=candidate.id,
+                previous_status=candidate.interview_status,
+                new_status=new_status,
+                changed_by="system",
+                reason="Reconciled on /complete (session was already terminated)",
+            )
+            db.add(log)
+            candidate.interview_status = new_status
+            db.commit()
         if not session.evaluation:
             background_tasks.add_task(_run_evaluation_background, session_id)
         return {"status": "processing", "session_id": session_id}
@@ -1371,18 +1452,7 @@ async def complete_interview(
     session.status = SessionStatus.completed
     session.completed_at = datetime.utcnow()
 
-    # Determine interview_status based on how the interview ended
-    candidate = db.query(Candidate).filter(Candidate.id == session.candidate_id).first()
     if candidate:
-        if not early_termination:
-            new_status = "Completed"
-        elif termination_reason == "ended_by_candidate":
-            new_status = "Ended by Candidate"
-        elif termination_reason == "network_disconnect":
-            new_status = "Disconnected – Network Issue"
-        else:
-            new_status = "Candidate Terminated Prematurely"
-
         log = InterviewStatusLog(
             candidate_id=candidate.id,
             previous_status=candidate.interview_status,
@@ -1467,6 +1537,31 @@ def get_evaluation(session_id: int, db: Session = Depends(get_db)):
     if not session.evaluation:
         raise HTTPException(status_code=404, detail="Evaluation not yet generated")
     return _format_evaluation(session.evaluation)
+
+
+@router.get(
+    "/interview/sessions/{session_id}/evaluation-status",
+    summary="Cheap status probe for the evaluation background task",
+    description=(
+        "Returns one of: `done` (evaluation row exists), `processing` (background "
+        "task running), `failed` (background task gave up — show retry button), "
+        "or `idle` (no task ever started for this session).\n\n"
+        "The frontend polls this in a tight loop; it never 404s, so the browser "
+        "console doesn't fill with red errors while waiting."
+    ),
+    tags=["Interview"],
+)
+def get_evaluation_status(session_id: int, db: Session = Depends(get_db)):
+    session = _get_session_or_404(session_id, db)
+    if session.evaluation:
+        return {"state": "done"}
+    try:
+        meta = json.loads(session.session_metadata or "{}")
+    except Exception:
+        meta = {}
+    state = meta.get("evaluation_state", "idle")
+    error = meta.get("evaluation_error") if state == "failed" else None
+    return {"state": state, "error": error}
 
 
 @router.post(
@@ -1686,7 +1781,8 @@ async def upload_recording(
             from app.main import _FFMPEG as _ff
             if _ff:
                 fixed_path = file_path + ".fixed.webm"
-                proc = subprocess.run(
+                proc = await asyncio.to_thread(
+                    subprocess.run,
                     [_ff, "-y", "-i", file_path, "-c", "copy", fixed_path],
                     capture_output=True, timeout=60,
                 )

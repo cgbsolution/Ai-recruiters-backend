@@ -115,7 +115,14 @@ class Evaluation(Base):
     confidence_score = Column(Float, nullable=True)
     coding_score = Column(Float, nullable=True)  # 0-100, only set when coding submissions exist
     overall_score = Column(Float, nullable=True)
-    recommendation = Column(Enum(Recommendation), nullable=True)
+    # The Postgres `recommendation` enum stores the human labels ("Strong Hire",
+    # "Hire", "Maybe", "No Hire"). SQLAlchemy's default would send the Python
+    # enum *name* ("strong_hire", "no_hire") which the DB rejects with
+    # InvalidTextRepresentation. values_callable forces it to use the .value.
+    recommendation = Column(
+        Enum(Recommendation, values_callable=lambda x: [e.value for e in x]),
+        nullable=True,
+    )
     summary = Column(Text, nullable=True)
     strengths = Column(Text, nullable=True)     # JSON array of strings
     weaknesses = Column(Text, nullable=True)    # JSON array of strings

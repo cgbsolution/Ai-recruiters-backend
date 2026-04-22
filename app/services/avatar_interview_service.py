@@ -1323,7 +1323,10 @@ Return ONLY valid JSON:
             messages=[{"role": "user", "content": prompt}],
             model=OPUS,
             max_tokens=4000,
-            timeout_seconds=180,  # Opus with full transcript needs up to 2-3 minutes
+            # 90s/attempt × outer 360s wrapper × 4 retries = up to ~6 min total
+            # before we give up — fail fast so the candidate sees a real retry
+            # button instead of staring at "Generating…" for 7+ minutes.
+            timeout_seconds=90,
         )
     except Exception as e:
         logging.error(f"[Evaluation] AI call failed for session {session.id}: {type(e).__name__}: {e}\n{traceback.format_exc()}")
