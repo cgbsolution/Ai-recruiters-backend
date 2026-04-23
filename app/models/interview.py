@@ -6,6 +6,7 @@ from sqlalchemy import (
     Integer, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
+from sqlalchemy.types import TypeDecorator
 
 from app.database import Base
 
@@ -31,19 +32,43 @@ class Recommendation(str, enum.Enum):
     no_hire = "No Hire"
 
 
-class _CaseInsensitiveEnum(Enum):
-    # Legacy rows may store lowercase labels ("hire", "no hire"). The canonical
-    # values are title-case; normalize on read so those rows don't crash loading.
-    def _object_value_for_elem(self, elem):
-        try:
-            return self._object_lookup[elem]
-        except KeyError:
-            if isinstance(elem, str):
-                needle = elem.strip().lower()
-                for key, obj in self._object_lookup.items():
-                    if isinstance(key, str) and key.lower() == needle:
-                        return obj
-            return super()._object_value_for_elem(elem)
+class RecommendationType(TypeDecorator):
+    # Column type for Evaluation.recommendation.
+    # Writes canonical .value ("Strong Hire" / "Hire" / "Maybe" / "No Hire").
+    # Reads tolerate legacy rows that were stored as the Python enum .name
+    # ("hire", "strong_hire", "no_hire", "maybe") before values_callable was
+    # added, and any case variation.
+    impl = String(32)
+    cache_ok = True
+
+    _aliases = {
+        "strong_hire": Recommendation.strong_hire,
+        "strong hire": Recommendation.strong_hire,
+        "hire": Recommendation.hire,
+        "maybe": Recommendation.maybe,
+        "no_hire": Recommendation.no_hire,
+        "no hire": Recommendation.no_hire,
+    }
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, Recommendation):
+            return value.value
+        if isinstance(value, str):
+            member = self._aliases.get(value.strip().lower())
+            if member is not None:
+                return member.value
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, Recommendation):
+            return value
+        if isinstance(value, str):
+            return self._aliases.get(value.strip().lower())
+        return None
 
 
 class MeetingScheduleStatus(str, enum.Enum):
@@ -130,14 +155,7 @@ class Evaluation(Base):
     confidence_score = Column(Float, nullable=True)
     coding_score = Column(Float, nullable=True)  # 0-100, only set when coding submissions exist
     overall_score = Column(Float, nullable=True)
-    # The Postgres `recommendation` enum stores the human labels ("Strong Hire",
-    # "Hire", "Maybe", "No Hire"). SQLAlchemy's default would send the Python
-    # enum *name* ("strong_hire", "no_hire") which the DB rejects with
-    # InvalidTextRepresentation. values_callable forces it to use the .value.
-    recommendation = Column(
-        _CaseInsensitiveEnum(Recommendation, values_callable=lambda x: [e.value for e in x]),
-        nullable=True,
-    )
+    recommendation = Column(RecommendationType(), nullable=True)
     summary = Column(Text, nullable=True)
     strengths = Column(Text, nullable=True)     # JSON array of strings
     weaknesses = Column(Text, nullable=True)    # JSON array of strings
