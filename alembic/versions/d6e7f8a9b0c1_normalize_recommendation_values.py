@@ -1,9 +1,15 @@
 """Normalize evaluations.recommendation legacy values.
 
-Older rows were written with the Python enum .name ("hire",
-"strong_hire", "no_hire", "maybe") before values_callable was switched
-to .value. Those rows now crash on read with LookupError. This migration
-rewrites them to the canonical title-case labels.
+The Postgres `recommendation` enum type drifted out of sync with the
+Python enum across earlier migrations: some deployments ended up with
+lowercase/underscore labels (hire, strong_hire, no_hire) and cannot
+accept title-case writes ("No Hire"), while newer code reads title-case.
+
+Rather than recreate the enum and keep fighting the drift, convert the
+column to plain varchar in one shot, normalizing values during the
+conversion. The Python side already uses a TypeDecorator
+(RecommendationType) with impl=String(32), so this also removes the
+DDL/model mismatch.
 
 Revision ID: d6e7f8a9b0c1
 Revises: c5d6e7f8a9b0
@@ -23,28 +29,32 @@ def upgrade() -> None:
     dialect = bind.dialect.name
 
     if dialect == "postgresql":
-        # If the enum type is missing any of the legacy lowercase/underscore
-        # labels the UPDATE below would be a no-op anyway (Postgres would have
-        # rejected those writes at INSERT time). If the enum *does* contain
-        # them — e.g. someone ran ALTER TYPE — cast through text so the
-        # comparison works regardless.
+        # Convert the column off the enum type and normalize data at the
+        # same time. The USING clause transforms every existing value
+        # (whether stored as "hire", "strong_hire", "No Hire", etc.) to
+        # its canonical title-case form.
         op.execute(
             """
-            UPDATE evaluations
-            SET recommendation = CASE LOWER(recommendation::text)
-                WHEN 'strong_hire' THEN 'Strong Hire'
-                WHEN 'strong hire' THEN 'Strong Hire'
-                WHEN 'hire' THEN 'Hire'
-                WHEN 'maybe' THEN 'Maybe'
-                WHEN 'no_hire' THEN 'No Hire'
-                WHEN 'no hire' THEN 'No Hire'
-                ELSE recommendation::text
-            END::recommendation
-            WHERE recommendation IS NOT NULL
-              AND recommendation::text NOT IN ('Strong Hire','Hire','Maybe','No Hire')
+            ALTER TABLE evaluations
+            ALTER COLUMN recommendation TYPE varchar(32)
+            USING (
+                CASE LOWER(recommendation::text)
+                    WHEN 'strong_hire' THEN 'Strong Hire'
+                    WHEN 'strong hire' THEN 'Strong Hire'
+                    WHEN 'hire' THEN 'Hire'
+                    WHEN 'maybe' THEN 'Maybe'
+                    WHEN 'no_hire' THEN 'No Hire'
+                    WHEN 'no hire' THEN 'No Hire'
+                    ELSE recommendation::text
+                END
+            )
             """
         )
+        # The enum type is no longer referenced by any column; drop it so
+        # future fresh-DB setups don't recreate the drift.
+        op.execute("DROP TYPE IF EXISTS recommendation")
     else:
+        # MySQL / SQLite: column is already effectively VARCHAR.
         op.execute(
             """
             UPDATE evaluations
@@ -64,6 +74,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Data normalization is not reversible — we don't know which rows were
-    # originally lowercase. No-op.
+    # Forwards-only: we would not recover the exact legacy enum contents,
+    # and the column is varchar going forward by design.
     pass
