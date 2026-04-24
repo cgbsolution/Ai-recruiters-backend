@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone as _tz
 from pathlib import Path
 from typing import List, Optional
 
@@ -1094,7 +1094,18 @@ async def schedule_interview(
     )
     db.add(log)
 
-    candidate.interview_date = payload.interview_date
+    # Normalize the scheduled moment to a NAIVE UTC datetime before storing.
+    # Pydantic parses "...Z" into an aware UTC datetime, but the column is
+    # `TIMESTAMP WITHOUT TIME ZONE`; depending on psycopg / server session
+    # timezone, an aware value can land in the DB as the server-local wall
+    # clock instead of UTC, which then gets a second +offset applied when
+    # _format_interview_date converts "naive-as-UTC" → IST. Forcing UTC-naive
+    # here removes all ambiguity so both email and dashboard render the
+    # original recruiter-selected moment correctly.
+    _sched_dt = payload.interview_date
+    if _sched_dt is not None and _sched_dt.tzinfo is not None:
+        _sched_dt = _sched_dt.astimezone(_tz.utc).replace(tzinfo=None)
+    candidate.interview_date = _sched_dt
     candidate.interview_timezone = payload.interview_timezone
     candidate.joining_flexibility = payload.joining_flexibility
     candidate.allow_candidate_reschedule = payload.allow_candidate_reschedule
