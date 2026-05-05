@@ -296,16 +296,22 @@ def verify_access(
     tok = _get_token_or_404(token, db)
     email_str = str(payload.email).strip().lower()
 
-    # 1. Check if candidate exists for this job (invited by recruiter)
+    # 1. Check if candidate exists for this job (invited by recruiter).
+    #    Match is case-insensitive: candidates added via resume parsing or
+    #    manual recruiter entry may be stored with the original casing
+    #    (e.g. "Coder.Shadab92@gmail.com"), but the URL/form value gets
+    #    lowercased above. Without func.lower the join silently misses,
+    #    sending an already-invited candidate to the apply form.
     candidate = db.query(Candidate).filter(
-        Candidate.email == email_str,
+        func.lower(Candidate.email) == email_str,
         Candidate.job_id == tok.job_id,
     ).first()
 
     if not candidate:
-        # Also check resume_metadata — if resume exists but not invited for this job
+        # Also check resume_metadata — if resume exists but not invited for this job.
+        # Same case-insensitivity caveat as the candidate query above.
         meta = db.query(ResumeMetadata).filter(
-            ResumeMetadata.candidate_email == email_str
+            func.lower(ResumeMetadata.candidate_email) == email_str
         ).first()
 
         if meta:
@@ -565,7 +571,7 @@ def apply_for_job(
 
     # Also create/update a candidate record for this job
     existing_candidate = db.query(Candidate).filter(
-        Candidate.email == email_str,
+        func.lower(Candidate.email) == email_str,
         Candidate.job_id == tok.job_id,
     ).first()
 
@@ -682,7 +688,7 @@ def register_candidate(
     phone_str = (payload.phone or "").strip()
 
     filters = [
-        (Candidate.email == email_str) & (Candidate.job_id == tok.job_id),
+        (func.lower(Candidate.email) == email_str) & (Candidate.job_id == tok.job_id),
     ]
     if phone_str:
         filters.append(
@@ -789,7 +795,7 @@ def register_candidate(
             db.rollback()
             # Race condition: another request created this candidate first — retry lookup
             existing = db.query(Candidate).filter(
-                Candidate.email == email_str,
+                func.lower(Candidate.email) == email_str,
                 Candidate.job_id == tok.job_id,
             ).first()
             if existing:
@@ -884,7 +890,7 @@ def auto_register_candidate(
 
     # Check for existing candidate for this job
     existing = db.query(Candidate).filter(
-        Candidate.email == email_str,
+        func.lower(Candidate.email) == email_str,
         Candidate.job_id == tok.job_id,
     ).first()
 
@@ -1032,7 +1038,7 @@ def login_candidate(
     job = db.query(Job).filter(Job.id == tok.job_id).first()
 
     candidate = db.query(Candidate).filter(
-        Candidate.email == str(payload.email),
+        func.lower(Candidate.email) == str(payload.email).strip().lower(),
         Candidate.job_id == tok.job_id,
     ).first()
 
