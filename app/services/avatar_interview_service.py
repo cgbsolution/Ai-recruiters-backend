@@ -977,12 +977,19 @@ async def conduct_turn(
     # double-inject if the AI already produced one on an earlier coding turn.
     prior_coding_asked = 0
     if code_editor_enabled:
+        # Match either the first-coding intro or any of the follow-up transition
+        # phrases we may have used after a prior code submission. Without this,
+        # the count stays at 1 forever once we switch wording, breaking fallback
+        # selection on a 3rd+ coding turn.
         prior_coding_asked = (
             db.query(InterviewMessage)
             .filter(
                 InterviewMessage.session_id == session.id,
                 InterviewMessage.role == "ai",
-                InterviewMessage.content.ilike("%Switch to Coding Test%"),
+            )
+            .filter(
+                InterviewMessage.content.ilike("%Switch to Coding Test%")
+                | InterviewMessage.content.ilike("%next coding challenge%")
             )
             .count()
         )
@@ -1006,8 +1013,14 @@ async def conduct_turn(
             "time_limit": coding_question.get("time_limit", 15),
             "difficulty": coding_question.get("difficulty", "medium"),
         }
-        # Force the spoken message to the standard instruction — never read the coding problem aloud
-        response["message"] = "Now let's test your coding skills. Please click the 'Switch to Coding Test' button at the top of your screen to open the code editor and complete the challenge."
+        # Force the spoken message — never read the problem aloud. The first
+        # coding question gets the full editor instruction; subsequent ones get
+        # a short transition because the editor is already open and the
+        # candidate already knows how to use it.
+        if prior_coding_asked >= 1:
+            response["message"] = "Great, here is your next coding challenge. The new problem has loaded in the editor — please review it and submit your solution."
+        else:
+            response["message"] = "Now let's test your coding skills. Please click the 'Switch to Coding Test' button at the top of your screen to open the code editor and complete the challenge."
         # Also update the DB message to match
         last_ai = db.query(InterviewMessage).filter(
             InterviewMessage.session_id == session.id,
