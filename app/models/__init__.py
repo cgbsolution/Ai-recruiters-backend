@@ -23,3 +23,4 @@ from app.models.resume_metadata import ResumeMetadata
 from app.models.job_metadata import JobMetadata
 from app.models.ai_credit_usage import AiCreditUsage
 from app.models.secondary_cam import SecondaryCamSession, SecondaryCamSnapshot
+from app.models.observer import ObserverToken

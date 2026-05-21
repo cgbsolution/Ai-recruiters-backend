@@ -31,9 +31,10 @@ logging.basicConfig(
 # Keep app-level loggers at INFO so our own messages still appear
 logging.getLogger("app").setLevel(logging.INFO)
 from app.database import Base, engine
-from app.routers import ai, auth, candidates, credits, file_manager, interview, jobs, organizations, questions, resume_database, secondary_cam, tts, uploads
+from app.routers import ai, auth, candidates, credits, file_manager, interview, jobs, observer, organizations, questions, resume_database, secondary_cam, tts, uploads
 
 import app.models  # noqa: F401 — ensure all models are registered with Base
+import app.services.observer_events  # noqa: F401 — wire SQLAlchemy listeners for the live observer broker
 
 # Run Alembic migrations on startup (adds missing columns/tables safely)
 try:
@@ -129,6 +130,12 @@ _raw_migrations = [
         "ALTER TABLE interview_sessions ADD COLUMN IF NOT EXISTS interview_language VARCHAR(20) DEFAULT 'en'",
         # email logs
         "CREATE TABLE IF NOT EXISTS email_logs (id SERIAL PRIMARY KEY, candidate_id INTEGER REFERENCES candidates(id) ON DELETE CASCADE, subject VARCHAR(500) NOT NULL, triggered_by VARCHAR(100) DEFAULT 'SYSTEM', trigger_event VARCHAR(100), sent_at TIMESTAMP DEFAULT NOW(), status VARCHAR(20) DEFAULT 'sent')",
+        # live observer tokens (P2P WebRTC + SSE transcript)
+        "CREATE TABLE IF NOT EXISTS observer_tokens (id SERIAL PRIMARY KEY, token VARCHAR(64) NOT NULL, candidate_id INTEGER REFERENCES candidates(id) ON DELETE CASCADE NOT NULL, job_id INTEGER REFERENCES jobs(id) ON DELETE CASCADE NOT NULL, session_id INTEGER REFERENCES interview_sessions(id) ON DELETE SET NULL, room_name VARCHAR(120) NOT NULL, created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, created_by_email VARCHAR(255), expires_at TIMESTAMP, revoked_at TIMESTAMP, view_count INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL DEFAULT NOW())",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_observer_tokens_token ON observer_tokens(token)",
+        "CREATE INDEX IF NOT EXISTS ix_observer_tokens_candidate_id ON observer_tokens(candidate_id)",
+        "CREATE INDEX IF NOT EXISTS ix_observer_tokens_session_id ON observer_tokens(session_id)",
+        "CREATE INDEX IF NOT EXISTS ix_observer_tokens_room_name ON observer_tokens(room_name)",
 ]
 try:
     with engine.connect() as conn:
@@ -553,6 +560,17 @@ app.include_router(organizations.router, prefix="/organizations", tags=["Organiz
 app.include_router(file_manager.router, prefix="/file-manager", tags=["File Manager"])
 app.include_router(secondary_cam.router, tags=["Secondary Camera"])
 app.include_router(tts.router, tags=["Text-to-Speech"])
+app.include_router(observer.router, tags=["Live Observer"])
+
+
+@app.on_event("startup")
+async def _attach_observer_broker_loop():
+    """Capture the running event loop so the observer broker can safely
+    dispatch events queued by sync producers (SQLAlchemy listeners running
+    in worker threads for sync endpoints)."""
+    import asyncio
+    from app.services.observer_broker import broker
+    broker.attach_loop(asyncio.get_running_loop())
 
 
 @app.get("/health", tags=["Health"])

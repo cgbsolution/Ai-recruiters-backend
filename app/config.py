@@ -73,6 +73,16 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: str = ""
     GOOGLE_REDIRECT_URI: str = "http://localhost:8000/auth/google/callback"
 
+    # ── Live Observer (P2P WebRTC) ──────────────────────────────────────────
+    # Public frontend base used to build observer share links sent in emails.
+    OBSERVER_LINK_BASE_URL: str = "http://localhost:3000"
+    # STUN: Google's free public servers, comma-separated.
+    OBSERVER_STUN_URLS: str = "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302"
+    # TURN (optional): Metered.ca free tier credentials. Leave empty to run STUN-only.
+    OBSERVER_TURN_URL: str = ""
+    OBSERVER_TURN_USERNAME: str = ""
+    OBSERVER_TURN_CREDENTIAL: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

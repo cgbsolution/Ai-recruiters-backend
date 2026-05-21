@@ -1215,6 +1215,48 @@ async def schedule_interview(
         except Exception:
             logger.warning("Failed to send WhatsApp to candidate %s", candidate.id, exc_info=True)
 
+    # ── Observer link (live read-only watch URL for recruiter) ──────────────
+    observer_link = None
+    observer_email_sent = False
+    try:
+        from app.services.observer_service import (
+            get_or_create_observer_token,
+            send_observer_link_email,
+            _build_observer_url,
+        )
+        from app.models.job import Job as _JobModel
+
+        _exp = None
+        if candidate.interview_date:
+            from datetime import timedelta as _td
+            _exp = candidate.interview_date + _td(days=2)
+
+        obs_tok = get_or_create_observer_token(
+            db,
+            candidate=candidate,
+            creator_user_id=user.id,
+            creator_email=user.email,
+            expires_at=_exp,
+        )
+        observer_link = _build_observer_url(obs_tok.token)
+
+        _job = db.query(_JobModel).filter(_JobModel.id == candidate.job_id).first()
+        _title = _job.title if _job else "Interview"
+        observer_email_sent = await send_observer_link_email(
+            db,
+            candidate=candidate,
+            creator_email=user.email,
+            observer_token=obs_tok,
+            job_title=_title,
+            is_reschedule=is_reschedule,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to mint or email observer link for candidate %s",
+            candidate.id,
+            exc_info=True,
+        )
+
     # Return candidate data + notification status
     result = CandidateRead.model_validate(candidate)
     response_dict = result.model_dump()
@@ -1222,6 +1264,9 @@ async def schedule_interview(
     response_dict["whatsapp_sent"] = whatsapp_sent
     if google_meet_link:
         response_dict["google_meet_link"] = google_meet_link
+    if observer_link:
+        response_dict["observer_link"] = observer_link
+        response_dict["observer_email_sent"] = observer_email_sent
     return response_dict
 
 
@@ -2197,4 +2242,114 @@ def get_email_history(candidate_id: int, db: Session = Depends(get_db)):
             }
             for log in logs
         ],
+    }
+
+
+# ── Observer Link (admin actions) ────────────────────────────────────────────
+
+@router.get(
+    "/{candidate_id}/observer-link",
+    summary="Get the live observer link for this candidate",
+)
+def get_observer_link(
+    candidate_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Returns the latest active observer URL for this candidate, or null."""
+    from app.models.observer import ObserverToken
+    from app.services.observer_service import _build_observer_url
+
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
+    obs = (
+        db.query(ObserverToken)
+        .filter(
+            ObserverToken.candidate_id == candidate.id,
+            ObserverToken.revoked_at.is_(None),
+        )
+        .order_by(ObserverToken.created_at.desc())
+        .first()
+    )
+    if obs is None:
+        return {"link": None}
+    return {
+        "link": _build_observer_url(obs.token),
+        "token": obs.token,
+        "expires_at": obs.expires_at.isoformat() if obs.expires_at else None,
+        "view_count": obs.view_count or 0,
+        "created_by_email": obs.created_by_email,
+    }
+
+
+@router.post(
+    "/{candidate_id}/observer-link/revoke",
+    summary="Revoke the observer link for this candidate",
+)
+def revoke_observer_link(
+    candidate_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    from app.models.observer import ObserverToken
+
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
+    obs = (
+        db.query(ObserverToken)
+        .filter(
+            ObserverToken.candidate_id == candidate.id,
+            ObserverToken.revoked_at.is_(None),
+        )
+        .order_by(ObserverToken.created_at.desc())
+        .first()
+    )
+    if obs is None:
+        raise HTTPException(status_code=404, detail="No active observer link to revoke")
+    obs.revoked_at = datetime.utcnow()
+    db.commit()
+    return {"ok": True, "revoked_at": obs.revoked_at.isoformat()}
+
+
+@router.post(
+    "/{candidate_id}/observer-link/resend",
+    summary="Email the observer link to the current user",
+)
+async def resend_observer_link(
+    candidate_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    from app.services.observer_service import (
+        get_or_create_observer_token,
+        send_observer_link_email,
+        _build_observer_url,
+    )
+    from app.models.job import Job as _JobModel
+
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
+
+    _exp = None
+    if candidate.interview_date:
+        from datetime import timedelta as _td
+        _exp = candidate.interview_date + _td(days=2)
+
+    obs = get_or_create_observer_token(
+        db,
+        candidate=candidate,
+        creator_user_id=user.id,
+        creator_email=user.email,
+        expires_at=_exp,
+    )
+    job = db.query(_JobModel).filter(_JobModel.id == candidate.job_id).first()
+    sent = await send_observer_link_email(
+        db,
+        candidate=candidate,
+        creator_email=user.email,
+        observer_token=obs,
+        job_title=(job.title if job else "Interview"),
+        is_reschedule=False,
+    )
+    return {
+        "ok": True,
+        "email_sent": sent,
+        "link": _build_observer_url(obs.token),
     }
