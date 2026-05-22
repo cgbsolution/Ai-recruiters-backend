@@ -32,7 +32,9 @@ from app.models.interview import (
 )
 from app.models.job import Job
 from app.models.organization import Organization
+from app.models.user import User, UserRole
 from app.database import SessionLocal
+from app.auth import require_roles
 
 
 def _check_and_increment_candidate_quota(db, job_id: int) -> None:
@@ -2372,3 +2374,43 @@ async def get_starter_code(language: str):
     from app.services.code_execution_service import get_starter_code as _get_starter
     code = _get_starter(language)
     return {"language": language, "code": code}
+
+
+@router.post(
+    "/interview/code/test-run",
+    summary="Standalone code sandbox test (super-admin only)",
+    description=(
+        "Runs code through the exact same sandbox pipeline used during "
+        "interviews, but without requiring an active InterviewSession. "
+        "Intended for super-admins to debug Piston/Judge0 connectivity and "
+        "language support without scheduling a candidate."
+    ),
+)
+@limiter.limit("30/minute")
+async def test_run_code(
+    request: Request,
+    _user: User = Depends(require_roles(UserRole.super_admin)),
+):
+    """Body: { language, code, test_cases?, stdin? } — same shape as
+    /run-code, minus the session_id requirement."""
+    body = await request.json()
+    language = body.get("language", "python")
+    code = body.get("code", "")
+    test_cases = body.get("test_cases", [])
+    stdin = body.get("stdin", "")
+
+    if not code.strip():
+        raise HTTPException(status_code=400, detail="Code cannot be empty")
+
+    from app.services.code_execution_service import run_test_cases, execute_code
+
+    if test_cases:
+        return await run_test_cases(language, code, test_cases, timeout=10)
+    exec_result = await execute_code(language, code, stdin=stdin, timeout=10)
+    return {
+        "total": 0,
+        "passed": 0,
+        "failed": 0,
+        "results": [],
+        "output": exec_result,
+    }
