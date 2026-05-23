@@ -1084,6 +1084,28 @@ async def schedule_interview(
     old_status = candidate.interview_status
     is_reschedule = old_status == "Scheduled"
 
+    # Terminal statuses represent a completed (or otherwise concluded) AI round.
+    # Rescheduling must not silently undo that — it would zero out the "AI Round"
+    # tab count and the "Interview Completed" card, and overwrite the candidate's
+    # real interview_date with the new schedule.
+    TERMINAL_STATUSES = {
+        "Completed",
+        "Terminated – Cheating Detected",
+        "Ended by Candidate",
+        "Candidate Terminated Prematurely",
+        "Terminated Prematurely",
+        "Disconnected – Network Issue",
+        "Candidate Dropped Interview",
+    }
+    if old_status in TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Candidate's interview is already '{old_status}'. "
+                "Move them back to a pre-interview stage before rescheduling."
+            ),
+        )
+
     # Log status change
     log = InterviewStatusLog(
         candidate_id=candidate.id,

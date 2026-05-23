@@ -26,6 +26,8 @@ class InterviewSettingsIn(BaseModel):
     secondary_cam: bool = False
     mode: str = "TRADITIONAL"
     max_questions: int = 10
+    max_coding_questions: int = 0
+    manual_coding_questions: bool = False
     auto_skip_timeout: int = 30
     special_instructions: str = ""
     scoring: str = "Standard Evaluation"
@@ -97,6 +99,8 @@ class InterviewSettingsOut(BaseModel):
     secondary_cam: bool
     mode: str
     max_questions: int
+    max_coding_questions: int = 0
+    manual_coding_questions: bool = False
     auto_skip_timeout: int
     special_instructions: Optional[str]
     scoring: str

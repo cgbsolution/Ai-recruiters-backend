@@ -509,7 +509,18 @@ async def publish_frames_ws(
             msg = await websocket.receive()
             # Accept either binary frames (preferred) or a text "ping".
             if "bytes" in msg and msg["bytes"] is not None:
-                broker.broadcast_frame(session_id, msg["bytes"])
+                # Broker errors MUST NOT disconnect the candidate. The frame
+                # relay is best-effort eye-candy for observers; the
+                # candidate's own interview (audio/video recording, Q&A,
+                # screenshots) does not depend on this.
+                try:
+                    broker.broadcast_frame(session_id, msg["bytes"])
+                except Exception as broker_exc:
+                    logger.warning(
+                        "publish_frames broker.broadcast_frame failed for "
+                        "session %s (ignoring, candidate keeps going): %s",
+                        session_id, broker_exc,
+                    )
             elif "text" in msg and msg["text"] is not None:
                 # Ignore — used as keepalive only.
                 continue

@@ -11,8 +11,23 @@ from app.models.job import (
     JobQuestion,
     JobResponsibility,
     JobSkill,
+    MixOfQuestions,
 )
 from app.schemas.job import JobCreate, JobUpdate
+
+
+def _normalize_mix_of_questions(raw) -> MixOfQuestions:
+    """Map any acceptable input (Enum, "mix", "MIX", "ai_only", ...) to the
+    canonical MixOfQuestions enum. Defaults to mix on unrecognized input so a
+    bad value never silently breaks the question plan."""
+    if isinstance(raw, MixOfQuestions):
+        return raw
+    if raw is None:
+        return MixOfQuestions.mix
+    try:
+        return MixOfQuestions(str(raw).upper())
+    except (ValueError, KeyError):
+        return MixOfQuestions.mix
 
 
 def _insert_children(db: Session, job: Job, data: JobCreate) -> None:
@@ -40,6 +55,8 @@ def _insert_children(db: Session, job: Job, data: JobCreate) -> None:
             secondary_cam=s.secondary_cam,
             mode=s.mode,
             max_questions=s.max_questions,
+            max_coding_questions=s.max_coding_questions if s.code_editor_required else 0,
+            manual_coding_questions=s.manual_coding_questions if s.code_editor_required else False,
             auto_skip_timeout=s.auto_skip_timeout,
             special_instructions=s.special_instructions,
             scoring=s.scoring,
@@ -83,7 +100,7 @@ def create_job(db: Session, data: JobCreate, org_id: Optional[int] = None) -> Jo
         manager_phone=data.manager_phone,
         manager_email=data.manager_email,
         evaluation_scoring=data.evaluation_scoring,
-        mix_of_questions=data.mix_of_questions,
+        mix_of_questions=_normalize_mix_of_questions(data.mix_of_questions),
         allow_to_contact=data.allow_to_contact,
         upload_jd=data.upload_jd,
         organization_id=org_id,
@@ -116,7 +133,7 @@ def update_job(db: Session, job_id: int, data: JobUpdate) -> Optional[Job]:
     job.manager_phone = data.manager_phone
     job.manager_email = data.manager_email
     job.evaluation_scoring = data.evaluation_scoring
-    job.mix_of_questions = data.mix_of_questions
+    job.mix_of_questions = _normalize_mix_of_questions(data.mix_of_questions)
     job.allow_to_contact = data.allow_to_contact
     job.upload_jd = data.upload_jd
 

@@ -19,6 +19,7 @@ from app.models.candidate import Candidate
 from app.models.interview import (
     CandidateFeedback,
     CodingSubmission,
+    Evaluation,
     InterviewMessage,
     InterviewScreenshot,
     InterviewSession,
@@ -38,11 +39,26 @@ from app.auth import require_roles
 
 
 def _check_and_increment_candidate_quota(db, job_id: int) -> None:
-    """Check lifetime candidate quota and increment counter. Raises 403 if exceeded."""
+    """Check lifetime candidate quota and increment counter atomically.
+
+    Raises 403 if exceeded. Uses SELECT ... FOR UPDATE to serialise concurrent
+    registrations on the SAME org so two simultaneous requests can't both
+    pass the check and overshoot the quota. Without this, a candidate
+    double-clicking submit while the org is at limit-minus-one would burn an
+    extra quota slot (see audit #12).
+    """
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job or not job.organization_id:
         return
-    org = db.query(Organization).filter(Organization.id == job.organization_id).first()
+    # Row-level lock on the organization for the duration of this transaction.
+    # Released on commit/rollback by SQLAlchemy. On SQLite (tests) FOR UPDATE
+    # is a no-op — that's fine, tests don't exercise concurrency.
+    org = (
+        db.query(Organization)
+        .filter(Organization.id == job.organization_id)
+        .with_for_update()
+        .first()
+    )
     if not org or (org.max_candidates_per_job or 0) == 0:
         return
     if (org.total_candidates_used or 0) >= org.max_candidates_per_job:
@@ -604,53 +620,87 @@ def apply_for_job(
 
 
 def _parse_resume_metadata_bg(meta_id: int):
-    """Background task to parse resume and update metadata."""
+    """Background task to parse resume and update metadata.
+
+    Retries up to 3 times with exponential backoff on transient failures
+    (OOM, network glitch fetching from a remote file store, etc.). Permanent
+    failures (file truly unreadable) abort early after attempt 1 since the
+    same input will fail the same way.
+    """
     from app.services.fast_resume_parser import extract_text_from_file, fast_parse_resume
-    db = SessionLocal()
-    try:
-        from app.models.resume_metadata import ResumeMetadata
-        meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
-        if not meta or not meta.resume_file_path:
-            return
+    import time as _time
 
-        meta.parsing_status = "processing"
-        db.commit()
+    last_exc: Optional[str] = None
+    permanent_failure = False
+    for attempt in range(1, 4):
+        if permanent_failure:
+            break
+        db = SessionLocal()
+        try:
+            from app.models.resume_metadata import ResumeMetadata
+            meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
+            if not meta or not meta.resume_file_path:
+                return
 
-        raw_text = extract_text_from_file(meta.resume_file_path)
-        if not raw_text:
-            meta.parsing_status = "failed"
-            meta.parsing_error = "Could not extract text from file"
+            meta.parsing_status = "processing"
+            db.commit()
+
+            raw_text = extract_text_from_file(meta.resume_file_path)
+            if not raw_text:
+                # Permanent: same input will produce same empty output.
+                meta.parsing_status = "failed"
+                meta.parsing_error = "Could not extract text from file"
+                db.commit()
+                permanent_failure = True
+                return
+
+            parsed = fast_parse_resume(raw_text)
+            meta.raw_text = raw_text
+            meta.candidate_name = parsed.get("candidate_name") or meta.candidate_name
+            meta.phone = parsed.get("phone") or meta.phone
+            meta.skills = json.dumps(parsed.get("skills", []))
+            meta.experience_years = parsed.get("experience_years")
+            meta.education = json.dumps(parsed.get("education", []))
+            meta.certifications = json.dumps(parsed.get("certifications", []))
+            meta.work_experience = json.dumps(parsed.get("work_experience", []))
+            meta.location = parsed.get("location") or meta.location
+            meta.current_designation = parsed.get("current_designation")
+            meta.keywords = json.dumps(parsed.get("keywords", []))
+            meta.personal_details = json.dumps(parsed.get("personal_details") or {})
+            meta.summary = parsed.get("summary")
+            meta.parsing_status = "completed"
+            meta.parsed_at = datetime.utcnow()
             db.commit()
             return
+        except Exception as e:
+            last_exc = f"{type(e).__name__}: {e}"
+            logging.exception(
+                "[ResumeParse] attempt %d/3 failed for meta_id=%s: %s",
+                attempt, meta_id, last_exc,
+            )
+            if attempt < 3:
+                _time.sleep(attempt * 2)  # 2s, 4s
+        finally:
+            db.close()
 
-        parsed = fast_parse_resume(raw_text)
-        meta.raw_text = raw_text
-        meta.candidate_name = parsed.get("candidate_name") or meta.candidate_name
-        meta.phone = parsed.get("phone") or meta.phone
-        meta.skills = json.dumps(parsed.get("skills", []))
-        meta.experience_years = parsed.get("experience_years")
-        meta.education = json.dumps(parsed.get("education", []))
-        meta.certifications = json.dumps(parsed.get("certifications", []))
-        meta.work_experience = json.dumps(parsed.get("work_experience", []))
-        meta.location = parsed.get("location") or meta.location
-        meta.current_designation = parsed.get("current_designation")
-        meta.keywords = json.dumps(parsed.get("keywords", []))
-        meta.personal_details = json.dumps(parsed.get("personal_details") or {})
-        meta.summary = parsed.get("summary")
-        meta.parsing_status = "completed"
-        meta.parsed_at = datetime.utcnow()
-        db.commit()
-    except Exception as e:
+    # All retries failed (transient) — mark failed for visibility so an admin
+    # can manually re-parse later.
+    if last_exc and not permanent_failure:
         try:
+            db = SessionLocal()
+            from app.models.resume_metadata import ResumeMetadata
             meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
             if meta:
                 meta.parsing_status = "failed"
-                meta.parsing_error = str(e)[:500]
+                meta.parsing_error = last_exc[:500]
                 db.commit()
-        except:
-            pass
-    finally:
-        db.close()
+        except Exception as final_exc:
+            logging.error("[ResumeParse] final-failure write also failed: %s", final_exc)
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 @router.post(
@@ -1280,8 +1330,60 @@ def log_violation(
             db.add(log)
             candidate.interview_status = "Terminated – Cheating Detected"
 
-    db.commit()
-    db.refresh(violation)
+    # Retry the commit on transient DB errors. A failed violation write
+    # bypasses cheating detection (a candidate at violation #5 could keep
+    # interviewing if this drops). We never want that, so retry hard.
+    import time as _time
+    commit_ok = False
+    last_err: Optional[str] = None
+    for attempt in range(1, 5):
+        try:
+            db.commit()
+            db.refresh(violation)
+            commit_ok = True
+            break
+        except Exception as exc:
+            last_err = f"{type(exc).__name__}: {exc}"
+            logging.error(
+                f"[Violation] commit attempt {attempt}/4 failed for session "
+                f"{session_id} (violation #{session.violation_count}): {last_err}"
+            )
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            # Re-add the row after rollback (rollback discards pending objects).
+            db.add(Violation(
+                session_id=session_id,
+                violation_type=v_type,
+                details=payload.details,
+                occurred_at=datetime.utcnow(),
+            ))
+            # Re-apply session/candidate mutations
+            session.violation_count = (session.violation_count or 0)
+            if should_terminate:
+                session.status = SessionStatus.terminated
+                session.completed_at = datetime.utcnow()
+                candidate = db.query(Candidate).filter(Candidate.id == session.candidate_id).first()
+                if candidate:
+                    candidate.interview_status = "Terminated – Cheating Detected"
+            if attempt < 4:
+                _time.sleep(attempt * 0.5)
+
+    if not commit_ok:
+        logging.critical(
+            f"[Violation] PERSIST FAILED after 4 attempts for session "
+            f"{session_id}. last_error={last_err}. Cheating detection may "
+            f"have been bypassed for this event."
+        )
+        # Still return 200 with should_terminate=True so the client at least
+        # honors the termination locally if it was already pending.
+        return ViolationResponse(
+            violation_id=0,
+            session_id=session_id,
+            total_violations=session.violation_count or 0,
+            should_terminate=should_terminate,
+        )
 
     return ViolationResponse(
         violation_id=violation.id,
@@ -1317,8 +1419,16 @@ def _set_eval_state(session_id: int, state: str, error: Optional[str] = None) ->
 
 
 async def _run_evaluation_background(session_id: int):
-    """Background task: generate evaluation with automatic retry.
-    Wrapped in asyncio.wait_for to prevent blocking the server indefinitely."""
+    """Background task: generate evaluation with automatic retry + exponential
+    backoff. Wrapped in asyncio.wait_for so a hung LLM can't block forever.
+
+    Guarantees (this is the user's main 'data not saving' concern):
+    - The evaluation_state in session_metadata is ALWAYS updated, even if
+      _do_evaluation crashes with an unexpected exception.
+    - If all retries fail, a STUB Evaluation row is created with null scores
+      and a failure-summary so GET /evaluation returns 200 (not 404) and the
+      retry button in the UI actually has something to retry.
+    """
     MAX_RETRIES = 4
     TOTAL_TIMEOUT = 360  # 6 minutes total — per-attempt LLM timeout is 90s
 
@@ -1355,31 +1465,75 @@ async def _run_evaluation_background(session_id: int):
 
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}"
-                logging.error(
-                    f"[Evaluation] FAILED attempt {attempt + 1} for session {session_id}: {last_error}"
+                logging.exception(
+                    f"[Evaluation] FAILED attempt {attempt + 1} for session {session_id}"
                 )
                 if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(3)  # Short retry delay — don't block server
+                    # Exponential backoff with jitter so we don't hammer a
+                    # struggling LLM provider: 2s, 5s, 11s, capped at 30s.
+                    import random
+                    backoff = min(30, (2 ** (attempt + 1)) + random.uniform(0, 1))
+                    await asyncio.sleep(backoff)
                 else:
                     logging.error(f"[Evaluation] ALL {MAX_RETRIES} RETRIES FAILED for session {session_id}")
             finally:
                 db.close()
 
+    # Top-level guard: any unhandled exception inside _do_evaluation (e.g. an
+    # asyncio cancellation, a bug in _set_eval_state, an import error) must
+    # still leave the candidate with a "failed" state and a stub row — never
+    # a permanent "processing..." spinner.
     try:
-        await asyncio.wait_for(_do_evaluation(), timeout=TOTAL_TIMEOUT)
-    except asyncio.TimeoutError:
-        last_error = f"Evaluation timed out after {TOTAL_TIMEOUT}s"
-        logging.error(f"[Evaluation] TOTAL TIMEOUT ({TOTAL_TIMEOUT}s) for session {session_id} — giving up")
-
-    # If we got here without a `done` state already set, mark as failed so the
-    # frontend's polling sees the failure and shows the Retry button.
-    db = SessionLocal()
-    try:
-        session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
-        if session and not session.evaluation:
-            _set_eval_state(session_id, "failed", error=last_error or "Unknown error")
+        try:
+            await asyncio.wait_for(_do_evaluation(), timeout=TOTAL_TIMEOUT)
+        except asyncio.TimeoutError:
+            last_error = f"Evaluation timed out after {TOTAL_TIMEOUT}s"
+            logging.error(f"[Evaluation] TOTAL TIMEOUT ({TOTAL_TIMEOUT}s) for session {session_id}")
+        except Exception as outer:
+            last_error = f"{type(outer).__name__}: {outer}"
+            logging.exception(
+                f"[Evaluation] _do_evaluation crashed unexpectedly for session {session_id}"
+            )
     finally:
-        db.close()
+        # If we got here without a `done` state already set, mark as failed
+        # AND insert a stub Evaluation row so the recruiter UI shows
+        # "evaluation failed — retry" instead of a 404 dead end.
+        db = SessionLocal()
+        try:
+            session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+            if session and not session.evaluation:
+                _set_eval_state(session_id, "failed", error=last_error or "Unknown error")
+                try:
+                    stub = Evaluation(
+                        session_id=session_id,
+                        candidate_id=session.candidate_id,
+                        summary=(
+                            "Evaluation could not be generated automatically. "
+                            f"Last error: {last_error or 'Unknown error'}. "
+                            "Click 'Re-generate' to try again."
+                        ),
+                        meets_threshold=False,
+                    )
+                    db.add(stub)
+                    db.commit()
+                    logging.info(
+                        f"[Evaluation] Stub row created for failed session {session_id}"
+                    )
+                except Exception as stub_exc:
+                    logging.error(
+                        f"[Evaluation] Could not create stub row for session "
+                        f"{session_id}: {stub_exc}"
+                    )
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+        except Exception as final_exc:
+            logging.exception(
+                f"[Evaluation] Final cleanup also failed for session {session_id}: {final_exc}"
+            )
+        finally:
+            db.close()
 
 
 @router.post(
@@ -1806,18 +1960,52 @@ async def upload_recording(
         except Exception as exc:
             logging.warning("[Recording] Remux skipped for %s: %s", file_path, exc)
 
-    # Update candidate record
+    # Update candidate record. The file is already durable on disk at this
+    # point — even if this DB commit fails, the recording is recoverable from
+    # /uploads/recordings/{session_id}.* and an operator can repair the link.
+    # We retry the commit on transient errors so we don't fail this loud.
+    db_link_saved = False
     if session.candidate_id:
         candidate = db.query(Candidate).filter(Candidate.id == session.candidate_id).first()
         if candidate:
             candidate.recording_link = recording_link
             candidate.video_duration = duration or "0:00"
-            db.commit()
+            for attempt in range(1, 4):
+                try:
+                    db.commit()
+                    db_link_saved = True
+                    break
+                except Exception as link_exc:
+                    logging.error(
+                        f"[Recording] candidate.recording_link commit attempt {attempt}/3 "
+                        f"failed for session {session_id}: {link_exc}"
+                    )
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    if attempt == 3:
+                        # File is durable on disk; DB link update failed. Log
+                        # loud so an operator can repair, but return success
+                        # because the candidate's data is NOT lost.
+                        logging.error(
+                            f"[Recording] FILE SAVED but DB link NOT updated for session "
+                            f"{session_id}. Recover via: UPDATE candidates SET "
+                            f"recording_link='{recording_link}', video_duration='"
+                            f"{duration or '0:00'}' WHERE id={session.candidate_id};"
+                        )
+                    else:
+                        import time as _t
+                        _t.sleep(attempt * 0.5)
 
     return RecordingUploadResponse(
         recording_link=recording_link,
         video_duration=duration or "0:00",
-        message="Recording saved successfully.",
+        message=(
+            "Recording saved successfully."
+            if db_link_saved or not session.candidate_id
+            else "Recording file saved; link update pending — admin will be notified."
+        ),
     )
 
 
@@ -1944,17 +2132,37 @@ async def upload_screenshot(
         except ValueError:
             detected_faces = 1
 
-    # Persist screenshot record to DB for proctoring audit trail
+    # Persist screenshot record to DB for proctoring audit trail. If the DB
+    # write fails, the file IS already on disk — so we don't fail the request,
+    # we just log loud so an operator can backfill the audit trail. The
+    # candidate's interview must NOT halt over a screenshot DB hiccup.
     screenshot = InterviewScreenshot(
         session_id=session_id,
         file_path=relative_path,
         captured_at=datetime.utcnow(),
         face_count=detected_faces,
     )
-    db.add(screenshot)
-    db.commit()
+    db_saved = False
+    try:
+        db.add(screenshot)
+        db.commit()
+        db_saved = True
+    except Exception as db_exc:
+        logging.error(
+            f"[Screenshot] DB write failed for session {session_id} "
+            f"(file IS saved at {relative_path}): {db_exc}"
+        )
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
-    return {"ok": True, "path": relative_path, "face_count": detected_faces}
+    return {
+        "ok": True,
+        "path": relative_path,
+        "face_count": detected_faces,
+        "db_saved": db_saved,
+    }
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -2149,7 +2357,20 @@ async def submit_code(
     # dedicated tab, and lets the evaluator score coding separately from
     # verbal answers. Failure to write this MUST NOT block the interview —
     # we wrap defensively so a schema drift never breaks the candidate UX.
+    # Pre-serialize the test_results so a non-JSON-friendly object (custom
+    # exception, set, etc.) doesn't crash the whole write at commit time.
     try:
+        results_payload = test_result.get("results", [])
+        try:
+            test_results_json = json.dumps(results_payload, default=str)
+        except Exception as ser_exc:
+            logging.error(
+                "[submit_code] test_results JSON serialization failed for session "
+                "%s: %s — storing empty list to keep the row valid",
+                session_id, ser_exc,
+            )
+            test_results_json = "[]"
+
         db.add(CodingSubmission(
             session_id=session.id,
             question_index=question_index,
@@ -2160,18 +2381,32 @@ async def submit_code(
             code=code,
             test_cases_total=int(test_result.get("total", 0)),
             test_cases_passed=int(test_result.get("passed", 0)),
-            test_results=json.dumps(test_result.get("results", [])),
+            test_results=test_results_json,
             execution_time_ms=exec_ms,
         ))
     except Exception as e:
         logging.warning("[submit_code] failed to persist CodingSubmission: %s", e)
 
-    db.commit()
+    # Commit the candidate's submission + transcript message BEFORE we touch
+    # the AI. If the AI review call subsequently fails, the candidate's code
+    # is already saved — they don't lose their work over a Claude/Gemini
+    # outage.
+    try:
+        db.commit()
+    except Exception as commit_exc:
+        logging.error("[submit_code] commit failed for session %s: %s", session_id, commit_exc)
+        db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="Could not save submission. Please try again in a moment.",
+        )
 
-    # Now get AI's response about the code
+    # Now get AI's response about the code. This is best-effort: if it fails,
+    # the candidate still sees their test results and the interview can
+    # continue on the next /message call (which will see the saved
+    # CodingSubmission in history).
     from app.services.avatar_interview_service import conduct_turn
 
-    # Send code context to AI for discussion
     ai_context = (
         f"The candidate submitted code for the coding challenge.\n"
         f"Language: {language}\n"
@@ -2180,7 +2415,29 @@ async def submit_code(
         f"Please review their solution, discuss their approach, and then continue the interview."
     )
 
-    ai_response = await conduct_turn(session, ai_context, db)
+    ai_response: Optional[dict] = None
+    try:
+        ai_response = await conduct_turn(session, ai_context, db)
+    except Exception as ai_exc:
+        logging.exception(
+            "[submit_code] AI review failed for session %s — code IS saved, "
+            "candidate can continue: %s", session_id, ai_exc,
+        )
+        # Don't abort the request — the candidate's submission is durable.
+        # The client should fall back to showing the test results and let the
+        # candidate continue with the next interview message.
+        ai_response = {
+            "session_id": session_id,
+            "message": (
+                "Thanks for submitting. I'm reviewing your code — "
+                "please continue to the next question."
+            ),
+            "question_index": session.current_question_index,
+            "is_complete": False,
+            "is_off_topic": False,
+            "role": "ai",
+            "ai_review_failed": True,
+        }
 
     return {
         "test_result": test_result,
@@ -2274,7 +2531,12 @@ async def list_coding_submissions(
     for r in rows:
         try:
             test_results = json.loads(r.test_results) if r.test_results else []
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as parse_exc:
+            logging.warning(
+                "[list_coding_submissions] corrupt test_results JSON on row "
+                "id=%s (session=%s): %s — returning empty list",
+                r.id, session_id, parse_exc,
+            )
             test_results = []
         out.append({
             "id": r.id,

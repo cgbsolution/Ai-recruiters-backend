@@ -34,26 +34,75 @@ VIOLATION_TERMINATE_THRESHOLD = 5
 
 def _build_question_plan(job: Job, settings_obj: Optional[InterviewSettings]) -> tuple:
     """
-    Build the question plan based on job config.
-    Returns (predefined_questions: list[str], ai_question_count: int, max_q: int, mode_str: str).
+    Build the VERBAL question plan based on job config. Coding questions are
+    handled separately (see _build_system_prompt + conduct_turn) — they're a
+    fixed-count phase appended after the verbal phase.
+    Returns (predefined_questions: list[str], ai_question_count: int,
+             verbal_count: int, mode_str: str).
     """
     from app.models.job import MixOfQuestions
 
-    max_q = settings_obj.max_questions if settings_obj else 8
-    mix_mode = job.mix_of_questions if job.mix_of_questions else MixOfQuestions.mix
+    max_q_verbal = settings_obj.max_questions if settings_obj else 8
+    # max_questions must be at least 1 — guard against bad data so the
+    # interview never collapses to zero verbal questions.
+    if not max_q_verbal or max_q_verbal < 1:
+        max_q_verbal = 8
 
-    predefined = [q.text for q in job.questions] if job.questions else []
-
-    if mix_mode == MixOfQuestions.only and predefined:
-        # ONLY predefined questions — override max_q to match
-        return predefined, 0, len(predefined), "ONLY_PREDEFINED"
-    elif predefined:
-        # MIX mode — use predefined + fill remainder with AI
-        ai_count = max(0, max_q - len(predefined))
-        return predefined, ai_count, max_q, "MIX"
+    raw_mode = job.mix_of_questions if job.mix_of_questions else MixOfQuestions.mix
+    # `mix_of_questions` is a SQLAlchemy Enum column, but the API sometimes
+    # writes a raw lowercase string ("mix" / "only" / "ai_only") via the
+    # Pydantic schema. Normalize both forms so the equality checks below are
+    # reliable.
+    if isinstance(raw_mode, MixOfQuestions):
+        mix_mode = raw_mode
     else:
-        # No predefined — all AI-generated
-        return [], max_q, max_q, "ALL_AI"
+        try:
+            mix_mode = MixOfQuestions(str(raw_mode).upper())
+        except (ValueError, KeyError):
+            mix_mode = MixOfQuestions.mix
+
+    # Predefined questions with category=="coding" are reserved for the
+    # manual-coding-questions path; they MUST NOT be asked verbally.
+    predefined = [
+        q.text
+        for q in (job.questions or [])
+        if (getattr(q, "category", None) or "").lower() != "coding"
+    ]
+
+    if mix_mode == MixOfQuestions.ai_only:
+        # Recruiter explicitly opted out of predefined questions — ignore any
+        # leftover JobQuestion rows from a previous mode and ask AI-only.
+        plan = ([], max_q_verbal, max_q_verbal, "ALL_AI")
+    elif mix_mode == MixOfQuestions.only and predefined:
+        # ONLY predefined questions — verbal count is forced to len(predefined)
+        plan = (predefined, 0, len(predefined), "ONLY_PREDEFINED")
+    elif predefined:
+        # MIX mode — predefined + AI fills remainder of verbal phase.
+        # If the recruiter loaded more predefined questions than max_questions,
+        # bump max_q_verbal up so every predefined question still gets asked
+        # AND we still add at least one AI question to honor "Mix" intent.
+        if len(predefined) >= max_q_verbal:
+            adjusted = len(predefined) + 1
+            logger.warning(
+                "[question_plan] job=%s has %d predefined questions but max_questions=%d "
+                "— bumping verbal count to %d so MIX mode still asks at least 1 AI question",
+                getattr(job, "id", None), len(predefined), max_q_verbal, adjusted,
+            )
+            max_q_verbal = adjusted
+        ai_count = max_q_verbal - len(predefined)
+        plan = (predefined, ai_count, max_q_verbal, "MIX")
+    else:
+        # No predefined — verbal phase is fully AI-generated
+        plan = ([], max_q_verbal, max_q_verbal, "ALL_AI")
+
+    logger.info(
+        "[question_plan] job=%s mode_in=%s mode_resolved=%s max_q_verbal_setting=%s "
+        "predefined=%d -> plan: predefined=%d ai=%d verbal_total=%d mode=%s",
+        getattr(job, "id", None), raw_mode, mix_mode.value,
+        settings_obj.max_questions if settings_obj else None,
+        len(predefined), len(plan[0]), plan[1], plan[2], plan[3],
+    )
+    return plan
 
 
 LANGUAGE_INSTRUCTIONS = {
@@ -214,6 +263,144 @@ SCORING GUIDANCE (internal — do not share with candidate):
 - Skips or says "I don't know" → 0, flag as critical gap in evaluation"""
 
 
+def _safe_commit(db: Session, label: str, max_attempts: int = 3) -> None:
+    """Commit with retry on transient errors.
+
+    PostgreSQL/psycopg occasionally raises OperationalError (connection
+    reset, deadlock detected, server restarting). For the interview hot-path
+    losing data on a 1-in-1000 transient hiccup is unacceptable, so we retry
+    with short backoff. After max_attempts we rollback and re-raise — the
+    caller decides whether the response should still go through (e.g. a
+    cached fallback) or surface 5xx.
+    """
+    import time
+    from sqlalchemy.exc import OperationalError, DBAPIError, IntegrityError
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            db.commit()
+            return
+        except IntegrityError:
+            # Not transient — caller violated a constraint. Rollback and bubble
+            # up so the bug is visible instead of being retried forever.
+            db.rollback()
+            raise
+        except (OperationalError, DBAPIError) as exc:
+            if attempt >= max_attempts:
+                logger.error(
+                    f"[_safe_commit] {label} — exhausted {max_attempts} attempts: {exc}"
+                )
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                raise
+            logger.warning(
+                f"[_safe_commit] {label} — transient DB error on attempt "
+                f"{attempt}/{max_attempts}: {exc}. Retrying in {attempt * 0.5}s."
+            )
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            time.sleep(attempt * 0.5)
+
+
+def _build_coding_section(
+    *,
+    code_editor_enabled: bool,
+    coding_count: int,
+    max_q_verbal: int,
+    max_q: int,
+    skills: str,
+    manual_coding_enabled: bool,
+    manual_coding_prompts: list,
+) -> str:
+    """Render the CODING QUESTIONS block of the system prompt.
+
+    Separated out because the f-string version mixed ternaries with `+` which
+    triggers a Python precedence trap (ternary binds looser than `+`, so naïve
+    `A + B if cond else C + D` parses as `(A+B) if cond else (C+D)` and drops
+    pieces). A plain function is easier to read and trivially correct.
+    """
+    if not (code_editor_enabled and coding_count > 0):
+        return (
+            "CODE EDITOR IS DISABLED for this interview.\n"
+            "- Do NOT ask any practical coding questions that require writing code.\n"
+            "- Do NOT include a \"coding_question\" object in your response — always set it to null.\n"
+            "- Keep all questions verbal/conceptual: ask about concepts, approaches, design patterns, debugging strategies, etc.\n"
+            "- You may ask the candidate to EXPLAIN how they would write code or describe an algorithm, but NEVER ask them to actually write or type code."
+        )
+
+    coding_turns_csv = ", ".join(str(i) for i in range(max_q_verbal + 1, max_q + 1))
+    s_or_empty = "s" if coding_count > 1 else ""
+    are_or_is = "s are" if coding_count > 1 else " is"
+
+    header = (
+        f"CODE EDITOR IS ENABLED — {coding_count} coding challenge{are_or_is} MANDATORY and happen at the END of the interview.\n\n"
+        f"CODING PLAN for this session:\n"
+        f"- Verbal questions: {max_q_verbal}  (turns 1 through {max_q_verbal})\n"
+        f"- Coding questions: {coding_count}  (turns {max_q_verbal + 1} through {max_q})\n"
+        f"- Total turns: {max_q}\n"
+        f"- Coding turns: {coding_turns_csv}\n\n"
+        f"⚠️ HARD REQUIREMENT — NON-NEGOTIABLE:\n"
+        f"- On any turn where `question_index` is in the Coding turns list above, you MUST emit a `coding_question` object.\n"
+        f"- On every OTHER turn, `coding_question` MUST be null.\n"
+        f"- Do NOT ask coding questions before the theory round is complete.\n"
+        f"- Do NOT skip the coding round even if the candidate was skipping or giving weak answers — the coding round is mandatory.\n"
+        f"- Ask EXACTLY {coding_count} coding question{s_or_empty} — not more, not fewer.\n\n"
+        f"When emitting a coding question, the JSON response MUST be:\n"
+        f"- \"message\" EXACTLY: \"Please click on the top-left button to start the coding test.\"\n"
+        f"- \"coding_question\": fully-populated object (see shape below).\n"
+        f"- Do NOT read the problem description aloud. The candidate reads it in the editor.\n"
+    )
+
+    if manual_coding_enabled and manual_coding_prompts:
+        recruiter_lines = "\n".join(
+            f"  Coding {i+1} (turn {max_q_verbal + 1 + i}): {p}"
+            for i, p in enumerate(manual_coding_prompts)
+        )
+        authoring = (
+            f"\nAUTHORING RULES — RECRUITER-AUTHORED PROMPTS (manual_coding_questions=ON):\n"
+            f"The recruiter has supplied EXACTLY {len(manual_coding_prompts)} coding problem prompt(s). "
+            f"You MUST use them IN ORDER for the {coding_count} coding turn(s). "
+            f"Do NOT invent your own problem when a recruiter prompt is provided.\n\n"
+            f"Recruiter prompts (one per coding turn, in order):\n{recruiter_lines}\n\n"
+            f"For each recruiter prompt above, expand it into the full coding_question format below. "
+            f"Faithfully reflect the recruiter's intent — do NOT change the topic, but you MAY add a clear "
+            f"input/output spec, constraints, and AT LEAST 3 test cases. Use stdin/stdout I/O only — no function signatures.\n"
+        )
+    else:
+        diversity_line = (
+            "\n- The problems MUST cover DIFFERENT skill areas (e.g., one on arrays, one on strings) — do not repeat the same pattern."
+            if coding_count > 1 else ""
+        )
+        authoring = (
+            f"\nAUTHORING RULES — tailor the problem to THIS candidate:\n"
+            f"- The problem MUST reflect the role ({skills}) and the candidate's resume (see Candidate Background above).\n"
+            f"- For a frontend / full-stack role, favour DOM-free JS logic problems (array/string/object manipulation, simple algorithms) that work via stdin/stdout.\n"
+            f"- For a backend / data role, favour parsing, sorting, counting, or simple graph/tree traversal.\n"
+            f"- For a senior candidate, pick \"hard\"; mid-level → \"medium\"; junior → \"easy\".{diversity_line}\n"
+            f"- EVERY problem MUST include AT LEAST 3 test cases (normal + edge cases). Use stdin/stdout I/O only — no function signatures.\n"
+        )
+
+    footer = (
+        "\ncoding_question format (ALL fields required):\n"
+        "{\n"
+        "  \"title\": \"Short problem title\",\n"
+        "  \"description\": \"Full problem description with input/output format, constraints, and at least one worked example\",\n"
+        "  \"test_cases\": [\n"
+        "    {\"input\": \"stdin text\", \"expected_output\": \"stdout text\", \"description\": \"what this test verifies\"},\n"
+        "    {\"input\": \"...\", \"expected_output\": \"...\", \"description\": \"...\"}\n"
+        "  ],\n"
+        "  \"time_limit\": 15,\n"
+        "  \"difficulty\": \"easy | medium | hard\"\n"
+        "}\n"
+    )
+
+    return header + authoring + footer
+
+
 def _build_system_prompt(job: Job, candidate: Candidate, settings_obj: Optional[InterviewSettings], language: str = "en") -> str:
     skills = ", ".join([s.skill for s in job.skills]) if job.skills else "general skills"
     mode = settings_obj.mode.value if settings_obj else "TRADITIONAL"
@@ -222,7 +409,33 @@ def _build_system_prompt(job: Job, candidate: Candidate, settings_obj: Optional[
     resume_based = settings_obj.resume_based if settings_obj else True
     code_editor_enabled = settings_obj.code_editor_required if settings_obj else False
 
-    predefined, ai_count, max_q, q_mode = _build_question_plan(job, settings_obj)
+    predefined, ai_count, max_q_verbal, q_mode = _build_question_plan(job, settings_obj)
+    coding_count = (
+        (settings_obj.max_coding_questions if settings_obj else 0)
+        if code_editor_enabled
+        else 0
+    )
+    # max_q is the TOTAL number of turns (verbal phase + coding phase). The AI
+    # prompt uses max_q everywhere it refers to "last question / question_index
+    # ceiling", so keeping it as the grand total preserves all existing turn
+    # logic. The coding-plan section below carves out the last `coding_count`
+    # turns explicitly.
+    max_q = max_q_verbal + coding_count
+    # Pull manually-authored coding question prompts (JobQuestion rows with
+    # category="coding"). These are recruiter-authored and used verbatim when
+    # the job is configured with manual_coding_questions=True.
+    manual_coding_enabled = bool(
+        getattr(settings_obj, "manual_coding_questions", False)
+        if settings_obj else False
+    )
+    manual_coding_prompts: list[str] = []
+    if code_editor_enabled and manual_coding_enabled:
+        manual_coding_prompts = [
+            q.text
+            for q in (job.questions or [])
+            if (getattr(q, "category", None) or "").lower() == "coding"
+            and (q.text or "").strip()
+        ]
 
     resume_context = ""
     if candidate:
@@ -243,6 +456,9 @@ Candidate Background:
             resume_context += "- NOTE: Resume-based questions are DISABLED. Do NOT ask questions about the candidate's resume, past projects, or specific work history. Focus only on the job description, required skills, and general technical/behavioral questions.\n"
 
     # ── Build question plan section ──
+    # Note: max_q_verbal is the count of VERBAL turns; max_q is the GRAND TOTAL
+    # (verbal + coding). Coding turns are handled separately in the CODING
+    # QUESTIONS section below.
     question_plan_section = ""
     if q_mode == "ONLY_PREDEFINED":
         numbered = "\n".join(f"  Q{i+1}: {q}" for i, q in enumerate(predefined))
@@ -255,7 +471,7 @@ You MUST ask ONLY these EXACT predefined questions in the order shown.
 - Do NOT generate your own questions
 - Do NOT skip, rephrase, combine, or replace any predefined question
 - Ask them EXACTLY as written
-- Total questions to ask: {max_q}
+- Verbal questions to ask: {max_q_verbal}
 
 PREDEFINED QUESTIONS (ask in this EXACT order):
 {numbered}
@@ -264,9 +480,7 @@ FLOW:
 1. Opening: Give intro + ask candidate to introduce themselves (question_index=0)
 2. After self-intro: Acknowledge briefly, then ask Q1 as written (question_index=1)
 3. For each subsequent question: Ask it as written, wait for answer, then ask next
-4. After the candidate answers Q{max_q}, set is_complete to true
-
-After asking ALL {max_q} questions and receiving answers, set is_complete to true.
+4. After the candidate answers Q{max_q_verbal}, proceed to the coding round if enabled, otherwise set is_complete to true
 """
     elif q_mode == "MIX":
         numbered = "\n".join(f"  Q{i+1}: {q}" for i, q in enumerate(predefined))
@@ -275,16 +489,16 @@ After asking ALL {max_q} questions and receiving answers, set is_complete to tru
 QUESTION PLAN (MODE: MIX — Predefined + AI-Generated)
 ═══════════════════════════════════════════════════════════════
 
-Total questions: {max_q}
+Verbal questions: {max_q_verbal}
   - Predefined: {len(predefined)} questions (must be asked FIRST in exact order)
-  - AI-Generated: {ai_count} additional questions (after all predefined ones)
+  - AI-Generated: {ai_count} additional verbal questions (after all predefined ones)
 
 PHASE 1 — PREDEFINED QUESTIONS (Q1 to Q{len(predefined)}):
 Ask these in EXACT order, EXACTLY as written. Do NOT rephrase or skip:
 {numbered}
 
-PHASE 2 — AI-GENERATED QUESTIONS (Q{len(predefined) + 1} to Q{max_q}):
-Generate {ai_count} dynamic questions based on:
+PHASE 2 — AI-GENERATED VERBAL QUESTIONS (Q{len(predefined) + 1} to Q{max_q_verbal}):
+Generate {ai_count} dynamic verbal questions based on:
   - Job description and required skills: {", ".join([s.skill for s in job.skills] if job.skills else ["general skills"])}
   - Candidate's previous answers
   - Gaps in technical depth, problem-solving, behavioral, situational coverage
@@ -293,10 +507,19 @@ FLOW:
 1. Opening: Give intro + ask candidate to introduce themselves (question_index=0)
 2. After self-intro: Acknowledge briefly, then ask Q1 — the first PREDEFINED question (question_index=1)
 3. Questions Q1–Q{len(predefined)}: Ask predefined questions exactly as written
-4. Questions Q{len(predefined) + 1}–Q{max_q}: Generate and ask {ai_count} new questions
-5. After Q{max_q} is answered: Set is_complete to true
+4. Questions Q{len(predefined) + 1}–Q{max_q_verbal}: Generate and ask {ai_count} new verbal questions
+5. After Q{max_q_verbal} is answered: Proceed to the coding round if enabled, otherwise set is_complete to true
 
-CRITICAL: You MUST ask exactly {max_q} questions total. Stop and complete after Q{max_q}.
+⚠️ CRITICAL RULES FOR MIX MODE — DO NOT VIOLATE:
+- You MUST ask exactly {max_q_verbal} verbal questions total.
+- Finishing the {len(predefined)} predefined question(s) is NOT the end of the interview.
+  After Q{len(predefined)} is answered, your VERY NEXT message MUST ask Q{len(predefined) + 1}
+  (the first AI-generated question). Do NOT thank the candidate, do NOT say goodbye,
+  do NOT set is_complete=true. Acknowledge in one sentence and ask Q{len(predefined) + 1} immediately.
+- is_complete MUST remain false for questions Q1 through Q{max_q_verbal - 1}.
+- is_complete MAY become true ONLY after the candidate has answered Q{max_q_verbal}
+  (or candidate explicitly asks to end).
+- Coding questions (if enabled) come AFTER the {max_q_verbal} verbal questions, not before.
 """
     else:
         question_plan_section = f"""
@@ -304,18 +527,18 @@ CRITICAL: You MUST ask exactly {max_q} questions total. Stop and complete after 
 QUESTION PLAN (MODE: ALL AI-GENERATED)
 ═══════════════════════════════════════════════════════════════
 
-Generate ALL {max_q} questions dynamically. No predefined questions.
-- Total questions: {max_q}
+Generate ALL {max_q_verbal} VERBAL questions dynamically. No predefined questions.
+- Verbal questions: {max_q_verbal}
 - Base on: job description, required skills ({skills}), and candidate's answers
 - Coverage: technical depth, problem-solving, system design, behavioral, situational
 
 FLOW:
 1. Opening: Give intro + ask candidate to introduce themselves (question_index=0)
 2. After self-intro: Acknowledge briefly, then generate and ask Q1 (question_index=1)
-3. For each subsequent question: Based on candidate's answer, generate and ask Q2, Q3, ..., Q{max_q}
-4. After Q{max_q} is answered: Set is_complete to true
+3. For each subsequent question: Based on candidate's answer, generate and ask Q2, Q3, ..., Q{max_q_verbal}
+4. After Q{max_q_verbal} is answered: Proceed to the coding round if enabled, otherwise set is_complete to true
 
-CRITICAL: Ask exactly {max_q} questions total. Stop and complete after Q{max_q}.
+CRITICAL: Ask exactly {max_q_verbal} verbal questions total. Coding questions (if enabled) come AFTER.
 """
 
     lang_instruction = LANGUAGE_INSTRUCTIONS.get(language, "")
@@ -404,49 +627,15 @@ J. If candidate asks "how many questions left" — tell them exactly: "You have 
 ═══════════════════════════════════════════════════════════════
 CODING QUESTIONS
 ═══════════════════════════════════════════════════════════════
-{"" if code_editor_enabled else """CODE EDITOR IS DISABLED for this interview.
-- Do NOT ask any practical coding questions that require writing code.
-- Do NOT include a "coding_question" object in your response — always set it to null.
-- Keep all questions verbal/conceptual: ask about concepts, approaches, design patterns, debugging strategies, etc.
-- You may ask the candidate to EXPLAIN how they would write code or describe an algorithm, but NEVER ask them to actually write or type code."""}
-{"" if not code_editor_enabled else (lambda _cc=max(1, round(max_q * 0.2)): f"""CODE EDITOR IS ENABLED — coding challenges are MANDATORY and happen at the END of the interview.
-
-CODING PLAN for this session:
-- Total questions: {max_q}
-- Number of coding questions: {_cc}  (≈20% of total, minimum 1)
-- Theory/verbal questions: {max_q - _cc}  (turns 1 through {max_q - _cc})
-- Coding turns: {", ".join(str(i) for i in range(max_q - _cc + 1, max_q + 1))}  (last {_cc} turn{'s' if _cc > 1 else ''} of the interview)
-
-⚠️ HARD REQUIREMENT — NON-NEGOTIABLE:
-- On any turn where `question_index` is in the Coding turns list above, you MUST emit a `coding_question` object.
-- On every OTHER turn, `coding_question` MUST be null.
-- Do NOT ask coding questions before the theory round is complete.
-- Do NOT skip the coding round even if the candidate was skipping or giving weak answers — the coding round is mandatory.
-
-When emitting a coding question, the JSON response MUST be:
-- "message" EXACTLY: "Please click on the top-left button to start the coding test."
-- "coding_question": fully-populated object (see shape below).
-- Do NOT read the problem description aloud. The candidate reads it in the editor.
-
-AUTHORING RULES — tailor the problem to THIS candidate:
-- The problem MUST reflect the role ({skills}) and the candidate's resume (see Candidate Background above).
-- For a frontend / full-stack role, favour DOM-free JS logic problems (array/string/object manipulation, simple algorithms) that work via stdin/stdout.
-- For a backend / data role, favour parsing, sorting, counting, or simple graph/tree traversal.
-- For a senior candidate, pick "hard"; mid-level → "medium"; junior → "easy".
-- If {_cc} > 1, the problems MUST cover DIFFERENT skill areas (e.g., one on arrays, one on strings) — do not repeat the same pattern.
-- EVERY problem MUST include AT LEAST 3 test cases (normal + edge cases). Use stdin/stdout I/O only — no function signatures.
-
-coding_question format (ALL fields required):
-{{{{
-  "title": "Short problem title",
-  "description": "Full problem description with input/output format, constraints, and at least one worked example",
-  "test_cases": [
-    {{{{"input": "stdin text", "expected_output": "stdout text", "description": "what this test verifies"}}}},
-    {{{{"input": "...", "expected_output": "...", "description": "..."}}}}
-  ],
-  "time_limit": 15,
-  "difficulty": "easy | medium | hard"
-}}}}""")()}
+{_build_coding_section(
+    code_editor_enabled=code_editor_enabled,
+    coding_count=coding_count,
+    max_q_verbal=max_q_verbal,
+    max_q=max_q,
+    skills=skills,
+    manual_coding_enabled=manual_coding_enabled,
+    manual_coding_prompts=manual_coding_prompts,
+)}
 
 ═══════════════════════════════════════════════════════════════
 RESPONSE FORMAT — STRICT RULES
@@ -623,27 +812,95 @@ async def conduct_turn(
     candidate_message: Optional[str],
     db: Session,
 ) -> dict:
+    """Drive one interview turn. Wraps the main body so that ANY unexpected
+    exception (sanitisation regex bug, AI returning weird shapes, DB transient
+    error) still leaves the chat history in a consistent state — the user's
+    answer is saved and a graceful "had a brief hiccup" reply is returned
+    instead of a 500 that drops the message."""
+    try:
+        return await _conduct_turn_impl(session, candidate_message, db)
+    except Exception as exc:
+        logger.exception(
+            f"[conduct_turn] unhandled error for session {session.id}: {exc}"
+        )
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        # Last-resort: save the candidate message + a generic AI reply so the
+        # turn isn't lost. If THIS also fails, we re-raise so the client at
+        # least sees an error rather than thinking the answer was accepted.
+        try:
+            if candidate_message is not None:
+                db.add(InterviewMessage(
+                    session_id=session.id,
+                    role="candidate",
+                    content=candidate_message,
+                    question_index=session.current_question_index,
+                ))
+            next_qi = (session.current_question_index or 0) + 1
+            fallback_msg = "Sorry, I had a brief hiccup on my end. Let's keep going — could you tell me a bit about your most recent project?"
+            db.add(InterviewMessage(
+                session_id=session.id,
+                role="ai",
+                content=fallback_msg,
+                question_index=next_qi,
+            ))
+            session.current_question_index = next_qi
+            _safe_commit(db, f"conduct_turn emergency fallback session={session.id}")
+            return {
+                "session_id": session.id,
+                "message": fallback_msg,
+                "question_index": next_qi,
+                "is_complete": False,
+                "is_off_topic": False,
+                "role": "ai",
+            }
+        except Exception as inner:
+            logger.error(
+                f"[conduct_turn] emergency fallback ALSO failed for session "
+                f"{session.id}: {inner}. Re-raising original exception."
+            )
+            raise exc
+
+
+async def _conduct_turn_impl(
+    session: InterviewSession,
+    candidate_message: Optional[str],
+    db: Session,
+) -> dict:
     job = db.query(Job).filter(Job.id == session.job_id).first()
     candidate = db.query(Candidate).filter(Candidate.id == session.candidate_id).first() if session.candidate_id else None
     interview_settings = job.interview_settings if job else None
 
     # ── Server-side guard: detect candidate requesting to end ──
-    max_q = interview_settings.max_questions if interview_settings else 8
+    # max_questions on InterviewSettings is the VERBAL question count (post-feature).
+    # The total interview length is verbal + coding. `max_q` represents total turns
+    # so the AI prompt's question_index references stay correct.
+    _verbal_count = interview_settings.max_questions if interview_settings else 8
+    _code_enabled_v = bool(
+        interview_settings.code_editor_required if interview_settings else False
+    )
+    _coding_count_v = (
+        interview_settings.max_coding_questions
+        if (interview_settings and _code_enabled_v)
+        else 0
+    )
+    max_q = _verbal_count + _coding_count_v
 
     # One-shot diagnostic at the start of a session: confirms whether the
     # code editor is wired up for this interview and which turns are the
-    # coding turns (the last ~20% of the interview). Helps debug
-    # "no coding question appeared" reports.
+    # coding turns (the last N turns of the interview, where N is the
+    # configured max_coding_questions). Helps debug "no coding question
+    # appeared" reports.
     if (session.current_question_index or 0) == 0:
-        _code_enabled = bool(
-            interview_settings.code_editor_required if interview_settings else False
+        _coding_turns = (
+            list(range(_verbal_count + 1, max_q + 1)) if _coding_count_v > 0 else []
         )
-        _cc = max(1, round(max_q * 0.2)) if _code_enabled else 0
-        _coding_turns = list(range(max_q - _cc + 1, max_q + 1)) if _code_enabled else []
         logger.info(
             f"[conduct_turn] session={session.id} job={getattr(job,'id',None)} "
-            f"code_editor_required={_code_enabled} max_q={max_q} "
-            f"coding_count={_cc} coding_turns={_coding_turns}"
+            f"code_editor_required={_code_enabled_v} verbal={_verbal_count} "
+            f"coding={_coding_count_v} max_q={max_q} coding_turns={_coding_turns}"
         )
     if candidate_message is not None:
         lower_msg = candidate_message.lower().strip()
@@ -769,8 +1026,14 @@ async def conduct_turn(
     except Exception as e:
         logger.warning(f"Claude attempt 1 failed for session {session.id}: {e}")
 
-    # ── Attempt 2: Retry once with shorter timeout ──
+    # ── Attempt 2: Retry once with shorter timeout, after a short backoff ──
+    # 1-second delay is short enough that the candidate's wait time barely
+    # changes, but long enough to avoid hammering a struggling LLM provider
+    # back-to-back. We add a small random jitter so concurrent candidates
+    # don't sync up.
     if result is None:
+        import random as _r
+        await asyncio.sleep(1 + _r.uniform(0, 0.5))
         try:
             llm_result = await _ask_with_system_usage(system_prompt, claude_messages, model=SONNET, max_tokens=256, timeout_seconds=20)
             log_usage(llm_result, feature="interview", session_id=session.id)
@@ -843,7 +1106,7 @@ async def conduct_turn(
             content=fallback_msg,
             question_index=q_index,
         ))
-        db.commit()
+        _safe_commit(db, f"conduct_turn fallback session={session.id}")
         return {
             "session_id": session.id,
             "message": fallback_msg,
@@ -873,6 +1136,71 @@ async def conduct_turn(
             )
             raw_question_index = current_qi + 1
     question_index = raw_question_index if raw_question_index is not None else current_qi + 1
+
+    # ── Guard against premature completion ──
+    # In MIX mode the model has been observed to set is_complete=true after the
+    # predefined questions run out, even though Phase 2 (AI-generated questions)
+    # should follow. The explicit "candidate wants to end" path already returned
+    # earlier in this function, so by this point any is_complete=true that
+    # arrives before we've reached max_q is a model bug. Re-prompt Claude to
+    # produce the next question instead of cutting the interview short.
+    if (
+        is_complete
+        and question_index < max_q
+        and candidate_message is not None
+    ):
+        logger.warning(
+            f"[conduct_turn] AI returned is_complete=true at question_index="
+            f"{question_index} but max_q={max_q} for session {session.id}. "
+            f"Re-prompting for the next question."
+        )
+        next_qi = max(current_qi + 1, question_index)
+        repair_messages = list(claude_messages) + [
+            {
+                "role": "assistant",
+                "content": json.dumps({
+                    "message": message_text or "",
+                    "is_complete": True,
+                    "question_index": question_index,
+                }),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"SYSTEM CORRECTION: Do not end the interview yet. "
+                    f"You have asked {question_index} of {max_q} questions. "
+                    f"Ask the next interview question now. Set is_complete=false "
+                    f"and question_index={next_qi}. Return ONLY the JSON object."
+                ),
+            },
+        ]
+        try:
+            repair_result = await _ask_with_system_usage(
+                system_prompt, repair_messages, model=SONNET,
+                max_tokens=512, timeout_seconds=20,
+            )
+            log_usage(repair_result, feature="interview", session_id=session.id)
+            repaired = _parse_json(repair_result.text)
+            if isinstance(repaired, dict) and repaired.get("message"):
+                message_text = str(repaired.get("message"))
+                is_complete = bool(repaired.get("is_complete", False))
+                question_index = int(repaired.get("question_index", next_qi))
+                coding_question = repaired.get("coding_question") or coding_question
+        except Exception as repair_exc:
+            logger.warning(
+                f"[conduct_turn] re-prompt after premature is_complete failed "
+                f"for session {session.id}: {repair_exc}. Falling back to bridge."
+            )
+
+        # If the repair call still left us with is_complete=true (or no good
+        # message), fall back to a bridge so the interview doesn't terminate.
+        if is_complete and question_index < max_q:
+            is_complete = False
+            question_index = next_qi
+            _closing_signals = ("thank you for your time", "that concludes",
+                                "we'll be in touch", "धन्यवाद", "شكراً")
+            if any(s in (message_text or "").lower() for s in _closing_signals):
+                message_text = "Got it, thanks. Let's continue with the next question."
 
     # Sanitize: strip any embedded JSON / code blocks from the spoken message
     # This prevents the AI from leaking raw JSON structure into the chat
@@ -931,47 +1259,37 @@ async def conduct_turn(
     if not message_text:
         message_text = "Thank you. Let's continue."
 
-    # If this is the closing message (is_complete=true), save with question_index=None
-    # so it doesn't appear as a scored question in the evaluation
-    db.add(InterviewMessage(
-        session_id=session.id,
-        role="ai",
-        content=message_text,
-        question_index=None if is_complete else question_index,
-    ))
-
-    session.current_question_index = question_index
-    if is_complete:
-        session.status = SessionStatus.completed
-        session.completed_at = datetime.utcnow()
-
-    db.commit()
-
-    response = {
-        "session_id": session.id,
-        "message": message_text,
-        "question_index": question_index,
-        "is_complete": is_complete,
-        "is_off_topic": is_off_topic,
-        "role": "ai",
-    }
-
-    # ── Coding-question handling ─────────────────────────────────────────────
-    # Plan: coding questions are ~20% of total, placed at the END of the
-    # interview (after the theory round). Example:
-    #   max_q=5  → 1 coding (turn 5)
-    #   max_q=10 → 2 coding (turns 9, 10)
-    #   max_q=6  → 1 coding (turn 6)
-    # If the AI fails to emit a coding_question on a coding turn, the server
-    # injects a deterministic fallback so the candidate never silently misses
-    # the round.
+    # ── Coding-question handling (computed BEFORE commit so the candidate
+    # message, AI message, session updates, and any coding override all
+    # commit atomically — no half-state can leak if any single step throws).
+    # Plan: the LAST `max_coding_questions` turns of the interview are coding,
+    # appended after the verbal phase. Example with max_questions=5 (verbal)
+    # and max_coding_questions=2 (coding): turns 1-5 verbal, turns 6-7 coding,
+    # total max_q=7. If max_coding_questions is 0 (or code_editor_required is
+    # false), there is no coding round even if the AI emits a coding_question.
     code_editor_enabled = bool(
         interview_settings.code_editor_required if interview_settings else False
     )
-    coding_count = max(1, round(max_q * 0.2)) if code_editor_enabled else 0
-    coding_turns = (
-        set(range(max_q - coding_count + 1, max_q + 1)) if code_editor_enabled else set()
+    coding_count = (
+        (interview_settings.max_coding_questions if interview_settings else 0)
+        if code_editor_enabled else 0
     )
+    verbal_count = interview_settings.max_questions if interview_settings else 8
+    coding_turns = (
+        set(range(verbal_count + 1, max_q + 1)) if coding_count > 0 else set()
+    )
+    manual_coding_enabled = bool(
+        getattr(interview_settings, "manual_coding_questions", False)
+        if interview_settings else False
+    )
+    manual_coding_prompts: list[str] = []
+    if code_editor_enabled and manual_coding_enabled and job is not None:
+        manual_coding_prompts = [
+            q.text
+            for q in (job.questions or [])
+            if (getattr(q, "category", None) or "").lower() == "coding"
+            and (q.text or "").strip()
+        ]
 
     # Count coding questions already asked in this session so we don't
     # double-inject if the AI already produced one on an earlier coding turn.
@@ -996,6 +1314,35 @@ async def conduct_turn(
 
     is_coding_turn = code_editor_enabled and question_index in coding_turns
 
+    # When manual_coding_questions is ON, the recruiter prompt for THIS turn is
+    # the source of truth. Always overwrite whatever the AI emitted so the
+    # candidate sees the recruiter's intended problem (the AI may otherwise
+    # drift off-topic or paraphrase too aggressively).
+    if (
+        is_coding_turn
+        and not is_complete
+        and manual_coding_enabled
+        and manual_coding_prompts
+        and prior_coding_asked < coding_count
+    ):
+        prompt_idx = min(prior_coding_asked, len(manual_coding_prompts) - 1)
+        manual_prompt = manual_coding_prompts[prompt_idx]
+        if not (coding_question and isinstance(coding_question, dict)
+                and (coding_question.get("description") or "").strip()):
+            # AI didn't expand the prompt — fall back to a deterministic problem
+            # seeded by the recruiter's prompt text.
+            coding_question = _fallback_coding_question(
+                job, candidate, prior_coding_asked, manual_prompt=manual_prompt,
+            )
+        else:
+            # Preserve the recruiter's intent: prepend their original prompt to
+            # the AI-expanded description so the candidate sees both.
+            existing_desc = (coding_question.get("description") or "").strip()
+            if manual_prompt.strip() not in existing_desc:
+                coding_question["description"] = (
+                    manual_prompt.strip() + "\n\n" + existing_desc
+                )
+
     if (not coding_question) and is_coding_turn and not is_complete \
             and prior_coding_asked < coding_count:
         logger.warning(
@@ -1003,10 +1350,17 @@ async def conduct_turn(
             f"{question_index} (coding_turns={sorted(coding_turns)}) "
             f"for session {session.id} — injecting fallback."
         )
-        coding_question = _fallback_coding_question(job, candidate, prior_coding_asked)
+        manual_prompt = None
+        if manual_coding_enabled and manual_coding_prompts:
+            prompt_idx = min(prior_coding_asked, len(manual_coding_prompts) - 1)
+            manual_prompt = manual_coding_prompts[prompt_idx]
+        coding_question = _fallback_coding_question(
+            job, candidate, prior_coding_asked, manual_prompt=manual_prompt,
+        )
 
+    coding_question_for_response: Optional[dict] = None
     if coding_question and isinstance(coding_question, dict):
-        response["coding_question"] = {
+        coding_question_for_response = {
             "title": coding_question.get("title", "Coding Challenge"),
             "description": coding_question.get("description", ""),
             "test_cases": coding_question.get("test_cases", []),
@@ -1018,20 +1372,43 @@ async def conduct_turn(
         # a short transition because the editor is already open and the
         # candidate already knows how to use it.
         if prior_coding_asked >= 1:
-            response["message"] = "Great, here is your next coding challenge. The new problem has loaded in the editor — please review it and submit your solution."
+            message_text = "Great, here is your next coding challenge. The new problem has loaded in the editor — please review it and submit your solution."
         else:
-            response["message"] = "Now let's test your coding skills. Please click the 'Switch to Coding Test' button at the top of your screen to open the code editor and complete the challenge."
-        # Also update the DB message to match
-        last_ai = db.query(InterviewMessage).filter(
-            InterviewMessage.session_id == session.id,
-            InterviewMessage.role == "ai",
-        ).order_by(InterviewMessage.created_at.desc()).first()
-        if last_ai:
-            last_ai.content = response["message"]
-            db.commit()
+            message_text = "Now let's test your coding skills. Please click the 'Switch to Coding Test' button at the top of your screen to open the code editor and complete the challenge."
+
+    # ── Single atomic write of the whole turn ─────────────────────────────────
+    # Candidate message, AI message, session status, and coding-override text
+    # all commit together. If ANY of these throws, the in-flight transaction
+    # rolls back (SQLAlchemy auto-rollback on session close) and no partial
+    # state pollutes the chat history. We retry the commit on transient errors
+    # (psycopg disconnects, deadlocks) so a brief DB hiccup doesn't drop the
+    # turn — this is the user's main "data not saving" concern.
+    db.add(InterviewMessage(
+        session_id=session.id,
+        role="ai",
+        content=message_text,
+        question_index=None if is_complete else question_index,
+    ))
+    session.current_question_index = question_index
+    if is_complete:
+        session.status = SessionStatus.completed
+        session.completed_at = datetime.utcnow()
+
+    _safe_commit(db, f"conduct_turn session={session.id}")
+
+    response = {
+        "session_id": session.id,
+        "message": message_text,
+        "question_index": question_index,
+        "is_complete": is_complete,
+        "is_off_topic": is_off_topic,
+        "role": "ai",
+    }
+    if coding_question_for_response is not None:
+        response["coding_question"] = coding_question_for_response
         logger.info(
             f"[conduct_turn] Coding question delivered for session {session.id} "
-            f"at turn {question_index}: {response['coding_question'].get('title')}"
+            f"at turn {question_index}: {coding_question_for_response.get('title')}"
         )
 
     return response
@@ -1119,12 +1496,20 @@ def _fallback_coding_question(
     job: Optional[Job],
     candidate: Optional[Candidate],
     index: int = 0,
+    manual_prompt: Optional[str] = None,
 ) -> dict:
     """Deterministic coding problem used when the AI fails to emit one.
 
     Problems read stdin and write stdout so they run across every Piston
     runtime. For multi-coding interviews (`coding_count > 1`), we rotate
     through the bank using `index` so the candidate gets different problems.
+
+    When `manual_prompt` is supplied (recruiter-authored, manual coding
+    questions mode), we wrap it in a minimal coding_question shape with the
+    bank's generic test cases as a placeholder, so the candidate at least sees
+    the recruiter's intended problem text. The test cases are best-effort —
+    candidates can still write code; pass/fail comparison won't be meaningful
+    unless the AI expansion path runs successfully.
 
     The `job` / `candidate` arguments are accepted for future personalisation
     (e.g. picking a problem category from required skills) but the current
@@ -1133,6 +1518,16 @@ def _fallback_coding_question(
     """
     bank = _FALLBACK_PROBLEMS
     picked = bank[index % len(bank)]
+
+    if manual_prompt and manual_prompt.strip():
+        return {
+            "title": (manual_prompt.strip().splitlines()[0][:60] or "Coding Challenge"),
+            "description": manual_prompt.strip(),
+            "test_cases": picked["test_cases"],
+            "time_limit": 15,
+            "difficulty": picked.get("difficulty", "medium"),
+        }
+
     return {
         "title": picked["title"],
         "description": picked["description"],

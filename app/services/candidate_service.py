@@ -1,3 +1,4 @@
+import logging
 from typing import List, Optional
 
 from sqlalchemy.orm import Session
@@ -5,6 +6,62 @@ from sqlalchemy.orm import Session
 from app.models.candidate import Candidate, CandidateStatus
 from app.models.job import Job
 from app.schemas.candidate import CandidateCreate, CandidateUpdate
+
+logger = logging.getLogger(__name__)
+
+
+def _reconcile_stale_completed_candidates(
+    db: Session, candidates: list[Candidate]
+) -> None:
+    """One-shot self-healing pass.
+
+    A candidate may have a full Evaluation row (real scores) but still carry
+    interview_status="Scheduled" and candidate_stage="Candidates" — typically
+    because an earlier Reschedule action overwrote those fields after the
+    interview had already been evaluated. Repair them here so the AI Round
+    tab and Interview Completed counters reflect reality on the next load.
+
+    Detection rule: candidate has a non-null overall score AND interview_status
+    is "Scheduled". Stub evaluations (failed eval, score is null) are skipped.
+    """
+    from app.models.interview import InterviewSession, SessionStatus
+
+    candidate_ids = [
+        c.id for c in candidates
+        if c.interview_status == "Scheduled" and c.score is not None
+    ]
+    if not candidate_ids:
+        return
+
+    completed_session_ids = {
+        cid for (cid,) in db.query(InterviewSession.candidate_id).filter(
+            InterviewSession.candidate_id.in_(candidate_ids),
+            InterviewSession.status.in_(
+                [SessionStatus.completed, SessionStatus.terminated]
+            ),
+        ).distinct().all()
+    }
+    if not completed_session_ids:
+        return
+
+    dirty = False
+    for c in candidates:
+        if c.id in completed_session_ids and c.interview_status == "Scheduled":
+            logger.info(
+                "[reconcile] candidate=%s had score=%s but interview_status=Scheduled "
+                "— restoring Completed/AI Round",
+                c.id, c.score,
+            )
+            c.interview_status = "Completed"
+            if c.candidate_stage in (None, "Candidates"):
+                c.candidate_stage = "AI Round"
+            dirty = True
+    if dirty:
+        try:
+            db.commit()
+        except Exception as exc:
+            logger.warning("[reconcile] commit failed: %s", exc)
+            db.rollback()
 
 
 def get_candidates(
@@ -38,6 +95,11 @@ def get_candidates(
         query = query.filter(Candidate.candidate_stage == stage)
 
     rows = query.order_by(Candidate.applied_date.desc()).all()
+
+    # Self-heal any rows where an earlier Reschedule overwrote a completed
+    # candidate's status/stage back to "Scheduled" / "Candidates". This is
+    # cheap when nothing is stale (one indexed query that returns 0 rows).
+    _reconcile_stale_completed_candidates(db, [c for c, _ in rows])
 
     # Status priority for dedup — higher = keep this one
     _STATUS_PRIORITY = {

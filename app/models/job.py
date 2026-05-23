@@ -119,6 +119,14 @@ class InterviewSettings(Base):
     secondary_cam = Column(Boolean, default=False)
     mode = Column(Enum(InterviewMode), default=InterviewMode.traditional)
     max_questions = Column(Integer, default=10)
+    # When code_editor_required is True, this is the number of coding turns
+    # placed at the END of the interview (after the verbal/theory turns).
+    # 0 means "no coding round" even if code_editor_required is True.
+    max_coding_questions = Column(Integer, nullable=False, default=0, server_default="0")
+    # When True, the recruiter-authored coding questions stored on the job
+    # (JobQuestion rows with category="coding") are used verbatim instead of
+    # being AI-generated at interview time.
+    manual_coding_questions = Column(Boolean, nullable=False, default=False, server_default="false")
     auto_skip_timeout = Column(Integer, default=0)
     special_instructions = Column(Text, nullable=True)
     scoring = Column(String(255), default="Standard Evaluation")
