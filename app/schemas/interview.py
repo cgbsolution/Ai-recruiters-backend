@@ -22,7 +22,8 @@ class JobConfig(BaseModel):
     experience_level: Optional[str]
     experience_min: int
     experience_max: int
-    max_questions: int
+    max_questions: int                  # verbal-only count
+    max_coding_questions: int = 0       # coding turns appended after verbal
     mode: str
     virtual_avatar: bool
     webcam_required: bool

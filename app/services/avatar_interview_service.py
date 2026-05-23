@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -815,8 +816,14 @@ async def conduct_turn(
     """Drive one interview turn. Wraps the main body so that ANY unexpected
     exception (sanitisation regex bug, AI returning weird shapes, DB transient
     error) still leaves the chat history in a consistent state — the user's
-    answer is saved and a graceful "had a brief hiccup" reply is returned
-    instead of a 500 that drops the message."""
+    answer is saved and a graceful reply is returned instead of a 500 that
+    drops the message.
+
+    The reply is sourced from `_build_contextual_fallback` so consecutive
+    failures rotate through varied phrasings (and respect the candidate's
+    interview language) — that prevents the "Sorry, I had a brief hiccup"
+    text from being emitted verbatim three turns in a row.
+    """
     try:
         return await _conduct_turn_impl(session, candidate_message, db)
     except Exception as exc:
@@ -827,7 +834,15 @@ async def conduct_turn(
             db.rollback()
         except Exception:
             pass
-        # Last-resort: save the candidate message + a generic AI reply so the
+
+        # Re-resolve job/candidate after rollback so the fallback path can use
+        # them. Use a fresh query — if even THIS fails we degrade further.
+        try:
+            job = db.query(Job).filter(Job.id == session.job_id).first()
+        except Exception:
+            job = None
+
+        # Last-resort: save the candidate message + a varied AI reply so the
         # turn isn't lost. If THIS also fails, we re-raise so the client at
         # least sees an error rather than thinking the answer was accepted.
         try:
@@ -838,8 +853,35 @@ async def conduct_turn(
                     content=candidate_message,
                     question_index=session.current_question_index,
                 ))
+
+            consecutive_fallbacks = _count_recent_fallbacks(db, session.id)
+            # Always advance the question pointer on emergency fallback so the
+            # candidate isn't stuck answering the same question forever when
+            # the AI service is degraded. Without this, the model keeps
+            # echoing the same generic prompt because question_index never
+            # moves.
             next_qi = (session.current_question_index or 0) + 1
-            fallback_msg = "Sorry, I had a brief hiccup on my end. Let's keep going — could you tell me a bit about your most recent project?"
+
+            try:
+                fallback_msg = _build_contextual_fallback(
+                    candidate_message, consecutive_fallbacks, session, job, db,
+                )
+            except Exception as fb_exc:
+                logger.warning(
+                    f"[conduct_turn] contextual fallback failed: {fb_exc}. "
+                    f"Using hardcoded reply."
+                )
+                # Language-aware hardcoded backstop in case even the
+                # contextual builder is broken (e.g. corrupted FALLBACK_RESPONSES).
+                _lang = getattr(session, "interview_language", "en") or "en"
+                _backstops = {
+                    "en": "Let's keep things moving. Could you tell me about a recent project you've worked on?",
+                    "hi": "चलिए आगे बढ़ते हैं। क्या आप किसी हाल के प्रोजेक्ट के बारे में बता सकते हैं?",
+                    "ar": "لنواصل. هل يمكنك إخباري عن مشروع حديث عملت عليه؟",
+                    "hinglish": "Chaliye aage badhte hain. Kya aap kisi recent project ke baare mein bata sakte hain?",
+                }
+                fallback_msg = _backstops.get(_lang, _backstops["en"])
+
             db.add(InterviewMessage(
                 session_id=session.id,
                 role="ai",

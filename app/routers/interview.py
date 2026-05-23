@@ -259,6 +259,13 @@ def get_interview_config(token: str, db: Session = Depends(get_db)):
     settings_obj = job.interview_settings
     skills = [s.skill for s in job.skills] if job.skills else []
 
+    # When the code editor is disabled, coding turns are forced to 0 even if
+    # max_coding_questions has a leftover value from when it was enabled.
+    _code_enabled = settings_obj.code_editor_required if settings_obj else False
+    _coding_count = (
+        (settings_obj.max_coding_questions if settings_obj else 0)
+        if _code_enabled else 0
+    )
     return JobConfig(
         job_id=job.id,
         title=job.title,
@@ -268,6 +275,7 @@ def get_interview_config(token: str, db: Session = Depends(get_db)):
         experience_min=job.experience_min,
         experience_max=job.experience_max,
         max_questions=settings_obj.max_questions if settings_obj else 8,
+        max_coding_questions=_coding_count,
         mode=settings_obj.mode.value if settings_obj else "TRADITIONAL",
         virtual_avatar=settings_obj.virtual_avatar if settings_obj else True,
         webcam_required=settings_obj.webcam_required if settings_obj else True,
