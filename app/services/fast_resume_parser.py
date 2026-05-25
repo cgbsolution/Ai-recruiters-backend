@@ -333,9 +333,21 @@ def _split_sections(text: str) -> dict[str, str]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_email(text: str) -> Optional[str]:
-    """Extract the first email address from text."""
-    match = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
-    return match.group(0).lower() if match else None
+    """Extract the first email address from text.
+
+    Tolerates whitespace inserted around `@` or `.` by PDF text extractors
+    (common with Canva / InDesign exports — e.g. ``foo @gmail.com``).
+    """
+    if not text:
+        return None
+    pattern = r"[a-zA-Z0-9._%+\-]+\s*@\s*[a-zA-Z0-9\-]+(?:\s*\.\s*[a-zA-Z0-9\-]+)+"
+    match = re.search(pattern, text)
+    if not match:
+        return None
+    email = re.sub(r"\s+", "", match.group(0)).lower()
+    if not re.search(r"\.[a-zA-Z]{2,}$", email):
+        return None
+    return email
 
 
 def extract_phone(text: str) -> Optional[str]:

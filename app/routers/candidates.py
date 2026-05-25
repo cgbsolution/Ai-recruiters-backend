@@ -155,18 +155,28 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
                     parsed = {}
 
             # Extract email from resume text if parser didn't find a usable one.
-            # Guard against Haiku returning empty strings or placeholder-looking values
-            # that would short-circuit the regex fallback.
-            _haiku_email = (parsed.get("candidate_email") or "").strip()
-            if not _haiku_email or "@" not in _haiku_email or _haiku_email.endswith("@resume.local"):
-                import re as _re
-                email_match = _re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', resume_text or "")
-                if email_match:
-                    parsed["candidate_email"] = email_match.group(0)
+            # Normalize whitespace — PDF extractors sometimes insert spaces around
+            # `@` or `.` for styled headers (e.g. "foo @gmail.com"), which would
+            # otherwise be persisted verbatim from Haiku or missed by the regex.
+            import re as _re
+            from app.services.fast_resume_parser import extract_email as _extract_email
+            _haiku_email_raw = (parsed.get("candidate_email") or "").strip()
+            _haiku_email = _re.sub(r"\s+", "", _haiku_email_raw).lower() if _haiku_email_raw else ""
+            if (
+                not _haiku_email
+                or "@" not in _haiku_email
+                or _haiku_email.endswith("@resume.local")
+                or not _re.search(r"\.[a-zA-Z]{2,}$", _haiku_email)
+            ):
+                fallback_email = _extract_email(resume_text or "")
+                if fallback_email:
+                    parsed["candidate_email"] = fallback_email
                 elif _haiku_email and "@" in _haiku_email and not _haiku_email.endswith("@resume.local"):
                     parsed["candidate_email"] = _haiku_email
                 else:
                     parsed["candidate_email"] = None
+            else:
+                parsed["candidate_email"] = _haiku_email
 
             # Update candidate with parsed data
             parsed_email = parsed.get("candidate_email") or candidate.email
@@ -831,6 +841,168 @@ async def upload_resumes(
             pass  # candidate was deleted during parse — skip
 
     return result
+
+
+# ── Replace Resume for Existing Candidate ─────────────────────────────────────
+
+async def _reparse_for_existing_candidate(candidate_id: int, file_path: str) -> None:
+    """
+    Re-parse a newly uploaded resume for an EXISTING candidate.
+
+    Unlike `_parse_one`, this preserves the candidate's identity (email + DB row)
+    instead of deleting / merging on email collision. Used by the per-row
+    "upload resume" action when a candidate has no resume file.
+    """
+    async with _get_parse_semaphore():
+        db = SessionLocal()
+        try:
+            candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+            if not candidate:
+                return
+
+            candidate.parsing_status = "processing"
+            db.commit()
+
+            resume_text = await asyncio.to_thread(_sync_extract_text, file_path)
+
+            parsed = None
+            try:
+                from app.services.llm_resume_parser import llm_parse_resume
+                parsed = await llm_parse_resume(resume_text)
+                if not (parsed and parsed.get("candidate_name")):
+                    parsed = None
+            except Exception as haiku_exc:
+                logger.warning("Haiku parse failed for re-upload candidate %s: %s", candidate_id, haiku_exc)
+
+            if not parsed:
+                try:
+                    from app.services.fast_resume_parser import fast_parse_resume
+                    parsed = await asyncio.to_thread(fast_parse_resume, resume_text)
+                except Exception as regex_exc:
+                    logger.error("Regex parse failed for re-upload candidate %s: %s", candidate_id, regex_exc)
+                    parsed = {}
+
+            # Update candidate fields — preserve identity (email + id)
+            candidate.name = parsed.get("candidate_name") or candidate.name
+            candidate.phone = parsed.get("phone") or candidate.phone
+            candidate.location = parsed.get("location") or candidate.location
+            candidate.role = parsed.get("current_designation") or candidate.role
+            candidate.resume_path = file_path
+
+            _org_id = None
+            if candidate.job_id:
+                from app.models.job import Job
+                _job = db.query(Job).filter(Job.id == candidate.job_id).first()
+                if _job:
+                    _org_id = _job.organization_id
+
+            # Upsert ResumeMetadata keyed by the candidate's existing email
+            meta = None
+            if candidate.email and not candidate.email.endswith("@resume.local"):
+                meta_q = db.query(ResumeMetadata).filter(
+                    ResumeMetadata.candidate_email == candidate.email
+                )
+                if _org_id is not None:
+                    meta_q = meta_q.filter(ResumeMetadata.organization_id == _org_id)
+                meta = meta_q.first()
+            if not meta:
+                meta = ResumeMetadata(
+                    candidate_email=candidate.email,
+                    organization_id=_org_id,
+                )
+                db.add(meta)
+
+            meta.candidate_name = parsed.get("candidate_name") or candidate.name
+            meta.phone = parsed.get("phone")
+            meta.current_designation = parsed.get("current_designation")
+            meta.experience_years = parsed.get("experience_years")
+            meta.skills = json.dumps(parsed.get("skills", []))
+            meta.education = json.dumps(parsed.get("education", []))
+            meta.certifications = json.dumps(parsed.get("certifications", []))
+            meta.work_experience = json.dumps(parsed.get("work_experience", []))
+            meta.location = parsed.get("location")
+            meta.personal_details = json.dumps(parsed.get("personal_details") or {})
+            meta.keywords = json.dumps(parsed.get("keywords", []))
+            meta.summary = parsed.get("summary")
+            meta.resume_file_path = file_path
+            meta.raw_text = resume_text
+            meta.parsing_status = "completed"
+            meta.parsed_at = datetime.utcnow()
+            db.flush()
+
+            candidate.resume_metadata_id = meta.id
+
+            if candidate.job_id:
+                await _compute_fit_score_with_fallback(candidate, db, candidate.job_id, resume_text)
+
+            candidate.parsing_status = "completed"
+            db.commit()
+        except Exception as exc:
+            logger.error("Re-parse for candidate %s failed: %s", candidate_id, exc, exc_info=True)
+            try:
+                db.rollback()
+                c = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+                if c:
+                    c.parsing_status = "failed"
+                    db.commit()
+            except Exception:
+                pass
+        finally:
+            db.close()
+
+
+@router.post(
+    "/{candidate_id}/replace-resume",
+    response_model=CandidateRead,
+    summary="Upload or replace resume for an existing candidate",
+    description=(
+        "Upload a PDF/DOC/DOCX resume for an existing candidate. The new file "
+        "replaces any previously uploaded resume, the resume is re-parsed, and "
+        "the fit score is recomputed.\n\n"
+        "Preserves the candidate's identity (email, DB row, interview state) — "
+        "only `resume_path`, parsed metadata, and `resume_fit_score` are updated.\n\n"
+        "**Content-Type:** `multipart/form-data`"
+    ),
+)
+@limiter.limit("20/minute")
+async def replace_resume(
+    request: Request,
+    candidate_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
+
+    if file.content_type not in ALLOWED_RESUME_TYPES:
+        ext = Path(file.filename).suffix.upper() if file.filename else "Unknown"
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type ({ext}). Only PDF, DOC, and DOCX are accepted.",
+        )
+
+    safe_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{file.filename}"
+    new_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
+    with open(new_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    old_path = candidate.resume_path
+
+    # Parse synchronously so the caller receives the updated candidate
+    await _reparse_for_existing_candidate(candidate.id, new_path)
+
+    # Best-effort cleanup of the previous file
+    if old_path and old_path != new_path and os.path.isfile(old_path):
+        try:
+            os.remove(old_path)
+        except Exception as exc:
+            logger.warning("Failed to delete old resume %s: %s", old_path, exc)
+
+    db.expire_all()
+    refreshed = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+    if not refreshed:
+        raise HTTPException(status_code=500, detail="Failed to reload candidate after resume replace")
+    return refreshed
 
 
 # ── Fit Score Recompute ───────────────────────────────────────────────────────
