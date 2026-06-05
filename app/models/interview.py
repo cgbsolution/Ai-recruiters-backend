@@ -23,6 +23,7 @@ class ViolationType(str, enum.Enum):
     fullscreen_exit = "fullscreen_exit"
     face_not_detected = "face_not_detected"
     multiple_faces = "multiple_faces"
+    screen_share_stopped = "screen_share_stopped"
 
 
 class Recommendation(str, enum.Enum):

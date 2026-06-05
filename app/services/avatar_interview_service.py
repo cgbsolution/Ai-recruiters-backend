@@ -1061,7 +1061,7 @@ async def _conduct_turn_impl(
     raw = None
 
     try:
-        llm_result = await _ask_with_system_usage(system_prompt, claude_messages, model=SONNET, max_tokens=512, timeout_seconds=25)
+        llm_result = await _ask_with_system_usage(system_prompt, claude_messages, model=SONNET, max_tokens=1024, timeout_seconds=25)
         log_usage(llm_result, feature="interview", session_id=session.id)
         raw = llm_result.text
         result = _parse_json(raw)
@@ -1077,7 +1077,7 @@ async def _conduct_turn_impl(
         import random as _r
         await asyncio.sleep(1 + _r.uniform(0, 0.5))
         try:
-            llm_result = await _ask_with_system_usage(system_prompt, claude_messages, model=SONNET, max_tokens=256, timeout_seconds=20)
+            llm_result = await _ask_with_system_usage(system_prompt, claude_messages, model=SONNET, max_tokens=1024, timeout_seconds=20)
             log_usage(llm_result, feature="interview", session_id=session.id)
             raw = llm_result.text
             result = _parse_json(raw)
@@ -1103,10 +1103,22 @@ async def _conduct_turn_impl(
             except Exception:
                 pass
 
-        # Try regex extraction of message field from anywhere in raw text
+        # Try regex extraction of message field from anywhere in raw text.
+        # Capture up to the NEXT known field key (or closing brace) rather than
+        # the first quote — so an UNESCAPED quote inside the question (e.g. the
+        # model citing a term in quotes) no longer truncates Nira's message to
+        # just the acknowledgment ("...Given"). This was the core bug where the
+        # next question vanished and only the lead-in survived.
         if result is None:
             try:
-                msg_match = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', clean_text)
+                msg_match = re.search(
+                    r'"message"\s*:\s*"(.*?)"\s*(?:,\s*"(?:is_complete|is_off_topic|question_index|coding_question)"\s*:|}\s*$)',
+                    clean_text,
+                    flags=re.DOTALL,
+                )
+                if not msg_match:
+                    # Fall back to the conservative single-quote-terminated match.
+                    msg_match = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', clean_text)
                 if msg_match:
                     extracted = msg_match.group(1).replace('\\"', '"').replace('\\n', ' ').strip()
                     if len(extracted) > 5:
@@ -1219,7 +1231,7 @@ async def _conduct_turn_impl(
         try:
             repair_result = await _ask_with_system_usage(
                 system_prompt, repair_messages, model=SONNET,
-                max_tokens=512, timeout_seconds=20,
+                max_tokens=1024, timeout_seconds=20,
             )
             log_usage(repair_result, feature="interview", session_id=session.id)
             repaired = _parse_json(repair_result.text)

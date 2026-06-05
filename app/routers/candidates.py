@@ -1541,6 +1541,301 @@ async def cancel_interview(
     return candidate
 
 
+# ── Retake Interview: archive (download) then reset ───────────────────────────
+
+def _recordings_dir() -> str:
+    """Disk directory where interview recordings live (mirrors interview.py)."""
+    return os.path.join(UPLOAD_ROOT, "recordings")
+
+
+def _completed_or_terminated_sessions(db: Session, candidate_id: int):
+    from app.models.interview import InterviewSession, SessionStatus
+    return (
+        db.query(InterviewSession)
+        .filter(
+            InterviewSession.candidate_id == candidate_id,
+            InterviewSession.status.in_([SessionStatus.completed, SessionStatus.terminated]),
+        )
+        .order_by(InterviewSession.id.desc())
+        .all()
+    )
+
+
+@router.get(
+    "/{candidate_id}/interview-archive",
+    summary="Download a ZIP backup of the candidate's interview (video + transcript + evaluation)",
+    description=(
+        "Bundles the completed interview into a single ZIP — `recording.webm`, "
+        "`transcript.txt`, and `evaluation.json` — so the recruiter can keep a "
+        "copy BEFORE resetting the interview for a retake."
+    ),
+)
+def download_interview_archive(
+    candidate_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    import json as _json
+    import tempfile
+    import zipfile
+    from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
+    from app.models.interview import InterviewMessage, Evaluation, Violation
+
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
+
+    sessions = _completed_or_terminated_sessions(db, candidate_id)
+    if not sessions:
+        raise HTTPException(
+            status_code=404,
+            detail="No completed interview found to archive for this candidate.",
+        )
+    session = sessions[0]  # most recent
+
+    def _loads(s):
+        if not s:
+            return None
+        try:
+            return _json.loads(s)
+        except Exception:
+            return s
+
+    # ── Transcript ────────────────────────────────────────────────────────────
+    msgs = (
+        db.query(InterviewMessage)
+        .filter(InterviewMessage.session_id == session.id)
+        .order_by(InterviewMessage.created_at)
+        .all()
+    )
+    lines = [
+        f"Interview Transcript — {candidate.name or 'Candidate'} <{candidate.email or 'no-email'}>",
+        f"Session {session.id} | status={getattr(session.status, 'value', session.status)} "
+        f"| completed_at={session.completed_at}",
+        "=" * 70,
+        "",
+    ]
+    for m in msgs:
+        speaker = "AI Interviewer" if m.role == "ai" else (candidate.name or "Candidate")
+        lines.append(f"{speaker}:\n{m.content}\n")
+    transcript_txt = "\n".join(lines)
+
+    # ── Evaluation JSON ─────────────────────────────────────────────────────────
+    ev = db.query(Evaluation).filter(Evaluation.session_id == session.id).first()
+    violations = db.query(Violation).filter(Violation.session_id == session.id).all()
+    eval_obj = {
+        "candidate": {
+            "id": candidate.id,
+            "name": candidate.name,
+            "email": candidate.email,
+            "role": candidate.role,
+        },
+        "session_id": session.id,
+        "status": getattr(session.status, "value", str(session.status)),
+        "completed_at": session.completed_at.isoformat() if session.completed_at else None,
+        "video_duration": candidate.video_duration,
+        "scores": {
+            "overall": (ev.overall_score if ev else None) if ev else candidate.score,
+            "technical": ev.technical_score if ev else None,
+            "communication": ev.communication_score if ev else None,
+            "problem_solving": ev.problem_solving_score if ev else None,
+            "confidence": ev.confidence_score if ev else None,
+            "coding": ev.coding_score if ev else None,
+            "trust_score": candidate.trust_score,
+            "ai_cheating_score": candidate.ai_cheating_score,
+        },
+        "recommendation": (ev.recommendation if ev else None),
+        "summary": ev.summary if ev else None,
+        "strengths": _loads(ev.strengths) if ev else None,
+        "weaknesses": _loads(ev.weaknesses) if ev else None,
+        "detailed_feedback": ev.detailed_feedback if ev else None,
+        "per_question_evaluations": _loads(ev.per_question_evaluations) if ev else None,
+        "skills_ratings": _loads(ev.skills_ratings) if ev else None,
+        "violations": [
+            {
+                "type": getattr(v.violation_type, "value", str(v.violation_type)),
+                "details": v.details,
+                "at": v.occurred_at.isoformat() if v.occurred_at else None,
+            }
+            for v in violations
+        ],
+    }
+    eval_json = _json.dumps(eval_obj, indent=2, default=str)
+
+    # ── Recording file on disk ──────────────────────────────────────────────────
+    rec_path = None
+    rec_ext = ".webm"
+    if candidate.recording_link:
+        candidate_rec = os.path.join(_recordings_dir(), os.path.basename(candidate.recording_link))
+        if os.path.isfile(candidate_rec):
+            rec_path = candidate_rec
+            rec_ext = os.path.splitext(candidate_rec)[1] or ".webm"
+    if not rec_path:
+        # fall back to the conventional name {session_id}.webm
+        for ext in (".webm", ".mp4"):
+            p = os.path.join(_recordings_dir(), f"{session.id}{ext}")
+            if os.path.isfile(p):
+                rec_path, rec_ext = p, ext
+                break
+
+    # ── Build the ZIP to a temp file, stream it, then clean up ──────────────────
+    fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix=f"interview_{candidate_id}_")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            # Evaluation + transcript as a single readable PDF report. Fall back
+            # to the raw text/JSON only if PDF generation is unavailable.
+            try:
+                zf.writestr("evaluation_report.pdf", _build_evaluation_pdf_bytes(db, candidate))
+            except Exception as pdf_exc:
+                logger.warning(
+                    "archive: evaluation PDF build failed for candidate %s: %s — including text fallback",
+                    candidate_id, pdf_exc,
+                )
+                zf.writestr("transcript.txt", transcript_txt)
+                zf.writestr("evaluation.json", eval_json)
+            if rec_path:
+                zf.write(rec_path, arcname=f"recording{rec_ext}")
+            else:
+                zf.writestr(
+                    "recording_MISSING.txt",
+                    "No recording file was found on the server for this interview.",
+                )
+    except Exception as exc:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        logger.error("Failed to build interview archive for candidate %s: %s", candidate_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to build interview archive.")
+
+    def _cleanup(path: str):
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    safe_name = (candidate.name or "candidate").strip().replace(" ", "_") or "candidate"
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"interview_{safe_name}_{candidate_id}.zip",
+        background=BackgroundTask(_cleanup, zip_path),
+    )
+
+
+@router.post(
+    "/{candidate_id}/retake-interview",
+    response_model=CandidateRead,
+    summary="Reset a completed interview so the candidate can retake it (keeps resume & identity)",
+    description=(
+        "Permanently deletes the candidate's interview session(s) — transcript, "
+        "evaluation, violations, screenshots, and the recording file — and resets "
+        "the interview-state fields so the candidate can re-enter the SAME interview "
+        "link and start fresh. The candidate row, resume, and resume fit score are "
+        "KEPT. Intended to be called AFTER the recruiter has downloaded the archive."
+    ),
+)
+def retake_interview(
+    candidate_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    from datetime import timedelta
+    from app.models.interview import InterviewSession, InterviewStatusLog, InterviewToken
+
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
+
+    completed = _completed_or_terminated_sessions(db, candidate_id)
+    if not completed:
+        raise HTTPException(
+            status_code=400,
+            detail="This candidate has no completed interview to reset.",
+        )
+
+    # Reset means a clean slate: delete ALL of this candidate's sessions (so
+    # verify-access creates a brand-new one), not just the completed ones.
+    all_sessions = (
+        db.query(InterviewSession)
+        .filter(InterviewSession.candidate_id == candidate_id)
+        .all()
+    )
+    session_ids = [s.id for s in all_sessions]
+
+    # Delete recording files + leftover live-upload parts on disk (named by
+    # session id). DB rows cascade-delete when the session is removed.
+    rec_dir = _recordings_dir()
+    for sid in session_ids:
+        for ext in (".webm", ".mp4", ".webm.fixed.webm"):
+            p = os.path.join(rec_dir, f"{sid}{ext}")
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except OSError as exc:
+                logger.warning("retake: could not remove recording %s: %s", p, exc)
+        shutil.rmtree(os.path.join(rec_dir, ".parts", str(sid)), ignore_errors=True)
+
+    # Deleting the session cascades to messages, evaluation, violations,
+    # feedback, meeting_schedule, screenshots, and coding_submissions.
+    for s in all_sessions:
+        db.delete(s)
+
+    # Reset the candidate's INTERVIEW state — keep identity, resume, fit score.
+    log = InterviewStatusLog(
+        candidate_id=candidate.id,
+        previous_status=candidate.interview_status,
+        new_status="New",
+        changed_by="admin",
+        reason="Interview reset for retake (previous interview archived & removed)",
+    )
+    db.add(log)
+
+    candidate.interview_status = "New"
+    # Move back to the initial pipeline stage so they no longer count as
+    # "AI Round" (completed) — they're waiting to take the AI round again.
+    candidate.candidate_stage = "Candidates"
+    candidate.interview_date = None
+    candidate.interview_timezone = None
+    candidate.interview_link = None
+    candidate.recording_link = None
+    candidate.video_duration = None
+    # Post-interview scores — clear all of them.
+    candidate.score = None
+    candidate.trust_score = None
+    candidate.grammar_score = None
+    candidate.confidence_score = None
+    candidate.clarity_score = None
+    candidate.pronunciation_score = None
+    candidate.enthusiasm_score = None
+    candidate.conciseness_score = None
+    candidate.ai_cheating_score = None
+
+    # Guarantee the candidate can actually re-enter via the SAME interview link:
+    # if the per-job token has a finite expiry that's already past (or about to
+    # lapse), refresh it. Without this, a candidate scheduled with a short link
+    # expiry would be reset to "New" but then hit "link expired" on re-entry.
+    # This only re-opens access for THIS reset candidate — others who completed
+    # are still blocked by their own completed-session check in verify-access.
+    if candidate.job_id:
+        min_valid = datetime.utcnow() + timedelta(days=7)
+        active_tokens = (
+            db.query(InterviewToken)
+            .filter(InterviewToken.job_id == candidate.job_id, InterviewToken.is_active.is_(True))
+            .all()
+        )
+        for tok in active_tokens:
+            if tok.expires_at is not None and tok.expires_at < min_valid:
+                tok.expires_at = min_valid
+
+    db.commit()
+    db.refresh(candidate)
+    logger.info(
+        "[Retake] Reset interview for candidate %s (%s) — deleted sessions %s",
+        candidate.id, candidate.email, session_ids,
+    )
+    return candidate
+
+
 # ── Stage Promotion ───────────────────────────────────────────────────────────
 
 @router.post(
@@ -1966,23 +2261,16 @@ def regenerate_evaluation(
 # ── Download Endpoints ────────────────────────────────────────────────────────
 
 
-@router.get(
-    "/{candidate_id}/evaluation/download-pdf",
-    summary="Download evaluation report as PDF",
-)
-def download_evaluation_pdf(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """Generate and return a PDF evaluation report for the candidate."""
+def _build_evaluation_pdf_bytes(db: Session, candidate) -> bytes:
+    """Full evaluation report PDF (candidate info + scores + AI evaluation +
+    transcript) as bytes. Shared by the download-pdf endpoint and the
+    interview-archive ZIP so both produce the same readable report.
+    Raises ImportError if fpdf2 is not installed."""
     from io import BytesIO
-    from fastapi.responses import StreamingResponse
+    from fpdf import FPDF
     from app.models.interview import InterviewSession, InterviewMessage, SessionStatus, Evaluation
 
-    candidate = _get_candidate_with_org_check(db, candidate_id, user)
-
-    try:
-        from fpdf import FPDF
-    except ImportError:
-        raise HTTPException(status_code=500, detail="fpdf2 package not installed")
-
+    candidate_id = candidate.id
     latest_session = (
         db.query(InterviewSession)
         .filter(
@@ -2154,10 +2442,26 @@ def download_evaluation_pdf(candidate_id: int, db: Session = Depends(get_db), us
 
     buf = BytesIO()
     pdf.output(buf)
-    buf.seek(0)
+    return buf.getvalue()
+
+
+@router.get(
+    "/{candidate_id}/evaluation/download-pdf",
+    summary="Download evaluation report as PDF",
+)
+def download_evaluation_pdf(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Generate and return a PDF evaluation report for the candidate."""
+    from io import BytesIO
+    from fastapi.responses import StreamingResponse
+
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
+    try:
+        pdf_bytes = _build_evaluation_pdf_bytes(db, candidate)
+    except ImportError:
+        raise HTTPException(status_code=500, detail="fpdf2 package not installed")
     safe_name = (candidate.name or "candidate").replace(" ", "_")
     return StreamingResponse(
-        buf,
+        BytesIO(pdf_bytes),
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{safe_name}_Evaluation.pdf"'},
     )

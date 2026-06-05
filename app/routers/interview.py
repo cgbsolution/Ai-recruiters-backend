@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
 import traceback
@@ -199,6 +200,22 @@ async def generate_tts(payload: dict):
         raise HTTPException(status_code=503, detail="Google TTS not configured")
 
     text = (payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is required")
+
+    # Strip markdown / code-formatting so the voice never reads symbols aloud
+    # (e.g. `useState` → useState, **bold** → bold, ~~x~~ → x). Defense-in-depth:
+    # the frontend also cleans before sending, but doing it here too guarantees
+    # clean speech regardless of the client build or any other caller.
+    import re as _re
+    text = _re.sub(r"```[\s\S]*?```", " ", text)          # fenced code blocks
+    text = text.replace("`", "").replace("~~", "")          # inline code / strikethrough
+    text = _re.sub(r"\*\*|\*|__|_", "", text)               # bold / italic
+    text = _re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", text)      # markdown headings
+    text = _re.sub(r"(?m)^\s{0,3}>\s?", "", text)           # blockquotes
+    text = _re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)   # links [text](url) → text
+    text = _re.sub(r"[*_~#`]", "", text)                    # any stray markdown chars
+    text = _re.sub(r"\s{2,}", " ", text).strip()            # collapse whitespace
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
     if len(text) > 5000:
@@ -1617,6 +1634,9 @@ async def complete_interview(
             db.commit()
         if not session.evaluation:
             background_tasks.add_task(_run_evaluation_background, session_id)
+        # Backstop: assemble the live-uploaded recording parts if the client
+        # never called /recording-finalize (e.g. tab closed right after ending).
+        background_tasks.add_task(_finalize_recording_safety_net, session_id)
         return {"status": "processing", "session_id": session_id}
 
     session.status = SessionStatus.completed
@@ -1637,6 +1657,9 @@ async def complete_interview(
 
     # Trigger evaluation in background — returns 202 immediately
     background_tasks.add_task(_run_evaluation_background, session_id)
+    # Backstop: assemble the live-uploaded recording parts if the client never
+    # called /recording-finalize (e.g. tab/browser/laptop closed right after).
+    background_tasks.add_task(_finalize_recording_safety_net, session_id)
     return {"status": "processing", "session_id": session_id}
 
 
@@ -1882,7 +1905,8 @@ async def upload_recording(
     # the upload is non-empty AND at least as big as what's already on disk.
     tmp_path = f"{final_path}.incoming-{int(time.time())}"
 
-    tag = f"session={session_id} recording_id={recording_id or '-'} recovery={bool(recovery)}"
+    who = _candidate_label(db, session)
+    tag = f"{who} recording_id={recording_id or '-'} recovery={bool(recovery)}"
     try:
         total_size = 0
         with open(tmp_path, "wb") as f:
@@ -2006,6 +2030,19 @@ async def upload_recording(
                         import time as _t
                         _t.sleep(attempt * 0.5)
 
+    # Definitive, candidate-named outcome line so an operator can confirm at a
+    # glance whether THIS candidate's video landed on the server.
+    if db_link_saved or not session.candidate_id:
+        _rec_logger.info(
+            f"[Recording] SAVED OK (single-shot) for {who} — "
+            f"{total_size / (1024*1024):.2f} MB -> {recording_link}"
+        )
+    else:
+        _rec_logger.error(
+            f"[Recording] SAVE PARTIAL for {who} — file is on disk at {recording_link} "
+            f"but the DB link could NOT be updated (manual repair needed)."
+        )
+
     return RecordingUploadResponse(
         recording_link=recording_link,
         video_duration=duration or "0:00",
@@ -2015,6 +2052,316 @@ async def upload_recording(
             else "Recording file saved; link update pending — admin will be notified."
         ),
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live incremental recording upload
+#
+# The single-shot upload above sends the whole recording in ONE request at the
+# END of the interview — so if the candidate closes the tab/browser/laptop, the
+# entire video is lost. To make the recording survive ANY way the session ends,
+# the client instead streams the recording WHILE the interview runs: each batch
+# of MediaRecorder chunks is POSTed as a "part" to /recording-part, then
+# /recording-finalize stitches the parts (in order) into the final .webm.
+#
+# By the time the interview ends the video is already on the server, so a
+# tab/browser/laptop close can no longer lose it. The only unrecoverable bytes
+# are the last ~few seconds being recorded at the instant of a hard power-off
+# that never comes back — those never left the device.
+#
+# Parts are named by their START chunk index, zero-padded, so finalize can sort
+# and concatenate them in order. Re-uploading a range overwrites the same file
+# (idempotent). MediaRecorder chunks of one recording, concatenated in order,
+# form a valid WebM — which is exactly what the single-shot path already relied
+# on client-side.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _recording_upload_root() -> str:
+    _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+    return "/tmp/uploads" if _is_serverless else "uploads"
+
+
+# Logger under the "app" namespace. main.py sets the ROOT logger to WARNING but
+# "app" to INFO, so bare logging.info() is suppressed — these outcome lines must
+# go through an app.* logger to actually appear in the Dokploy logs.
+_rec_logger = logging.getLogger("app.recording")
+
+
+def _candidate_label(db: Session, session: InterviewSession) -> str:
+    """Human-readable candidate identity for recording logs, e.g.
+    "candidate 'Adarsh Sasi' <adarsh@x.com> (id=21, session=16)". So an operator
+    can see exactly WHOSE video was (or wasn't) saved."""
+    sid = getattr(session, "id", "?")
+    try:
+        if session and session.candidate_id:
+            c = db.query(Candidate).filter(Candidate.id == session.candidate_id).first()
+            if c:
+                return (
+                    f"candidate '{c.name or 'Unknown'}' "
+                    f"<{c.email or 'no-email'}> (id={c.id}, session={sid})"
+                )
+        return f"candidate (none linked) (session={sid})"
+    except Exception:
+        return f"candidate (lookup failed) (session={sid})"
+
+
+def _parts_dir(upload_root: str, session_id: int) -> str:
+    return f"{upload_root}/recordings/.parts/{session_id}"
+
+
+def _remux_webm_inplace(path: str) -> None:
+    """Rewrite WebM headers so duration/seekbar work (copy, no re-encode)."""
+    try:
+        from app.main import _FFMPEG as _ff
+        if not _ff:
+            return
+        fixed = path + ".fixed.webm"
+        proc = subprocess.run(
+            [_ff, "-y", "-i", path, "-c", "copy", fixed],
+            capture_output=True, timeout=120,
+        )
+        if proc.returncode == 0 and os.path.isfile(fixed):
+            os.replace(fixed, path)
+            logging.info("[Recording] Remuxed %s — seekbar metadata fixed", path)
+        elif os.path.isfile(fixed):
+            os.remove(fixed)
+    except Exception as exc:
+        logging.warning("[Recording] Remux skipped for %s: %s", path, exc)
+
+
+def _concat_parts_to_webm(upload_root: str, session_id: int) -> Optional[tuple]:
+    """Concatenate all uploaded parts (in chunk-index order) into the final
+    .webm. Idempotent and size-guarded: never replaces a larger existing file
+    with a smaller assembly (protects a good recording from a partial retry).
+    Returns (final_path, total_bytes) or None if there are no parts."""
+    pd = _parts_dir(upload_root, session_id)
+    if not os.path.isdir(pd):
+        return None
+    try:
+        part_files = sorted(
+            (f for f in os.listdir(pd) if f.endswith(".bin")),
+            key=lambda n: int(n.split(".")[0]),
+        )
+    except ValueError:
+        part_files = sorted(f for f in os.listdir(pd) if f.endswith(".bin"))
+    if not part_files:
+        return None
+
+    final_path = f"{upload_root}/recordings/{session_id}.webm"
+    os.makedirs(f"{upload_root}/recordings", exist_ok=True)
+    tmp = f"{final_path}.assembling-{int(time.time())}"
+    total = 0
+    try:
+        with open(tmp, "wb") as out:
+            for name in part_files:
+                with open(f"{pd}/{name}", "rb") as fin:
+                    while True:
+                        buf = fin.read(1 << 20)
+                        if not buf:
+                            break
+                        out.write(buf)
+                        total += len(buf)
+    except Exception as e:
+        logging.error(f"[Recording] concat failed for session {session_id}: {e}")
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return None
+
+    if total == 0:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+
+    if os.path.isfile(final_path):
+        try:
+            existing = os.path.getsize(final_path)
+        except OSError:
+            existing = 0
+        if existing >= total:
+            # A bigger/equal recording already exists (e.g. the single-shot
+            # upload landed). Keep it; drop our assembly.
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return (final_path, existing)
+
+    try:
+        os.replace(tmp, final_path)
+    except OSError as e:
+        logging.error(f"[Recording] promote assembled file failed session {session_id}: {e}")
+        return None
+    return (final_path, total)
+
+
+def _save_recording_link(db: Session, session: InterviewSession, recording_link: str, duration: str) -> bool:
+    """Persist candidate.recording_link with the same retry policy as the
+    single-shot path. Returns True if the DB link was saved."""
+    if not session.candidate_id:
+        return False
+    candidate = db.query(Candidate).filter(Candidate.id == session.candidate_id).first()
+    if not candidate:
+        return False
+    candidate.recording_link = recording_link
+    if duration:
+        candidate.video_duration = duration
+    for attempt in range(1, 4):
+        try:
+            db.commit()
+            return True
+        except Exception as exc:
+            logging.error(f"[Recording] link commit attempt {attempt}/3 failed (session {session.id}): {exc}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            if attempt < 3:
+                time.sleep(attempt * 0.5)
+    return False
+
+
+@router.post(
+    "/interview/sessions/{session_id}/recording-part",
+    status_code=200,
+    summary="Upload one part of an in-progress interview recording",
+    tags=["Interview"],
+)
+@limiter.limit("600/minute")
+async def upload_recording_part(
+    session_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    start_index: int = Form(...),
+    recording_id: str = Form(default=""),
+    db: Session = Depends(get_db),
+):
+    session = _get_session_or_404(session_id, db)
+    upload_root = _recording_upload_root()
+    pd = _parts_dir(upload_root, session_id)
+    os.makedirs(pd, exist_ok=True)
+
+    part_path = f"{pd}/{start_index:012d}.bin"
+    tmp = f"{part_path}.incoming-{int(time.time() * 1000)}"
+    total = 0
+    try:
+        with open(tmp, "wb") as f:
+            while chunk := await file.read(65536):
+                total += len(chunk)
+                f.write(chunk)
+        if total == 0:
+            os.remove(tmp)
+            return {"ok": True, "skipped": "empty", "start_index": start_index}
+        os.replace(tmp, part_path)
+    except Exception as e:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        logging.error(f"[Recording] part {start_index} save failed session={session_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"part save failed: {e}")
+    return {"ok": True, "bytes": total, "start_index": start_index}
+
+
+@router.post(
+    "/interview/sessions/{session_id}/recording-finalize",
+    response_model=RecordingUploadResponse,
+    summary="Stitch uploaded recording parts into the final video",
+    tags=["Interview"],
+)
+@limiter.limit("30/minute")
+async def finalize_recording(
+    session_id: int,
+    request: Request,
+    recording_id: str = Form(default=""),
+    duration: str = Form(default=""),
+    db: Session = Depends(get_db),
+):
+    session = _get_session_or_404(session_id, db)
+    who = _candidate_label(db, session)
+    upload_root = _recording_upload_root()
+
+    result = await asyncio.to_thread(_concat_parts_to_webm, upload_root, session_id)
+    if not result:
+        _rec_logger.error(
+            f"[Recording] SAVE FAILED for {who} — no uploaded parts found to "
+            f"finalize (recording never reached the server)."
+        )
+        raise HTTPException(status_code=404, detail="No recording parts to finalize")
+    final_path, total = result
+    await asyncio.to_thread(_remux_webm_inplace, final_path)
+
+    recording_link = f"/uploads/recordings/{session_id}.webm"
+    db_saved = _save_recording_link(db, session, recording_link, duration or "0:00")
+
+    # Parts are no longer needed once they're stitched and the link is saved.
+    if db_saved or not session.candidate_id:
+        shutil.rmtree(_parts_dir(upload_root, session_id), ignore_errors=True)
+        _rec_logger.info(
+            f"[Recording] SAVED OK (finalized from live parts) for {who} — "
+            f"{total / (1024*1024):.2f} MB -> {recording_link}"
+        )
+    else:
+        _rec_logger.error(
+            f"[Recording] SAVE PARTIAL for {who} — file assembled at {recording_link} "
+            f"but the DB link could NOT be updated (manual repair needed)."
+        )
+    return RecordingUploadResponse(
+        recording_link=recording_link,
+        video_duration=duration or "0:00",
+        message="Recording finalized from live-uploaded parts.",
+    )
+
+
+def _finalize_recording_safety_net(session_id: int):
+    """Server-side backstop: if the candidate's browser died before calling
+    /recording-finalize, stitch whatever parts DID arrive into a playable video
+    so a recording is present even when the client never finishes. Idempotent
+    and size-guarded, so it can never clobber a good single-shot upload."""
+    upload_root = _recording_upload_root()
+    final_path = f"{upload_root}/recordings/{session_id}.webm"
+    pd = _parts_dir(upload_root, session_id)
+    if not os.path.isdir(pd):
+        return  # no live parts — nothing to recover
+    # Give the client a window to upload its tail + call finalize itself first.
+    time.sleep(45)
+    # If a full recording already exists (client finalize or single-shot landed),
+    # only re-stitch if parts somehow total MORE (handled by the size guard).
+    result = _concat_parts_to_webm(upload_root, session_id)
+    if not result:
+        return
+    fp, total = result
+    _remux_webm_inplace(fp)
+    db = SessionLocal()
+    try:
+        session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+        if session:
+            who = _candidate_label(db, session)
+            saved = _save_recording_link(db, session, f"/uploads/recordings/{session_id}.webm", "")
+            if saved:
+                shutil.rmtree(pd, ignore_errors=True)
+                _rec_logger.info(
+                    f"[Recording] SAVED OK (safety-net) for {who} — "
+                    f"{total / (1024*1024):.2f} MB. Client never called finalize; "
+                    f"server assembled the uploaded parts."
+                )
+            else:
+                _rec_logger.error(
+                    f"[Recording] SAVE PARTIAL (safety-net) for {who} — file assembled "
+                    f"from parts but the DB link could NOT be updated (manual repair needed)."
+                )
+        else:
+            _rec_logger.error(
+                f"[Recording] SAVE FAILED (safety-net) — session {session_id} not found "
+                f"in DB; assembled {total / (1024*1024):.2f} MB of parts but cannot link it."
+            )
+    finally:
+        db.close()
 
 
 @router.post(

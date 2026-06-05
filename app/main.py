@@ -31,7 +31,7 @@ logging.basicConfig(
 # Keep app-level loggers at INFO so our own messages still appear
 logging.getLogger("app").setLevel(logging.INFO)
 from app.database import Base, engine
-from app.routers import ai, auth, candidates, credits, file_manager, interview, jobs, observer, organizations, questions, resume_database, secondary_cam, tts, uploads
+from app.routers import ai, auth, candidates, client_events, credits, file_manager, interview, jobs, observer, organizations, questions, resume_database, secondary_cam, tts, uploads
 
 import app.models  # noqa: F401 — ensure all models are registered with Base
 import app.services.observer_events  # noqa: F401 — wire SQLAlchemy listeners for the live observer broker
@@ -106,6 +106,27 @@ _raw_migrations = [
         "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS grammar_score FLOAT",
         "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS conciseness_score FLOAT",
         "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS clarity_score FLOAT",
+        # Convert the legacy native-enum `recommendation` column to plain VARCHAR.
+        # The ORM (RecommendationType, impl=String) writes free-text values like
+        # "No Hire", but Postgres refuses to implicitly cast varchar -> the old
+        # enum type — which was failing EVERY evaluation insert with
+        # "column recommendation is of type recommendation but expression is of
+        # type character varying". Only convert while it is still the enum, so
+        # this is idempotent (skipped once the column is already varchar).
+        """
+        DO $$
+        BEGIN
+          IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'evaluations'
+              AND column_name = 'recommendation'
+              AND data_type = 'USER-DEFINED'
+          ) THEN
+            ALTER TABLE evaluations
+              ALTER COLUMN recommendation TYPE VARCHAR(32) USING recommendation::text;
+          END IF;
+        END $$;
+        """,
         # organizations — feature flags
         "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS allow_resume_database BOOLEAN DEFAULT FALSE",
         "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS allow_code_editor BOOLEAN DEFAULT FALSE",
@@ -126,6 +147,8 @@ _raw_migrations = [
         "CREATE TABLE IF NOT EXISTS secondary_cam_sessions (id SERIAL PRIMARY KEY, session_id INTEGER REFERENCES interview_sessions(id) ON DELETE CASCADE UNIQUE, pairing_code VARCHAR(32) UNIQUE NOT NULL, status VARCHAR(20) DEFAULT 'pending', device_info TEXT, last_heartbeat TIMESTAMP, positioning_snapshot VARCHAR(500), created_at TIMESTAMP DEFAULT NOW(), verified_at TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS secondary_cam_snapshots (id SERIAL PRIMARY KEY, secondary_session_id INTEGER REFERENCES secondary_cam_sessions(id) ON DELETE CASCADE, file_path VARCHAR(500) NOT NULL, captured_at TIMESTAMP DEFAULT NOW())",
         "DO $$ BEGIN ALTER TYPE mixofquestions ADD VALUE IF NOT EXISTS 'ai_only'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+        # New proctoring violation: candidate stopped screen sharing mid-interview.
+        "DO $$ BEGIN ALTER TYPE violationtype ADD VALUE IF NOT EXISTS 'screen_share_stopped'; EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
         "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS added_by VARCHAR(255)",
         "ALTER TABLE interview_sessions ADD COLUMN IF NOT EXISTS interview_language VARCHAR(20) DEFAULT 'en'",
         # email logs
@@ -136,6 +159,11 @@ _raw_migrations = [
         "CREATE INDEX IF NOT EXISTS ix_observer_tokens_candidate_id ON observer_tokens(candidate_id)",
         "CREATE INDEX IF NOT EXISTS ix_observer_tokens_session_id ON observer_tokens(session_id)",
         "CREATE INDEX IF NOT EXISTS ix_observer_tokens_room_name ON observer_tokens(room_name)",
+        # client-side telemetry (recording-upload failures, crashes, memory pressure)
+        "CREATE TABLE IF NOT EXISTS client_events (id SERIAL PRIMARY KEY, session_id INTEGER, event_type VARCHAR(60) NOT NULL, message TEXT, context TEXT, url VARCHAR(1000), user_agent VARCHAR(500), device_memory_gb FLOAT, hardware_concurrency INTEGER, client_at VARCHAR(40), created_at TIMESTAMP DEFAULT NOW())",
+        "CREATE INDEX IF NOT EXISTS ix_client_events_session_id ON client_events(session_id)",
+        "CREATE INDEX IF NOT EXISTS ix_client_events_event_type ON client_events(event_type)",
+        "CREATE INDEX IF NOT EXISTS ix_client_events_created_at ON client_events(created_at)",
 ]
 try:
     with engine.connect() as conn:
@@ -561,6 +589,7 @@ app.include_router(file_manager.router, prefix="/file-manager", tags=["File Mana
 app.include_router(secondary_cam.router, tags=["Secondary Camera"])
 app.include_router(tts.router, tags=["Text-to-Speech"])
 app.include_router(observer.router, tags=["Live Observer"])
+app.include_router(client_events.router, tags=["Client Telemetry"])
 
 
 @app.on_event("startup")

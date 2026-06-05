@@ -137,12 +137,27 @@ async def _anthropic_ask_with_system(
 ) -> LLMResult:
     import anthropic
     client = _get_anthropic_client()
+
+    # Prompt-cache the system block. The interview system prompt is large (~600
+    # lines) and is resent on every turn, so caching it (Anthropic's ~5-min
+    # ephemeral cache) makes turns 2..N markedly faster to process and cheaper —
+    # the model reuses the cached prefix instead of re-reading it each turn.
+    # The SDK accepts `system` as a list of content blocks; only worth caching a
+    # sufficiently large prompt (small ones fall below the cacheable minimum).
+    system_param: object = system
+    if isinstance(system, str) and len(system) >= 4000:
+        system_param = [{
+            "type": "text",
+            "text": system,
+            "cache_control": {"type": "ephemeral"},
+        }]
+
     for attempt in range(retries):
         try:
             response = await client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
-                system=system,
+                system=system_param,
                 messages=messages,
                 timeout=timeout_seconds,
             )

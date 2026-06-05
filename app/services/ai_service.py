@@ -77,11 +77,34 @@ async def _ask_with_system_usage(
 
 
 def _parse_json(raw: str) -> Any:
-    raw = raw.strip()
+    raw = (raw or "").strip()
     if raw.startswith("```"):
         lines = raw.split("\n")
         raw = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
-    return json.loads(raw)
+        raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    # Tolerant repair for common LLM JSON mistakes: surrounding prose and
+    # unescaped newlines/tabs inside string values (which break strict parsing
+    # and previously caused interview questions to be truncated). Valid JSON
+    # never reaches this path. Unescaped inner QUOTES still can't be repaired
+    # here — the caller's field-level salvage handles those.
+    import re as _re
+    m = _re.search(r'(\{.*\}|\[.*\])', raw, _re.DOTALL)
+    if not m:
+        raise json.JSONDecodeError("No JSON object found in model output", raw, 0)
+    candidate = m.group(0)
+    for variant in (
+        candidate,
+        candidate.replace("\r", " ").replace("\n", " ").replace("\t", " "),
+    ):
+        try:
+            return json.loads(variant)
+        except json.JSONDecodeError:
+            continue
+    raise json.JSONDecodeError("Unrepairable JSON in model output", candidate, 0)
 
 
 async def generate_jd(req: GenerateJDRequest) -> GenerateJDResponse:
