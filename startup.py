@@ -3,11 +3,55 @@ Startup script: ensures all required DB tables/columns exist,
 then runs alembic upgrade to stay in sync.
 """
 import logging
+import time
 from sqlalchemy import text
 from app.database import engine
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("startup")
+
+# A fixed advisory-lock key so concurrent processes/containers (rolling deploys,
+# multiple workers) SERIALIZE their schema migrations instead of deadlocking on
+# ALTER TABLE locks. Session-level lock auto-releases if a process dies.
+_MIGRATION_LOCK_KEY = 727274
+
+
+def _autocommit_conn():
+    """Connection where each statement is its own transaction — so one failed
+    DDL can't abort (and cascade-fail) the rest of the batch."""
+    return engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+
+
+def _exec_safe(conn, sql: str, label: str, retries: int = 4) -> bool:
+    """Execute one DDL statement, retrying transient deadlocks. Never raises."""
+    for attempt in range(1, retries + 1):
+        try:
+            conn.execute(text(sql))
+            return True
+        except Exception as e:
+            if "deadlock" in str(e).lower() and attempt < retries:
+                logger.warning("%s: deadlock — retry %d/%d", label, attempt, retries)
+                time.sleep(0.5 * attempt)
+                continue
+            logger.warning("%s: %s", label, e)
+            return False
+    return False
+
+
+def _advisory_lock(conn) -> bool:
+    try:
+        conn.execute(text("SELECT pg_advisory_lock(:k)").bindparams(k=_MIGRATION_LOCK_KEY))
+        return True
+    except Exception as e:
+        logger.warning("advisory lock unavailable (continuing without it): %s", e)
+        return False
+
+
+def _advisory_unlock(conn) -> None:
+    try:
+        conn.execute(text("SELECT pg_advisory_unlock(:k)").bindparams(k=_MIGRATION_LOCK_KEY))
+    except Exception:
+        pass
 
 # All columns that migrations should have added.
 # Format: (table, column, sql_type, default)
@@ -168,35 +212,37 @@ REQUIRED_INDEXES = [
 
 
 def ensure_tables():
-    """Create any missing tables."""
-    with engine.connect() as conn:
-        for ddl in REQUIRED_TABLES:
-            try:
-                conn.execute(text(ddl))
-                logger.info("Ensured table from DDL")
-            except Exception as e:
-                logger.warning("Table creation: %s", e)
-        for idx in REQUIRED_INDEXES:
-            try:
-                conn.execute(text(idx))
-            except Exception as e:
-                logger.warning("Index creation: %s", e)
-        conn.commit()
+    """Create any missing tables/indexes — autocommit per statement + advisory
+    lock + deadlock retry, so concurrent startups can't deadlock or cascade-fail."""
+    with _autocommit_conn() as conn:
+        locked = _advisory_lock(conn)
+        try:
+            for ddl in REQUIRED_TABLES:
+                if _exec_safe(conn, ddl, "Table DDL"):
+                    logger.info("Ensured table from DDL")
+            for idx in REQUIRED_INDEXES:
+                _exec_safe(conn, idx, "Index")
+        finally:
+            if locked:
+                _advisory_unlock(conn)
     logger.info("All required tables verified.")
 
 
 def ensure_columns():
-    """Add any missing columns to the database."""
-    with engine.connect() as conn:
-        for table, column, col_type, default in REQUIRED_COLUMNS:
-            default_clause = f" DEFAULT {default}" if default else ""
-            sql = f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_type}{default_clause}"
-            try:
-                conn.execute(text(sql))
-                logger.info("Ensured column %s.%s", table, column)
-            except Exception as e:
-                logger.warning("Column %s.%s: %s", table, column, e)
-        conn.commit()
+    """Add any missing columns — autocommit per statement + advisory lock +
+    deadlock retry. Previously these ran in ONE transaction, so a deadlock on
+    one ALTER aborted the whole batch ('current transaction is aborted')."""
+    with _autocommit_conn() as conn:
+        locked = _advisory_lock(conn)
+        try:
+            for table, column, col_type, default in REQUIRED_COLUMNS:
+                default_clause = f" DEFAULT {default}" if default else ""
+                sql = f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_type}{default_clause}"
+                if _exec_safe(conn, sql, f"Column {table}.{column}"):
+                    logger.info("Ensured column %s.%s", table, column)
+        finally:
+            if locked:
+                _advisory_unlock(conn)
     logger.info("All required columns verified.")
 
 

@@ -166,13 +166,36 @@ _raw_migrations = [
         "CREATE INDEX IF NOT EXISTS ix_client_events_created_at ON client_events(created_at)",
 ]
 try:
-    with engine.connect() as conn:
-        for sql in _raw_migrations:
-            try:
-                conn.execute(sa.text(sql))
-            except Exception:
-                pass  # column/type already exists — safe to skip
-        conn.commit()
+    # Run in AUTOCOMMIT (each statement is its own transaction, so one failure
+    # can't abort the rest) and hold a Postgres advisory lock (same key as
+    # startup.py) so concurrent workers / rolling deploys SERIALIZE these DDLs
+    # instead of deadlocking on ALTER TABLE locks. Retry transient deadlocks.
+    import time as _t
+    _MIG_LOCK_KEY = 727274
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        _locked = False
+        try:
+            conn.execute(sa.text("SELECT pg_advisory_lock(:k)").bindparams(k=_MIG_LOCK_KEY))
+            _locked = True
+        except Exception:
+            pass
+        try:
+            for sql in _raw_migrations:
+                for _attempt in range(3):
+                    try:
+                        conn.execute(sa.text(sql))
+                        break
+                    except Exception as _e:
+                        if "deadlock" in str(_e).lower() and _attempt < 2:
+                            _t.sleep(0.5 * (_attempt + 1))
+                            continue
+                        break  # already exists / non-fatal — safe to skip
+        finally:
+            if _locked:
+                try:
+                    conn.execute(sa.text("SELECT pg_advisory_unlock(:k)").bindparams(k=_MIG_LOCK_KEY))
+                except Exception:
+                    pass
     logging.info("Raw SQL migrations applied successfully")
 except Exception as e2:
     logging.warning(f"Raw SQL migrations failed: {e2}")

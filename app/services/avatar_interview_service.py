@@ -1784,7 +1784,10 @@ Return ONLY valid JSON:
             system="You are a senior technical evaluator. Return only valid JSON.",
             messages=[{"role": "user", "content": prompt}],
             model=OPUS,
-            max_tokens=4000,
+            # Headroom for long interviews — a 20+ question evaluation (per-question
+            # positives/negatives + scores + summary + skills) overflowed 4000 and
+            # got truncated into unparseable JSON.
+            max_tokens=8000,
             # 90s/attempt × outer 360s wrapper × 4 retries = up to ~6 min total
             # before we give up — fail fast so the candidate sees a real retry
             # button instead of staring at "Generating…" for 7+ minutes.
@@ -1798,8 +1801,32 @@ Return ONLY valid JSON:
     try:
         data = _parse_json(llm_result.text)
     except Exception as e:
-        logging.error(f"[Evaluation] JSON parse failed for session {session.id}: {e}\nRaw AI response: {llm_result.text[:500]}")
-        raise
+        # The evaluation JSON most often breaks on UNescaped double-quotes inside
+        # feedback text (the model cites the candidate's words / terms like
+        # "useState" in quotes). Rather than fail the whole evaluation, ask the
+        # model to re-emit it as strictly-valid JSON. Truncation is already
+        # prevented by the raised max_tokens above. This repair only runs on a
+        # parse failure, so it adds no cost to the normal path.
+        logging.warning(f"[Evaluation] JSON parse failed for session {session.id}: {e}. Attempting JSON repair…")
+        try:
+            repair = await _ask_with_system_usage(
+                system=(
+                    "You fix malformed JSON. Output ONLY a single, strictly-valid JSON object — "
+                    "properly escape every inner double-quote and newline. No commentary, no markdown fences."
+                ),
+                messages=[{"role": "user", "content": f"Convert the following into one strictly-valid JSON object:\n\n{llm_result.text}"}],
+                model=SONNET,
+                max_tokens=8000,
+                timeout_seconds=60,
+            )
+            data = _parse_json(repair.text)
+            logging.info(f"[Evaluation] JSON repair succeeded for session {session.id}")
+        except Exception as e2:
+            logging.error(
+                f"[Evaluation] JSON parse failed AND repair failed for session {session.id}: {e2}\n"
+                f"Raw AI response: {llm_result.text[:500]}"
+            )
+            raise
 
     overall = float(data.get("overall_score", 0))
     rec_str = data.get("recommendation", "Maybe")
