@@ -1913,7 +1913,7 @@ async def upload_recording(
             while chunk := await file.read(65536):  # 64KB chunks for faster streaming
                 total_size += len(chunk)
                 f.write(chunk)
-        logging.info(f"[Recording] Wrote {total_size / (1024*1024):.2f} MB to {tmp_path} ({tag})")
+        _rec_logger.info(f"[Recording] Wrote {total_size / (1024*1024):.2f} MB to {tmp_path} ({tag})")
     except Exception as e:
         logging.error(f"[Recording] FAILED to save for session {session_id}: {e} ({tag})")
         try:
@@ -2257,6 +2257,10 @@ async def upload_recording_part(
             os.remove(tmp)
             return {"ok": True, "skipped": "empty", "start_index": start_index}
         os.replace(tmp, part_path)
+        _rec_logger.info(
+            f"[Recording] live chunk saved — session {session_id} "
+            f"start_index={start_index} ({total / 1024:.0f} KB)"
+        )
     except Exception as e:
         try:
             if os.path.isfile(tmp):
