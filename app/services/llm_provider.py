@@ -249,15 +249,18 @@ async def _gemini_ask_with_system(
 
     for attempt in range(retries):
         try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=model,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    max_output_tokens=max_tokens,
-                    temperature=0.3,
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.models.generate_content,
+                    model=model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system,
+                        max_output_tokens=max_tokens,
+                        temperature=0.3,
+                    ),
                 ),
+                timeout=timeout_seconds,
             )
             usage = getattr(response, "usage_metadata", None)
             inp = getattr(usage, "prompt_token_count", 0) or 0 if usage else 0

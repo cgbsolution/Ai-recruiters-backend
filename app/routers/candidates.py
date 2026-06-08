@@ -499,10 +499,36 @@ def update_candidate(
     candidate_id: int, payload: CandidateUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
     _get_candidate_with_org_check(db, candidate_id, user)
-    candidate = candidate_service.update_candidate(db, candidate_id, payload)
+    try:
+        candidate = candidate_service.update_candidate(db, candidate_id, payload)
+    except candidate_service.DuplicateCandidateEmailError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        import traceback
+        logger.error(
+            "update_candidate(%s) failed: %s\n%s",
+            candidate_id, exc, traceback.format_exc()
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update candidate: {type(exc).__name__}: {exc}",
+        ) from exc
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
-    return candidate
+    # Serialize to dict here so any Pydantic/SQLAlchemy serialization errors
+    # are surfaced with a clear message rather than a blank 500.
+    try:
+        return CandidateRead.model_validate(candidate, from_attributes=True)
+    except Exception as exc:
+        import traceback
+        logger.error(
+            "update_candidate(%s) serialization failed: %s\n%s",
+            candidate_id, exc, traceback.format_exc()
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Candidate updated but response serialization failed: {type(exc).__name__}: {exc}",
+        ) from exc
 
 
 @router.delete("/{candidate_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete candidate")

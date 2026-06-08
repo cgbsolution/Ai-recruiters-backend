@@ -1,6 +1,8 @@
 import logging
 from typing import List, Optional
 
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.candidate import Candidate, CandidateStatus
@@ -8,6 +10,10 @@ from app.models.job import Job
 from app.schemas.candidate import CandidateCreate, CandidateUpdate
 
 logger = logging.getLogger(__name__)
+
+
+class DuplicateCandidateEmailError(ValueError):
+    """Raised when an update would duplicate a candidate email in the same job."""
 
 
 def _reconcile_stale_completed_candidates(
@@ -241,6 +247,30 @@ def update_candidate(
 
     updates = data.model_dump(exclude_none=True)
 
+    for field in ("name", "role", "email", "phone", "location", "image", "resume_path"):
+        if field in updates and isinstance(updates[field], str):
+            updates[field] = updates[field].strip()
+
+    if "email" in updates:
+        updates["email"] = updates["email"].lower()
+
+    target_email = (updates.get("email") or candidate.email or "").strip().lower()
+    target_job_id = updates.get("job_id", candidate.job_id)
+    if target_email and target_job_id is not None:
+        duplicate = (
+            db.query(Candidate)
+            .filter(
+                Candidate.id != candidate_id,
+                Candidate.job_id == target_job_id,
+                func.lower(Candidate.email) == target_email,
+            )
+            .first()
+        )
+        if duplicate:
+            raise DuplicateCandidateEmailError(
+                "A candidate with this email already exists for this job."
+            )
+
     # When status changes, auto-sync candidate_stage and interview_status
     new_status = updates.get("status")
     if new_status:
@@ -251,7 +281,20 @@ def update_candidate(
 
     for field, value in updates.items():
         setattr(candidate, field, value)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        message = str(getattr(exc, "orig", exc))
+        if (
+            "uq_candidate_email_job" in message
+            or "candidates.email, candidates.job_id" in message
+            or "candidates_email_job" in message
+        ):
+            raise DuplicateCandidateEmailError(
+                "A candidate with this email already exists for this job."
+            ) from exc
+        raise
     db.refresh(candidate)
     return candidate
 

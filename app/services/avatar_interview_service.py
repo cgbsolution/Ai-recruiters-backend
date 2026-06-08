@@ -31,6 +31,11 @@ from app.services.credit_service import log_usage
 logger = logging.getLogger(__name__)
 
 VIOLATION_TERMINATE_THRESHOLD = 5
+LIVE_TURN_TIMEOUT_SECONDS = 38
+LIVE_LLM_ATTEMPT_1_TIMEOUT_SECONDS = 18
+LIVE_LLM_ATTEMPT_2_TIMEOUT_SECONDS = 12
+LIVE_LLM_REPAIR_TIMEOUT_SECONDS = 10
+LIVE_LLM_RETRIES = 1
 
 
 def _build_question_plan(job: Job, settings_obj: Optional[InterviewSettings]) -> tuple:
@@ -825,7 +830,10 @@ async def conduct_turn(
     text from being emitted verbatim three turns in a row.
     """
     try:
-        return await _conduct_turn_impl(session, candidate_message, db)
+        return await asyncio.wait_for(
+            _conduct_turn_impl(session, candidate_message, db),
+            timeout=LIVE_TURN_TIMEOUT_SECONDS,
+        )
     except Exception as exc:
         logger.exception(
             f"[conduct_turn] unhandled error for session {session.id}: {exc}"
@@ -1061,7 +1069,14 @@ async def _conduct_turn_impl(
     raw = None
 
     try:
-        llm_result = await _ask_with_system_usage(system_prompt, claude_messages, model=SONNET, max_tokens=1024, timeout_seconds=25)
+        llm_result = await _ask_with_system_usage(
+            system_prompt,
+            claude_messages,
+            model=SONNET,
+            max_tokens=1024,
+            timeout_seconds=LIVE_LLM_ATTEMPT_1_TIMEOUT_SECONDS,
+            retries=LIVE_LLM_RETRIES,
+        )
         log_usage(llm_result, feature="interview", session_id=session.id)
         raw = llm_result.text
         result = _parse_json(raw)
@@ -1077,7 +1092,14 @@ async def _conduct_turn_impl(
         import random as _r
         await asyncio.sleep(1 + _r.uniform(0, 0.5))
         try:
-            llm_result = await _ask_with_system_usage(system_prompt, claude_messages, model=SONNET, max_tokens=1024, timeout_seconds=20)
+            llm_result = await _ask_with_system_usage(
+                system_prompt,
+                claude_messages,
+                model=SONNET,
+                max_tokens=1024,
+                timeout_seconds=LIVE_LLM_ATTEMPT_2_TIMEOUT_SECONDS,
+                retries=LIVE_LLM_RETRIES,
+            )
             log_usage(llm_result, feature="interview", session_id=session.id)
             raw = llm_result.text
             result = _parse_json(raw)
@@ -1231,7 +1253,9 @@ async def _conduct_turn_impl(
         try:
             repair_result = await _ask_with_system_usage(
                 system_prompt, repair_messages, model=SONNET,
-                max_tokens=1024, timeout_seconds=20,
+                max_tokens=1024,
+                timeout_seconds=LIVE_LLM_REPAIR_TIMEOUT_SECONDS,
+                retries=LIVE_LLM_RETRIES,
             )
             log_usage(repair_result, feature="interview", session_id=session.id)
             repaired = _parse_json(repair_result.text)

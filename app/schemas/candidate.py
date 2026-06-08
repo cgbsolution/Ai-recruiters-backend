@@ -87,7 +87,7 @@ class CandidateRead(BaseModel):
     location: Optional[str]
     status: str
     image: Optional[str]
-    applied_date: datetime
+    applied_date: Optional[datetime] = None
     job_id: Optional[int]
     job_title: Optional[str] = None
     resume_path: Optional[str] = None
