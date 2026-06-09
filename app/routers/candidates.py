@@ -333,9 +333,10 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
                 candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
                 if candidate:
                     # Keep the candidate with "failed" status so the upload response
-                    # can return it and the UI can show the failed row — deleting it
+                    # can return it and the UI can show the actual error — deleting it
                     # caused the frontend to show a generic "Failed" with no context.
                     candidate.parsing_status = "failed"
+                    candidate.parsing_error = str(exc)[:500]
                     db.commit()
                     logger.info("Marked candidate %s as failed: %s", candidate_id, str(exc)[:200])
             except Exception as cleanup_exc:
@@ -750,6 +751,7 @@ def get_parsing_status(candidate_id: int, db: Session = Depends(get_db), user: U
     return {
         "candidate_id": candidate.id,
         "parsing_status": candidate.parsing_status,
+        "parsing_error": candidate.parsing_error,
         "name": candidate.name,
         "email": candidate.email,
         "resume_fit_score": candidate.resume_fit_score,

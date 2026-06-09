@@ -72,6 +72,7 @@ class Candidate(Base):
     # ── Resume Metadata Link ──────────────────────────────────────────────────
     resume_metadata_id = Column(Integer, ForeignKey("resume_metadata.id"), nullable=True, index=True)
     parsing_status = Column(String(20), nullable=True, default=None)  # "pending"|"processing"|"completed"|"failed"
+    parsing_error = Column(Text, nullable=True)  # stores actual exception message on failure
 
     # ── Contact History ──────────────────────────────────────────────────────
     mail_contact_history = Column(Boolean, nullable=True, default=False)

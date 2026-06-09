@@ -125,6 +125,7 @@ class CandidateRead(BaseModel):
     # Resume metadata
     resume_metadata_id: Optional[int] = None
     parsing_status: Optional[str] = None
+    parsing_error: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
