@@ -79,9 +79,13 @@ def get_candidates(
 ) -> list:
     query = db.query(Candidate, Job.title).outerjoin(Job, Candidate.job_id == Job.id)
 
-    # Filter out placeholder emails that haven't been parsed yet
+    # Filter out placeholder emails that haven't been parsed yet, and
+    # permanently failed entries (kept in DB for upload-response reporting only).
+    # Use IS NULL OR != to avoid excluding legacy rows where parsing_status is NULL.
+    from sqlalchemy import or_
     query = query.filter(
-        ~Candidate.email.like("pending_%@resume.local")
+        ~Candidate.email.like("pending_%@resume.local"),
+        or_(Candidate.parsing_status.is_(None), Candidate.parsing_status != "failed"),
     )
 
     # Organization scoping

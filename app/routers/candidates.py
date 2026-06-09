@@ -297,6 +297,16 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
 
             candidate.resume_metadata_id = meta.id
 
+            # ── Commit all candidate + metadata BEFORE scoring ────────────────
+            # Scoring can fail (AI timeout, API error, DB constraint on fit-score
+            # fields). Without this early commit, a scoring failure leaves the
+            # session needing rollback, causing the final db.commit() below to
+            # throw PendingRollbackError — which deletes the candidate entirely.
+            # By committing here first, scoring failure can only undo fit-score
+            # columns, not the parsed resume data we just wrote.
+            candidate.parsing_status = "processing"
+            db.commit()
+
             # ── Step 3: Compute fit score (smart scoring, instant) ────────────
             if job_id:
                 await _compute_fit_score_with_fallback(candidate, db, job_id, resume_text)
@@ -322,13 +332,12 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
                 db.rollback()
                 candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
                 if candidate:
-                    db.delete(candidate)
+                    # Keep the candidate with "failed" status so the upload response
+                    # can return it and the UI can show the failed row — deleting it
+                    # caused the frontend to show a generic "Failed" with no context.
+                    candidate.parsing_status = "failed"
                     db.commit()
-                    logger.info("Deleted failed candidate %s", candidate_id)
-                # Clean up the uploaded file
-                if file_path and os.path.isfile(file_path):
-                    os.remove(file_path)
-                    logger.info("Deleted failed resume file: %s", file_path)
+                    logger.info("Marked candidate %s as failed: %s", candidate_id, str(exc)[:200])
             except Exception as cleanup_exc:
                 logger.warning("Cleanup after parse failure: %s", cleanup_exc)
         finally:
@@ -342,6 +351,14 @@ async def _compute_fit_score_with_fallback(
     Run AI scoring directly (awaited). Falls back to smart scoring if AI fails.
     This runs inside _parse_one which is already concurrent, so the upload
     endpoint shows "Parsing..." while this completes (~30-40s per candidate).
+
+    IMPORTANT: Any exception raised inside _ai_fit_score_for_candidate (including
+    a failed db.commit()) leaves the SQLAlchemy session needing rollback.  If we
+    swallow the exception without calling db.rollback(), the shared session is in
+    an invalid state — the caller's subsequent db.commit() then raises
+    PendingRollbackError, which triggers _parse_one's outer except and DELETES
+    the candidate.  Always rollback after a scoring failure to return the session
+    to a clean state for the caller.
     """
     # Try AI scoring — produces accurate score with reasoning
     try:
@@ -355,8 +372,19 @@ async def _compute_fit_score_with_fallback(
             return
     except asyncio.TimeoutError:
         logger.warning("AI scoring timed out for candidate %s", candidate.id)
+        # Rollback only if the session is in an invalid state from a failed
+        # db.commit() inside _ai_fit_score_for_candidate. If the session is
+        # clean (AI call failed before any commit), rollback is a no-op.
+        try:
+            db.rollback()
+        except Exception:
+            pass
     except Exception as e:
         logger.warning("AI scoring failed for candidate %s: %s", candidate.id, e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
     # Fallback: smart scoring (instant)
     try:
@@ -374,6 +402,10 @@ async def _compute_fit_score_with_fallback(
             logger.info("Smart scoring fallback for candidate %s: %s%%", candidate.id, result.fit_percentage)
     except Exception as e:
         logger.warning("Smart scoring also failed for candidate %s: %s", candidate.id, e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 _background_tasks: list[asyncio.Task] = []  # prevent GC of fire-and-forget tasks

@@ -29,16 +29,35 @@ logger = logging.getLogger(__name__)
 # ── Text Extraction ───────────────────────────────────────────────────────────
 
 def extract_text_from_pdf(file_path: str) -> str:
-    """Extract plain text from a PDF file using pdfplumber."""
+    """Extract plain text from a PDF file using pdfplumber.
+
+    Uses dedupe_chars(tolerance=1) to strip doubled characters produced by
+    Canva / InDesign / scanner PDF artefacts before extracting text.
+    Falls back to raw extraction on pages where deduplication fails.
+    Raises RuntimeError with a human-readable message when the PDF yields no
+    text at all (e.g. image-only / purely scanned PDFs).
+    """
     try:
         import pdfplumber
         text_parts = []
         with pdfplumber.open(file_path) as pdf:
             for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
+                try:
+                    page_text = page.dedupe_chars(tolerance=1).extract_text() or ""
+                except Exception:
+                    page_text = page.extract_text() or ""
+                if page_text.strip():
                     text_parts.append(page_text)
-        return "\n".join(text_parts)
+        result = "\n".join(text_parts).strip()
+        if not result:
+            raise RuntimeError(
+                "No text could be extracted from this PDF. "
+                "It may be a scanned / image-only document. "
+                "Please upload a text-based PDF or a DOCX file."
+            )
+        return result
+    except RuntimeError:
+        raise
     except ImportError:
         raise RuntimeError("pdfplumber is not installed. Run: pip install pdfplumber")
     except Exception as exc:

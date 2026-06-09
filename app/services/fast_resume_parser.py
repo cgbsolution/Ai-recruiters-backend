@@ -147,6 +147,28 @@ COMMON_SKILLS = {
     "pwa", "service worker", "web assembly", "wasm",
     "xml", "json", "yaml", "toml", "protobuf", "avro",
     "regex", "cron", "makefile", "cmake",
+    # Accounting / Finance domain
+    "quickbooks", "quickbooks online", "xero", "tally", "tally erp",
+    "zoho books", "zoho", "bill.com", "netsuite", "oracle netsuite",
+    "sage", "sage 50", "sage intacct", "wave accounting",
+    "accounts payable", "accounts receivable", "a/p", "a/r",
+    "payroll", "payroll processing", "reconciliation", "bank reconciliation",
+    "general ledger", "ledger", "trial balance", "journal entries",
+    "financial statements", "balance sheet", "income statement",
+    "profit and loss", "p&l", "cash flow", "cash flow management",
+    "budgeting", "forecasting", "financial reporting", "financial analysis",
+    "tax preparation", "tax filing", "gst", "vat", "tds", "income tax",
+    "audit", "internal audit", "statutory audit", "tax audit",
+    "us gaap", "gaap", "ifrs", "ind as", "accounting standards",
+    "1099", "w-2", "w2", "form 16",
+    "vlookup", "pivot table", "pivot tables", "excel", "ms excel",
+    "microsoft excel", "google sheets",
+    "bookkeeping", "cost accounting", "management accounting",
+    "fixed assets", "depreciation", "amortization",
+    "intercompany", "consolidation", "month-end closing", "year-end closing",
+    "variance analysis", "financial modelling", "financial modeling",
+    "erp", "mis", "mis reporting",
+    "ca", "cpa", "cfa", "acca", "cma",
 }
 
 
@@ -252,6 +274,8 @@ def extract_text_from_file(file_path: str) -> Optional[str]:
     glyph is stamped twice with a tiny offset. Without this, every character
     in the styled regions ends up doubled (e.g. ``yyuukkttii@@ggmmaaiill..ccoomm``),
     which breaks email/phone regex extraction and confuses the LLM parser.
+
+    Returns None for purely image/scanned PDFs (no embedded text layer).
     """
     import os
     ext = os.path.splitext(file_path)[1].lower()
@@ -268,7 +292,13 @@ def extract_text_from_file(file_path: str) -> Optional[str]:
                         # dedupe_chars can fail on malformed pages — fall back
                         # to the raw extraction rather than losing the page.
                         parts.append(page.extract_text() or "")
-                return "\n".join(parts)
+            result = "\n".join(parts).strip()
+            if not result:
+                logger.warning(
+                    "PDF yielded no text (likely scanned/image-only): %s", file_path
+                )
+                return None
+            return result
         elif ext in (".doc", ".docx"):
             from docx import Document
             doc = Document(file_path)
@@ -353,7 +383,7 @@ def extract_email(text: str) -> Optional[str]:
 def extract_phone(text: str) -> Optional[str]:
     """Extract phone number from text."""
     patterns = [
-        r"(?:\+91[\s\-]?)?[6-9]\d{4}[\s\-]?\d{5}",        # Indian mobile
+        r"(?:\+91[\s\-]{0,2})?[6-9]\d{4}[\s\-]?\d{5}",       # Indian mobile (+91- 8746075567 has dash+space)
         r"(?:\+1[\s\-]?)?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{4}",  # US/Canada
         r"(?:\+\d{1,3}[\s\-]?)?\d{5,15}",                    # International
     ]

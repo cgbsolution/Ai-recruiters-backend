@@ -674,7 +674,11 @@ def _parse_resume_metadata_bg(meta_id: int):
             if not raw_text:
                 # Permanent: same input will produce same empty output.
                 meta.parsing_status = "failed"
-                meta.parsing_error = "Could not extract text from file"
+                meta.parsing_error = (
+                    "No text could be extracted from this PDF. "
+                    "It may be a scanned / image-only document. "
+                    "Please re-upload as a text-based PDF or DOCX."
+                )
                 db.commit()
                 permanent_failure = True
                 return
