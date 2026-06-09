@@ -93,13 +93,19 @@ def _get_parse_semaphore() -> asyncio.Semaphore:
 
 
 def _sync_extract_text(file_path: str) -> str:
-    """Extract text from resume file — runs in thread pool."""
+    """Extract text from resume file — runs in thread pool.
+
+    Strips NUL bytes (0x00) that pdfplumber can emit for certain bullet
+    glyphs (e.g. ➢) or malformed font encodings. PostgreSQL TEXT fields
+    reject NUL bytes and raise DataError if they reach the DB.
+    """
     from app.services.fast_resume_parser import extract_text_from_file
 
     text = extract_text_from_file(file_path)
     if not text:
         raise RuntimeError(f"Could not extract text from {file_path}")
-    return text
+    # Strip null bytes — PostgreSQL TEXT columns reject \x00 bytes.
+    return text.replace("\x00", "")
 
 
 async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):

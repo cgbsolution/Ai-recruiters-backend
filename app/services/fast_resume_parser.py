@@ -292,7 +292,7 @@ def extract_text_from_file(file_path: str) -> Optional[str]:
                         # dedupe_chars can fail on malformed pages — fall back
                         # to the raw extraction rather than losing the page.
                         parts.append(page.extract_text() or "")
-            result = "\n".join(parts).strip()
+            result = "\n".join(parts).strip().replace("\x00", "")
             if not result:
                 logger.warning(
                     "PDF yielded no text (likely scanned/image-only): %s", file_path

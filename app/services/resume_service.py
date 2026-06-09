@@ -48,7 +48,7 @@ def extract_text_from_pdf(file_path: str) -> str:
                     page_text = page.extract_text() or ""
                 if page_text.strip():
                     text_parts.append(page_text)
-        result = "\n".join(text_parts).strip()
+        result = "\n".join(text_parts).strip().replace("\x00", "")
         if not result:
             raise RuntimeError(
                 "No text could be extracted from this PDF. "
