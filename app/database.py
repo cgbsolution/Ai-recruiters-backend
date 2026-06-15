@@ -5,8 +5,16 @@ from app.config import settings
 engine = create_engine(
     settings.DATABASE_URL,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
+    # Sized for concurrent interview turns. conduct_turn now releases its
+    # connection during the LLM await (commit before the call), so each turn
+    # only holds a connection for milliseconds of DB work — but keep headroom
+    # for screenshot/violation/recording traffic spikes.
+    pool_size=15,
+    max_overflow=30,
+    pool_timeout=30,
+    # Recycle idle connections before typical LB/Postgres idle kill windows
+    # so a stale connection never surfaces as a mid-interview 500.
+    pool_recycle=1800,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

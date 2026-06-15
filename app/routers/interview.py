@@ -2,12 +2,13 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import shutil
 import subprocess
 import time
 import traceback
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile, status
@@ -95,11 +96,27 @@ from app.services import avatar_interview_service as svc
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-limiter = Limiter(key_func=get_remote_address)
+def _client_ip(request: Request) -> str:
+    """Real client IP for rate limiting. Behind a proxy/LB (Heroku, Vercel,
+    nginx) request.client.host is the proxy's IP, so every candidate shared
+    ONE rate-limit bucket — a handful of concurrent interviews tripped the
+    10/min message limit and everyone got 429s. Prefer X-Forwarded-For."""
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=_client_ip)
 
 router = APIRouter()
 
 VIOLATION_TERMINATE_THRESHOLD = 5
+
+# Cache whether the configured Deepgram key can mint scoped grant tokens.
+# None = not probed yet; True = supported; False = not supported (use master key).
+# Avoids a doomed /v1/auth/grant round-trip on every STT (re)connect.
+_DG_GRANT_SUPPORTED: Optional[bool] = None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -159,19 +176,119 @@ def _get_session_or_404(session_id: int, db: Session) -> InterviewSession:
     return obj
 
 
+def _get_or_mint_session_access_token(session: InterviewSession, db: Session) -> str:
+    """Return the session's access token, minting one into session_metadata if
+    missing. Sent to the candidate at register/verify/login time; enforced on
+    /interview/sessions/{id}/* by the middleware in app.main. Sessions created
+    before this feature have no token and are grandfathered (no enforcement)."""
+    try:
+        meta = json.loads(session.session_metadata or "{}")
+    except Exception:
+        meta = {}
+    tok = meta.get("access_token")
+    if not tok:
+        tok = secrets.token_urlsafe(32)
+        meta["access_token"] = tok
+        session.session_metadata = json.dumps(meta)
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            # Fall back to whatever is now in the DB (concurrent mint), else
+            # return the unpersisted token — worst case the client holds a
+            # token the server doesn't know, and enforcement skips (legacy).
+            try:
+                db.refresh(session)
+                meta = json.loads(session.session_metadata or "{}")
+                tok = meta.get("access_token") or tok
+            except Exception:
+                pass
+    return tok
+
+
 # ── Public Endpoints ──────────────────────────────────────────────────────────
 
 # Deepgram token — MUST be before /interview/{token} to avoid wildcard match
 @router.get(
     "/interview/deepgram-token",
-    summary="Get Deepgram API key for STT",
+    summary="Get a short-lived Deepgram STT token for an active session",
     tags=["Interview"],
 )
-async def get_deepgram_token():
+@limiter.limit("30/minute")
+async def get_deepgram_token(
+    request: Request,
+    session_id: int = 0,
+    db: Session = Depends(get_db),
+):
+    """Previously this returned the raw master DEEPGRAM_API_KEY to ANY
+    unauthenticated caller — abuse burned the STT quota and live interviews
+    lost transcription. Now it:
+      1. requires an active interview session (and its X-Session-Token when set),
+      2. returns a short-lived scoped token via Deepgram's /v1/auth/grant,
+         falling back to the master key only if the grant API itself is down
+         (so a Deepgram control-plane outage can't kill live interviews).
+    Response: { key, scheme } — scheme is the WS subprotocol ("bearer" for
+    grant tokens, "token" for the legacy raw key)."""
     from app.config import settings
+    import httpx
+
     if not settings.DEEPGRAM_API_KEY:
         raise HTTPException(status_code=503, detail="Deepgram STT not configured")
-    return {"key": settings.DEEPGRAM_API_KEY}
+
+    if not session_id:
+        raise HTTPException(status_code=401, detail="session_id is required")
+    session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+    if not session or session.status not in (SessionStatus.pending, SessionStatus.in_progress):
+        raise HTTPException(status_code=403, detail="No active interview session")
+    # Honour the per-session access token when the session has one.
+    try:
+        _meta = json.loads(session.session_metadata or "{}")
+    except Exception:
+        _meta = {}
+    _expected = _meta.get("access_token")
+    if _expected:
+        _provided = request.headers.get("x-session-token") or request.query_params.get("st")
+        if _provided != _expected:
+            raise HTTPException(status_code=403, detail="Invalid or missing session token")
+
+    # Prefer a short-lived SCOPED token (Deepgram /v1/auth/grant) so the raw
+    # master key never reaches the browser. BUT many API keys lack the scope to
+    # mint grant tokens (they return 403 "Insufficient permissions"); probing on
+    # every reconnect then adds a doomed round-trip and latency to live STT.
+    # So we probe ONCE per process and cache the verdict in _DG_GRANT_SUPPORTED:
+    #   - unknown (None) → try the grant.
+    #   - False          → skip straight to the master key (scheme "token").
+    # Either way the browser WS subprotocol is [scheme, key]; "token" works with
+    # both the master key and grant tokens, "bearer" only with grant tokens.
+    global _DG_GRANT_SUPPORTED
+    if _DG_GRANT_SUPPORTED is not False:
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                res = await client.post(
+                    "https://api.deepgram.com/v1/auth/grant",
+                    headers={"Authorization": f"Token {settings.DEEPGRAM_API_KEY}"},
+                    json={"ttl_seconds": 600},
+                )
+            if res.status_code == 200:
+                access_token = (res.json() or {}).get("access_token")
+                if access_token:
+                    _DG_GRANT_SUPPORTED = True
+                    return {"key": access_token, "scheme": "bearer", "expires_in": 600}
+            # Non-200 (e.g. 403 insufficient permissions) → this key can't grant.
+            _DG_GRANT_SUPPORTED = False
+            logging.info(
+                f"[Deepgram] auth/grant unavailable for this key "
+                f"({res.status_code}) — using session-gated master key."
+            )
+        except Exception as exc:
+            # Transient control-plane error — don't latch False; just fall back
+            # this once and retry the grant on a future request.
+            logging.warning(f"[Deepgram] auth/grant errored ({exc}) — falling back to master key")
+
+    # Session-gated master key. Still protected: this endpoint requires an
+    # active session (+ its X-Session-Token), so the key is never handed to an
+    # anonymous caller the way it was before.
+    return {"key": settings.DEEPGRAM_API_KEY, "scheme": "token"}
 
 
 # Google Cloud TTS — Indian female voice
@@ -409,9 +526,16 @@ def verify_access(
             message="Your previous interview was terminated. Please contact HR.",
         )
 
-    # Common scheduling fields for all "granted" responses
+    # Common scheduling fields for all "granted" responses.
+    # interview_date is stored as NAIVE UTC (see candidates.schedule-interview);
+    # serialise it as timezone-AWARE UTC so the browser's `new Date(...)` parses
+    # it correctly instead of treating it as candidate-local wall time (which
+    # blocked/admitted candidates at the wrong moment by their UTC offset).
+    _idate = getattr(candidate, "interview_date", None)
+    if _idate is not None and _idate.tzinfo is None:
+        _idate = _idate.replace(tzinfo=timezone.utc)
     sched_fields = dict(
-        interview_date=getattr(candidate, "interview_date", None),
+        interview_date=_idate,
         interview_timezone=getattr(candidate, "interview_timezone", None),
         joining_flexibility=getattr(candidate, "joining_flexibility", "anytime"),
         allow_joining_early=getattr(candidate, "allow_joining_early", False),
@@ -486,6 +610,7 @@ def verify_access(
             can_resume=True,
             session_status=active_session.status.value,
             message="Welcome back! You can resume your interview.",
+            session_token=_get_or_mint_session_access_token(active_session, db),
             **sched_fields,
         )
 
@@ -515,6 +640,7 @@ def verify_access(
         candidate_id=candidate.id,
         can_resume=False,
         message="Access verified. Ready to start your interview.",
+        session_token=_get_or_mint_session_access_token(interview_session, db),
         **sched_fields,
     )
 
@@ -829,6 +955,7 @@ def register_candidate(
                 can_resume=True,
                 session_status=active_session.status.value,
                 message="Welcome back! You have an existing interview session. Resuming where you left off.",
+                session_token=_get_or_mint_session_access_token(active_session, db),
             )
 
         # Check for terminated session — don't allow re-interview, prompt to contact HR
@@ -901,6 +1028,7 @@ def register_candidate(
                         can_resume=True,
                         session_status=active_session.status.value,
                         message="Welcome back! Resuming your interview.",
+                        session_token=_get_or_mint_session_access_token(active_session, db),
                     )
             else:
                 raise HTTPException(status_code=409, detail="Registration conflict. Please try again.")
@@ -935,6 +1063,7 @@ def register_candidate(
         already_completed=False,
         can_resume=False,
         message="Session created. Ready to start interview.",
+        session_token=_get_or_mint_session_access_token(interview_session, db),
     )
 
 
@@ -1013,6 +1142,7 @@ def auto_register_candidate(
                 can_resume=True,
                 session_status=active_session.status.value,
                 message="Welcome back! Resuming your interview.",
+                session_token=_get_or_mint_session_access_token(active_session, db),
             )
 
         terminated = (
@@ -1096,6 +1226,7 @@ def auto_register_candidate(
         already_completed=False,
         can_resume=False,
         message="Auto-registered successfully. Ready to start interview.",
+        session_token=_get_or_mint_session_access_token(interview_session, db),
     )
 
 
@@ -1169,6 +1300,7 @@ def login_candidate(
             can_resume=True,
             session_status=active_session.status.value,
             message="Welcome back! Resuming your interview.",
+            session_token=_get_or_mint_session_access_token(active_session, db),
         )
 
     # No active session — create a new one
@@ -1191,6 +1323,7 @@ def login_candidate(
         already_completed=False,
         can_resume=False,
         message="Session created. Ready to start interview.",
+        session_token=_get_or_mint_session_access_token(new_session, db),
     )
 
 
@@ -1252,6 +1385,23 @@ async def interview_message(
 ):
     session = _get_session_or_404(session_id, db)
 
+    # ── Idempotency: a client retry after a network timeout may race a first
+    # request that actually completed server-side. Replay the stored response
+    # for a repeated turn_id instead of running a duplicate AI turn (which
+    # double-saved the answer and advanced the question index twice).
+    # Checked BEFORE the status guards: if the first request completed the
+    # interview, the retry must get the closing message back, not a 400.
+    turn_id = (payload.turn_id or "").strip()
+    if turn_id:
+        try:
+            _meta = json.loads(session.session_metadata or "{}")
+        except Exception:
+            _meta = {}
+        _last = _meta.get("last_turn") or {}
+        if _last.get("id") == turn_id and isinstance(_last.get("response"), dict):
+            logging.info(f"[interview_message] Replaying turn {turn_id} for session {session_id}")
+            return InterviewMessageResponse(**_last["response"])
+
     if session.status == SessionStatus.terminated:
         raise HTTPException(status_code=400, detail="Interview has been terminated due to violations")
     if session.status == SessionStatus.completed:
@@ -1264,6 +1414,19 @@ async def interview_message(
         db.flush()
 
     result = await svc.conduct_turn(session, payload.content, db)
+
+    if turn_id:
+        try:
+            _meta = json.loads(session.session_metadata or "{}")
+            _meta["last_turn"] = {"id": turn_id, "response": result}
+            session.session_metadata = json.dumps(_meta)
+            db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
     return InterviewMessageResponse(**result)
 
 
@@ -1388,8 +1551,11 @@ def log_violation(
                 details=payload.details,
                 occurred_at=datetime.utcnow(),
             ))
-            # Re-apply session/candidate mutations
-            session.violation_count = (session.violation_count or 0)
+            # Re-apply session/candidate mutations. The rollback expired the
+            # in-memory increment (the object reloads the OLD count from the
+            # DB), so we must re-increment — without "+ 1" a retried commit
+            # recorded the violation row but silently lost the count increase.
+            session.violation_count = (session.violation_count or 0) + 1
             if should_terminate:
                 session.status = SessionStatus.terminated
                 session.completed_at = datetime.utcnow()

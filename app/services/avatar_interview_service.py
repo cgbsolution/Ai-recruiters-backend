@@ -854,7 +854,26 @@ async def conduct_turn(
         # turn isn't lost. If THIS also fails, we re-raise so the client at
         # least sees an error rather than thinking the answer was accepted.
         try:
+            # _conduct_turn_impl commits the candidate message BEFORE the LLM
+            # call, so on a post-LLM failure it is already saved — re-adding it
+            # here would duplicate it in the transcript. Only add when missing.
+            _already_saved = False
             if candidate_message is not None:
+                try:
+                    _last_msg = (
+                        db.query(InterviewMessage)
+                        .filter(InterviewMessage.session_id == session.id)
+                        .order_by(InterviewMessage.created_at.desc(), InterviewMessage.id.desc())
+                        .first()
+                    )
+                    _already_saved = bool(
+                        _last_msg
+                        and _last_msg.role == "candidate"
+                        and _last_msg.content == candidate_message
+                    )
+                except Exception:
+                    _already_saved = False
+            if candidate_message is not None and not _already_saved:
                 db.add(InterviewMessage(
                     session_id=session.id,
                     role="candidate",
@@ -1063,6 +1082,18 @@ async def _conduct_turn_impl(
         ))
         db.flush()
         claude_messages.append({"role": "user", "content": candidate_message})
+
+    # Persist the candidate's message (and any pending status changes made by
+    # the route) NOW and COMMIT — committing returns this Session's pooled DB
+    # connection for the duration of the LLM awaits below (up to ~35 s).
+    # Without this every in-flight turn pinned a connection while waiting on
+    # the LLM; ~30 concurrent turns exhausted the pool (10+20) and the entire
+    # API hung. ORM objects (session/job/candidate) refresh lazily afterwards.
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
     # ── Attempt 1: Call Claude with standard settings ──
     result = None

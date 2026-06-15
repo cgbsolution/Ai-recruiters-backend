@@ -58,6 +58,10 @@ class CandidateRegisterResponse(BaseModel):
     can_resume: bool = False
     session_status: Optional[str] = None  # "pending" | "in_progress" when can_resume is True
     message: str
+    # Per-session bearer credential. The client must echo it back as the
+    # X-Session-Token header (or ?st= query for sendBeacon) on every
+    # /interview/sessions/{id}/* call — closes the sequential-id IDOR hole.
+    session_token: Optional[str] = None
 
 
 # ── Verify Access (invitation-based) ──────────────────────────────────────────
@@ -79,6 +83,8 @@ class VerifyAccessResponse(BaseModel):
     interview_timezone: Optional[str] = None
     joining_flexibility: Optional[str] = None  # "scheduled_time" | "anytime"
     allow_joining_early: Optional[bool] = None
+    # Per-session bearer credential (see CandidateRegisterResponse.session_token)
+    session_token: Optional[str] = None
 
 
 # ── Apply for Job (resume upload + basic details) ────────────────────────────
@@ -116,6 +122,11 @@ class ResumeSessionResponse(BaseModel):
 
 class InterviewMessageRequest(BaseModel):
     content: str                        # candidate's spoken/typed answer
+    # Client-generated idempotency key. The client retries /message after a
+    # network timeout while the original request may still complete server-side;
+    # replaying the same turn_id returns the stored response instead of running
+    # a duplicate AI turn (double question advance, duplicated answer).
+    turn_id: Optional[str] = None
 
 
 class InterviewMessageResponse(BaseModel):

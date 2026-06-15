@@ -31,36 +31,44 @@ logging.basicConfig(
 # Keep app-level loggers at INFO so our own messages still appear
 logging.getLogger("app").setLevel(logging.INFO)
 from app.database import Base, engine
-from app.routers import ai, auth, candidates, client_events, credits, file_manager, interview, jobs, observer, organizations, questions, resume_database, secondary_cam, tts, uploads
+from app.routers import ai, auth, calendar, candidates, client_events, credits, file_manager, interview, jobs, observer, organizations, questions, resume_database, secondary_cam, tts, uploads
 
 import app.models  # noqa: F401 — ensure all models are registered with Base
 import app.services.observer_events  # noqa: F401 — wire SQLAlchemy listeners for the live observer broker
 
-# Run Alembic migrations on startup (adds missing columns/tables safely)
-try:
-    from alembic.config import Config
-    from alembic import command
-    import os
+# Run Alembic migrations on startup (adds missing columns/tables safely).
+# Set SKIP_STARTUP_MIGRATIONS=1 once migrations run as a deploy step (the
+# Dockerfile already runs startup.py + `alembic upgrade head`) — import-time
+# migrations add seconds to EVERY cold start, which candidates experience as
+# "loading interview…" timeouts on serverless / restart-heavy platforms.
+_SKIP_STARTUP_MIGRATIONS = os.environ.get("SKIP_STARTUP_MIGRATIONS", "").lower() in ("1", "true", "yes")
 
-    _base_dir = os.path.dirname(os.path.dirname(__file__))
-    alembic_cfg = Config(os.path.join(_base_dir, "alembic.ini"))
-    alembic_cfg.set_main_option("script_location", os.path.join(_base_dir, "alembic"))
+if _SKIP_STARTUP_MIGRATIONS:
+    logging.info("SKIP_STARTUP_MIGRATIONS set — skipping import-time migrations")
+else:
+    try:
+        from alembic.config import Config
+        from alembic import command
 
-    # Check if alembic_version table exists — if not, the DB was created
-    # with create_all() and we need to stamp it before upgrading
-    from sqlalchemy import inspect as sa_inspect
-    _inspector = sa_inspect(engine)
-    if "alembic_version" not in _inspector.get_table_names():
-        logging.info("No alembic_version table — stamping DB at base revision")
-        # Stamp at initial so Alembic knows tables exist, then upgrade the rest
-        command.stamp(alembic_cfg, "f9ffeeb88d8e")  # initial_schema
+        _base_dir = os.path.dirname(os.path.dirname(__file__))
+        alembic_cfg = Config(os.path.join(_base_dir, "alembic.ini"))
+        alembic_cfg.set_main_option("script_location", os.path.join(_base_dir, "alembic"))
 
-    command.upgrade(alembic_cfg, "head")
-    logging.info("Alembic migrations applied successfully")
-except Exception as e:
-    logging.warning(f"Alembic migration failed: {e}")
-    Base.metadata.create_all(bind=engine)
-    logging.info("Fallback: Base.metadata.create_all() completed")
+        # Check if alembic_version table exists — if not, the DB was created
+        # with create_all() and we need to stamp it before upgrading
+        from sqlalchemy import inspect as sa_inspect
+        _inspector = sa_inspect(engine)
+        if "alembic_version" not in _inspector.get_table_names():
+            logging.info("No alembic_version table — stamping DB at base revision")
+            # Stamp at initial so Alembic knows tables exist, then upgrade the rest
+            command.stamp(alembic_cfg, "f9ffeeb88d8e")  # initial_schema
+
+        command.upgrade(alembic_cfg, "head")
+        logging.info("Alembic migrations applied successfully")
+    except Exception as e:
+        logging.warning(f"Alembic migration failed: {e}")
+        Base.metadata.create_all(bind=engine)
+        logging.info("Fallback: Base.metadata.create_all() completed")
 
 # Always run raw SQL migrations — ensures columns exist even if Alembic succeeded
 # (Alembic may not have the latest column additions)
@@ -165,40 +173,41 @@ _raw_migrations = [
         "CREATE INDEX IF NOT EXISTS ix_client_events_event_type ON client_events(event_type)",
         "CREATE INDEX IF NOT EXISTS ix_client_events_created_at ON client_events(created_at)",
 ]
-try:
-    # Run in AUTOCOMMIT (each statement is its own transaction, so one failure
-    # can't abort the rest) and hold a Postgres advisory lock (same key as
-    # startup.py) so concurrent workers / rolling deploys SERIALIZE these DDLs
-    # instead of deadlocking on ALTER TABLE locks. Retry transient deadlocks.
-    import time as _t
-    _MIG_LOCK_KEY = 727274
-    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        _locked = False
-        try:
-            conn.execute(sa.text("SELECT pg_advisory_lock(:k)").bindparams(k=_MIG_LOCK_KEY))
-            _locked = True
-        except Exception:
-            pass
-        try:
-            for sql in _raw_migrations:
-                for _attempt in range(3):
+if not _SKIP_STARTUP_MIGRATIONS:
+    try:
+        # Run in AUTOCOMMIT (each statement is its own transaction, so one failure
+        # can't abort the rest) and hold a Postgres advisory lock (same key as
+        # startup.py) so concurrent workers / rolling deploys SERIALIZE these DDLs
+        # instead of deadlocking on ALTER TABLE locks. Retry transient deadlocks.
+        import time as _t
+        _MIG_LOCK_KEY = 727274
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            _locked = False
+            try:
+                conn.execute(sa.text("SELECT pg_advisory_lock(:k)").bindparams(k=_MIG_LOCK_KEY))
+                _locked = True
+            except Exception:
+                pass
+            try:
+                for sql in _raw_migrations:
+                    for _attempt in range(3):
+                        try:
+                            conn.execute(sa.text(sql))
+                            break
+                        except Exception as _e:
+                            if "deadlock" in str(_e).lower() and _attempt < 2:
+                                _t.sleep(0.5 * (_attempt + 1))
+                                continue
+                            break  # already exists / non-fatal — safe to skip
+            finally:
+                if _locked:
                     try:
-                        conn.execute(sa.text(sql))
-                        break
-                    except Exception as _e:
-                        if "deadlock" in str(_e).lower() and _attempt < 2:
-                            _t.sleep(0.5 * (_attempt + 1))
-                            continue
-                        break  # already exists / non-fatal — safe to skip
-        finally:
-            if _locked:
-                try:
-                    conn.execute(sa.text("SELECT pg_advisory_unlock(:k)").bindparams(k=_MIG_LOCK_KEY))
-                except Exception:
-                    pass
-    logging.info("Raw SQL migrations applied successfully")
-except Exception as e2:
-    logging.warning(f"Raw SQL migrations failed: {e2}")
+                        conn.execute(sa.text("SELECT pg_advisory_unlock(:k)").bindparams(k=_MIG_LOCK_KEY))
+                    except Exception:
+                        pass
+        logging.info("Raw SQL migrations applied successfully")
+    except Exception as e2:
+        logging.warning(f"Raw SQL migrations failed: {e2}")
 
 _DESCRIPTION = """
 ## CGB Solutions — AI Recruiters API
@@ -370,6 +379,72 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         content={"detail": f"Internal server error: {type(exc).__name__}: {exc}"},
     )
 
+# ── Session-token enforcement for candidate session endpoints ────────────────
+# /interview/sessions/{id}/* used to be completely unauthenticated with small
+# sequential integer IDs (IDOR): anyone could read transcripts/evaluations,
+# inject answers, or terminate sessions. A per-session token is minted at
+# register/verify/login (see interview._get_or_mint_session_access_token) and
+# must be echoed back as the X-Session-Token header (or ?st= for sendBeacon).
+# Sessions created before this feature have no stored token → grandfathered.
+# Registered BEFORE the CORS middlewares (i.e. innermost) so 403s get CORS headers.
+import json as _json
+import re as _re_sess
+from starlette.concurrency import run_in_threadpool
+
+_SESSION_PATH_RE = _re_sess.compile(r"^/interview/sessions/(\d+)/([a-z0-9\-]+)")
+# upload-recording: orphan-recovery re-uploads on a later app load with no
+#   token in hand; the endpoint has its own empty/smaller-file guard rails.
+# coding-submissions: read by the authenticated ADMIN evaluation page, which
+#   has no candidate session token.
+_SESSION_AUTH_EXEMPT = {"upload-recording", "coding-submissions"}
+
+
+def _load_session_access_token(sid: int):
+    from app.database import SessionLocal as _SL
+    from app.models.interview import InterviewSession as _IS
+    db = _SL()
+    try:
+        row = (
+            db.query(_IS.session_metadata)
+            .filter(_IS.id == sid)
+            .first()
+        )
+    finally:
+        db.close()
+    if row is None:
+        return None, False  # session doesn't exist — let the route 404
+    try:
+        meta = _json.loads(row[0] or "{}")
+    except Exception:
+        meta = {}
+    return meta.get("access_token"), True
+
+
+@app.middleware("http")
+async def enforce_session_token(request: Request, call_next):
+    if request.method != "OPTIONS":
+        m = _SESSION_PATH_RE.match(request.url.path)
+        if m and m.group(2) not in _SESSION_AUTH_EXEMPT:
+            try:
+                expected, _exists = await run_in_threadpool(
+                    _load_session_access_token, int(m.group(1))
+                )
+            except Exception as exc:
+                logging.error(f"[SessionAuth] token lookup failed: {exc}")
+                expected = None
+            if expected:
+                provided = (
+                    request.headers.get("x-session-token")
+                    or request.query_params.get("st")
+                )
+                if provided != expected:
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "Invalid or missing session token"},
+                    )
+    return await call_next(request)
+
+
 # ── CORS ─────────────────────────────────────────────────────────────────────
 _cors_origins = settings.cors_origins_list
 
@@ -420,13 +495,19 @@ os.makedirs(f"{UPLOAD_ROOT}/recordings", exist_ok=True)
 from starlette.middleware.base import BaseHTTPMiddleware
 
 class CORSStaticMiddleware(BaseHTTPMiddleware):
-    """Add CORS headers to /uploads/* responses (StaticFiles doesn't go through CORSMiddleware)."""
+    """Add CORS headers to /uploads/* responses (StaticFiles doesn't go through
+    CORSMiddleware). Only reflects ALLOWED origins — the previous version
+    reflected ANY Origin with Allow-Credentials=true, which lets any website a
+    user visits read uploaded recordings/resumes cross-origin."""
     async def dispatch(self, request, call_next):
         response = await call_next(request)
         if request.url.path.startswith("/uploads/"):
-            origin = request.headers.get("origin", "*")
-            response.headers["Access-Control-Allow-Origin"] = origin
-            response.headers["Access-Control-Allow-Credentials"] = "true"
+            origin = request.headers.get("origin", "")
+            if origin and origin in _cors_origins:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+            elif "*" in _cors_origins:
+                response.headers["Access-Control-Allow-Origin"] = "*"
         return response
 
 app.add_middleware(CORSStaticMiddleware)
@@ -601,6 +682,7 @@ app.include_router(jobs.router, prefix="/jobs", tags=["Jobs"])
 app.include_router(jobs.public_router, prefix="/jobs", tags=["Jobs"])
 app.include_router(questions.router, prefix="/questions", tags=["Questions"])
 app.include_router(candidates.router, prefix="/candidates", tags=["Candidates"])
+app.include_router(calendar.router, prefix="/calendar", tags=["Calendar"])
 app.include_router(ai.router, prefix="/ai", tags=["AI"])
 app.include_router(uploads.router, prefix="/uploads", tags=["Uploads"])
 app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
