@@ -707,6 +707,41 @@ async def _attach_observer_broker_loop():
     broker.attach_loop(asyncio.get_running_loop())
 
 
+@app.on_event("startup")
+async def _start_recording_sweeper():
+    """Periodically assemble any interview recordings whose live-uploaded parts
+    were never stitched into a final video — e.g. the candidate's tab/laptop
+    closed the instant the interview ended, so the client never called
+    /recording-finalize and /complete (which schedules the safety-net) was
+    never reached either. Without this, those recordings sit on disk as raw
+    parts forever and the video looks 'lost' with no error in the logs.
+
+    The sweeper guarantees a candidate-named 'SAVED OK (sweeper)' line appears
+    in the backend terminal for every finished interview's video, and only ever
+    touches recordings that have been idle long enough to be safe."""
+    import asyncio
+    from app.routers.interview import sweep_orphan_recording_parts
+
+    _rec_log = logging.getLogger("app.recording")
+
+    async def _loop():
+        # Wait a bit after boot so startup/migrations settle, then sweep every 5 min.
+        await asyncio.sleep(90)
+        while True:
+            try:
+                recovered = await asyncio.to_thread(sweep_orphan_recording_parts)
+                if recovered:
+                    _rec_log.info(
+                        f"[Recording] sweeper recovered {recovered} orphaned recording(s) "
+                        f"whose interview ended without the client finalizing."
+                    )
+            except Exception as exc:  # never let the loop die
+                _rec_log.warning(f"[Recording] sweeper pass failed: {exc}")
+            await asyncio.sleep(300)
+
+    asyncio.create_task(_loop())
+
+
 @app.get("/health", tags=["Health"])
 def health_check():
     return {"status": "ok", "version": "3.0.0"}

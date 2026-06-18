@@ -1882,6 +1882,35 @@ def drop_interview(session_id: int, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
+@router.post(
+    "/interview/sessions/{session_id}/recording-finalize-beacon",
+    status_code=200,
+    summary="Tab-close beacon: assemble live-uploaded recording parts now",
+    description=(
+        "Fired via navigator.sendBeacon when the candidate closes the tab while a "
+        "recording exists (including on the completion screen, where the /drop "
+        "beacon no longer fires). Schedules the same idempotent, size-guarded "
+        "safety-net that stitches the uploaded parts into the final video, so the "
+        "recording isn't left unstitched when the client never reaches "
+        "/recording-finalize. No-auth (like /drop) for beacon reliability — it "
+        "only assembles parts already uploaded for this session."
+    ),
+    tags=["Interview"],
+)
+@limiter.limit("30/minute")
+async def recording_finalize_beacon(
+    session_id: int,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+    if not session:
+        return {"ok": False, "reason": "not_found"}
+    background_tasks.add_task(_finalize_recording_safety_net, session_id)
+    return {"ok": True}
+
+
 @router.get(
     "/interview/sessions/{session_id}/evaluation",
     response_model=EvaluationRead,
@@ -2255,6 +2284,45 @@ def _recording_upload_root() -> str:
 # "app" to INFO, so bare logging.info() is suppressed — these outcome lines must
 # go through an app.* logger to actually appear in the Dokploy logs.
 _rec_logger = logging.getLogger("app.recording")
+_proctor_logger = logging.getLogger("app.proctor")
+
+
+# Cached OpenCV Haar-cascade face classifier (ships with opencv — no model
+# download). Built lazily on first use so it doesn't slow cold starts.
+_face_cascade = None
+
+
+def count_faces_in_image(path: str):
+    """Count faces in a screenshot using OpenCV's Haar cascade. Returns an int,
+    or None if detection couldn't run (so the caller can fall back to 'unknown').
+
+    This replaces the old in-browser MediaPipe face detector, which loaded ~300
+    MB of WASM + model INTO the candidate's tab and was the primary driver of
+    the 'Aw, Snap! STATUS_BREAKPOINT' out-of-memory crash. Running detection
+    server-side keeps the candidate's tab light while preserving the proctoring
+    signal (face count per screenshot)."""
+    global _face_cascade
+    try:
+        import cv2
+        if _face_cascade is None:
+            _face_cascade = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            )
+        if _face_cascade is None or _face_cascade.empty():
+            return None
+        img = cv2.imread(path)
+        if img is None:
+            return None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # minNeighbors=6 / minSize=60 keep false positives low (a stricter pass
+        # than defaults) so background objects aren't miscounted as faces.
+        faces = _face_cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=6, minSize=(60, 60)
+        )
+        return int(len(faces))
+    except Exception as exc:
+        logging.warning(f"[Proctor] server-side face detection failed: {exc}")
+        return None
 
 
 def _candidate_label(db: Session, session: InterviewSession) -> str:
@@ -2279,6 +2347,128 @@ def _parts_dir(upload_root: str, session_id: int) -> str:
     return f"{upload_root}/recordings/.parts/{session_id}"
 
 
+def _sanitize_recid(recording_id: str) -> str:
+    """Filesystem-safe segment-dir name for a recording id. Empty (legacy
+    clients that never send one) maps to '_legacy'."""
+    rid = "".join(c for c in (recording_id or "").strip() if c.isalnum() or c in "-_")
+    return rid or "_legacy"
+
+
+def _session_is_terminal(session) -> bool:
+    """True once the interview is genuinely over (completed/terminated) — i.e.
+    the candidate can no longer rejoin and EXTEND the recording. Only then is it
+    safe to DELETE the live parts; deleting earlier would discard a segment a
+    returning candidate is about to continue past (resume data loss)."""
+    try:
+        return session is not None and session.status in (
+            SessionStatus.completed, SessionStatus.terminated,
+        )
+    except Exception:
+        return False
+
+
+def _segment_dirs(session_parts_dir: str):
+    """Return the per-recording-session segment directories under a session's
+    parts dir, OLDEST FIRST, so a drop+rejoin assembles in chronological order.
+
+    Handles two layouts so a deploy mid-interview never loses data:
+      - new:    .parts/{sid}/{recording_id}/*.bin   (one subdir per recording)
+      - legacy: .parts/{sid}/*.bin                  (flat = a single segment)
+    """
+    if not os.path.isdir(session_parts_dir):
+        return []
+
+    def _oldest_mtime(d: str, names) -> float:
+        try:
+            return min(os.path.getmtime(os.path.join(d, n)) for n in names)
+        except (OSError, ValueError):
+            return 0.0
+
+    try:
+        entries = os.listdir(session_parts_dir)
+    except OSError:
+        return []
+
+    segments = []  # (sort_key, dir_path)
+    flat_bins = [f for f in entries if f.endswith(".bin")]
+    if flat_bins:
+        segments.append((_oldest_mtime(session_parts_dir, flat_bins), session_parts_dir))
+    for e in entries:
+        sub = os.path.join(session_parts_dir, e)
+        if os.path.isdir(sub):
+            try:
+                sub_bins = [f for f in os.listdir(sub) if f.endswith(".bin")]
+            except OSError:
+                sub_bins = []
+            if sub_bins:
+                segments.append((_oldest_mtime(sub, sub_bins), sub))
+
+    segments.sort(key=lambda x: x[0])
+    return [d for _, d in segments]
+
+
+def _concat_segment_parts(seg_dir: str, out_path: str) -> int:
+    """Byte-concatenate ONE recording session's parts (in chunk-index order)
+    into out_path. The parts of a single MediaRecorder session, joined in order,
+    are a valid WebM. Returns bytes written (0 if none)."""
+    try:
+        part_files = sorted(
+            (f for f in os.listdir(seg_dir) if f.endswith(".bin")),
+            key=lambda n: int(n.split(".")[0]),
+        )
+    except (ValueError, OSError):
+        try:
+            part_files = sorted(f for f in os.listdir(seg_dir) if f.endswith(".bin"))
+        except OSError:
+            return 0
+    total = 0
+    with open(out_path, "wb") as out:
+        for name in part_files:
+            with open(os.path.join(seg_dir, name), "rb") as fin:
+                while True:
+                    buf = fin.read(1 << 20)
+                    if not buf:
+                        break
+                    out.write(buf)
+                    total += len(buf)
+    return total
+
+
+def _ffmpeg_concat(seg_files, out_path: str) -> bool:
+    """Join independent WebM segments into one valid file via ffmpeg's concat
+    demuxer (stream copy, no re-encode). Raw byte-concatenation of separate
+    MediaRecorder sessions does NOT produce a valid single video — each has its
+    own header — so this is required when a candidate dropped and rejoined."""
+    try:
+        from app.main import _FFMPEG as _ff
+        if not _ff:
+            return False
+        list_path = out_path + ".concat.txt"
+        with open(list_path, "w") as lf:
+            for sf in seg_files:
+                # Forward slashes only: ffmpeg's concat demuxer treats backslash
+                # as an escape char, so Windows paths must be normalised (and it
+                # accepts '/' on Windows too).
+                safe = os.path.abspath(sf).replace("\\", "/")
+                lf.write(f"file '{safe}'\n")
+        proc = subprocess.run(
+            # `-f webm` forces the output muxer: the caller's out_path is a
+            # temp name like "{sid}.webm.assembling-<ts>" with no recognised
+            # extension, so without this ffmpeg can't pick a format and fails.
+            [_ff, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+             "-c", "copy", "-f", "webm", out_path],
+            capture_output=True, timeout=300,
+        )
+        try:
+            os.remove(list_path)
+        except OSError:
+            pass
+        return proc.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+    except Exception as exc:
+        logging.warning(f"[Recording] ffmpeg concat failed: {exc}")
+        return False
+
+
 def _remux_webm_inplace(path: str) -> None:
     """Rewrite WebM headers so duration/seekbar work (copy, no re-encode)."""
     try:
@@ -2300,45 +2490,69 @@ def _remux_webm_inplace(path: str) -> None:
 
 
 def _concat_parts_to_webm(upload_root: str, session_id: int) -> Optional[tuple]:
-    """Concatenate all uploaded parts (in chunk-index order) into the final
-    .webm. Idempotent and size-guarded: never replaces a larger existing file
-    with a smaller assembly (protects a good recording from a partial retry).
-    Returns (final_path, total_bytes) or None if there are no parts."""
+    """Assemble the final .webm from a session's live-uploaded parts.
+
+    Each recording SEGMENT (one MediaRecorder session — there is more than one
+    only when the candidate dropped and rejoined) is byte-concatenated from its
+    own parts, then segments are joined in chronological order. A single segment
+    is already a valid WebM (fast path). Multiple segments are joined with
+    ffmpeg's concat demuxer, because byte-concatenating independent recordings
+    produces an INVALID file that plays only the first segment — which was a
+    silent video-loss path for every drop+rejoin interview.
+
+    Idempotent and size-guarded: never replaces a larger existing file with a
+    smaller assembly. Returns (final_path, total_bytes) or None if no parts."""
     pd = _parts_dir(upload_root, session_id)
-    if not os.path.isdir(pd):
-        return None
-    try:
-        part_files = sorted(
-            (f for f in os.listdir(pd) if f.endswith(".bin")),
-            key=lambda n: int(n.split(".")[0]),
-        )
-    except ValueError:
-        part_files = sorted(f for f in os.listdir(pd) if f.endswith(".bin"))
-    if not part_files:
+    segments = _segment_dirs(pd)
+    if not segments:
         return None
 
     final_path = f"{upload_root}/recordings/{session_id}.webm"
     os.makedirs(f"{upload_root}/recordings", exist_ok=True)
+    seg_tmpdir = f"{final_path}.segs-{int(time.time())}"
     tmp = f"{final_path}.assembling-{int(time.time())}"
     total = 0
     try:
-        with open(tmp, "wb") as out:
-            for name in part_files:
-                with open(f"{pd}/{name}", "rb") as fin:
-                    while True:
-                        buf = fin.read(1 << 20)
-                        if not buf:
-                            break
-                        out.write(buf)
-                        total += len(buf)
+        os.makedirs(seg_tmpdir, exist_ok=True)
+        seg_files = []
+        for i, seg in enumerate(segments):
+            seg_out = os.path.join(seg_tmpdir, f"seg_{i:03d}.webm")
+            if _concat_segment_parts(seg, seg_out) > 0:
+                seg_files.append(seg_out)
+
+        if not seg_files:
+            return None
+
+        if len(seg_files) == 1:
+            # Single recording session — already a valid WebM.
+            os.replace(seg_files[0], tmp)
+        else:
+            # Candidate dropped + rejoined → multiple independent recordings.
+            if not _ffmpeg_concat(seg_files, tmp):
+                # ffmpeg unavailable: byte-join as a last resort so at least the
+                # first segment is recoverable. Log loudly — this file may only
+                # play the first segment in some players.
+                _rec_logger.warning(
+                    f"[Recording] session {session_id}: joining {len(seg_files)} "
+                    f"resume segments WITHOUT ffmpeg — result may play only the "
+                    f"first segment. Install/enable ffmpeg for a clean join."
+                )
+                with open(tmp, "wb") as out:
+                    for sf in seg_files:
+                        with open(sf, "rb") as fin:
+                            shutil.copyfileobj(fin, out)
+        total = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
     except Exception as e:
         logging.error(f"[Recording] concat failed for session {session_id}: {e}")
-        try:
-            if os.path.isfile(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
+        for p in (tmp,):
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except OSError:
+                pass
         return None
+    finally:
+        shutil.rmtree(seg_tmpdir, ignore_errors=True)
 
     if total == 0:
         try:
@@ -2412,7 +2626,10 @@ async def upload_recording_part(
 ):
     session = _get_session_or_404(session_id, db)
     upload_root = _recording_upload_root()
-    pd = _parts_dir(upload_root, session_id)
+    # Store parts under a per-recording subdir so a drop+rejoin (which mints a
+    # NEW recording id) cannot overwrite the earlier segment's parts. Assembly
+    # joins all segments in order.
+    pd = f"{_parts_dir(upload_root, session_id)}/{_sanitize_recid(recording_id)}"
     os.makedirs(pd, exist_ok=True)
 
     part_path = f"{pd}/{start_index:012d}.bin"
@@ -2473,9 +2690,13 @@ async def finalize_recording(
     recording_link = f"/uploads/recordings/{session_id}.webm"
     db_saved = _save_recording_link(db, session, recording_link, duration or "0:00")
 
-    # Parts are no longer needed once they're stitched and the link is saved.
+    # Parts are stitched and the link is saved. Only DELETE the parts once the
+    # interview is genuinely over (completed/terminated). If the session is still
+    # resumable, keep the parts so a rejoining candidate's earlier segment can be
+    # re-joined with the new one; the sweeper cleans them up later.
     if db_saved or not session.candidate_id:
-        shutil.rmtree(_parts_dir(upload_root, session_id), ignore_errors=True)
+        if _session_is_terminal(session):
+            shutil.rmtree(_parts_dir(upload_root, session_id), ignore_errors=True)
         _rec_logger.info(
             f"[Recording] SAVED OK (finalized from live parts) for {who} — "
             f"{total / (1024*1024):.2f} MB -> {recording_link}"
@@ -2518,7 +2739,13 @@ def _finalize_recording_safety_net(session_id: int):
             who = _candidate_label(db, session)
             saved = _save_recording_link(db, session, f"/uploads/recordings/{session_id}.webm", "")
             if saved:
-                shutil.rmtree(pd, ignore_errors=True)
+                # Only delete parts when the interview is genuinely over. This
+                # safety-net also fires on a tab-close DROP (via the beacon),
+                # where the session is still resumable — deleting then would lose
+                # the pre-drop segment when the candidate rejoins. The sweeper
+                # cleans non-terminal sessions up after the resume window.
+                if _session_is_terminal(session):
+                    shutil.rmtree(pd, ignore_errors=True)
                 _rec_logger.info(
                     f"[Recording] SAVED OK (safety-net) for {who} — "
                     f"{total / (1024*1024):.2f} MB. Client never called finalize; "
@@ -2536,6 +2763,122 @@ def _finalize_recording_safety_net(session_id: int):
             )
     finally:
         db.close()
+
+
+# A recording is only "stale" (safe to assemble + clean up) once NO new live
+# part has arrived for this long. While an interview is running, the client
+# POSTs a part every ~4 s; 10 minutes also matches the resume grace window, so
+# we never assemble/delete parts a returning candidate might still extend.
+_STALE_PARTS_SECONDS = 600
+
+
+def sweep_orphan_recording_parts() -> int:
+    """Backstop sweeper: assemble any interview recordings whose live-uploaded
+    parts were never stitched into a final video — e.g. the candidate's tab/
+    laptop closed before /complete or /recording-finalize ran, so neither the
+    client finalize nor the /complete safety-net fired. Idempotent and
+    size-guarded (never clobbers a larger existing file). Only touches
+    recordings with no new part for _STALE_PARTS_SECONDS, so an in-progress
+    interview is never disturbed.
+
+    Logs a candidate-named 'SAVED OK (sweeper)' line for each recovery so the
+    backend terminal ALWAYS shows a confirmation that a finished interview's
+    video landed on disk — even when the browser never told us the interview
+    ended. Returns the number of recordings newly assembled."""
+    upload_root = _recording_upload_root()
+    parts_root = f"{upload_root}/recordings/.parts"
+    if not os.path.isdir(parts_root):
+        return 0
+    try:
+        session_dirs = os.listdir(parts_root)
+    except OSError:
+        return 0
+
+    recovered = 0
+    now = time.time()
+    for name in session_dirs:
+        if not name.isdigit():
+            continue
+        session_id = int(name)
+        pd = f"{parts_root}/{name}"
+        if not os.path.isdir(pd):
+            continue
+
+        # Collect .bin parts across BOTH layouts (legacy flat + per-recording
+        # subdirs) by walking the session's parts tree.
+        bin_paths = []
+        try:
+            for root, _dirs, files in os.walk(pd):
+                for f in files:
+                    if f.endswith(".bin"):
+                        bin_paths.append(os.path.join(root, f))
+        except OSError:
+            continue
+        if not bin_paths:
+            continue
+
+        # Skip if a part arrived recently — the interview may still be live OR
+        # the candidate is within the resume window and about to extend it.
+        try:
+            newest = max(os.path.getmtime(p) for p in bin_paths)
+        except OSError:
+            continue
+        if now - newest < _STALE_PARTS_SECONDS:
+            continue
+
+        final_path = f"{upload_root}/recordings/{session_id}.webm"
+        try:
+            parts_total = sum(os.path.getsize(p) for p in bin_paths)
+        except OSError:
+            parts_total = 0
+
+        # If a final video already exists and is at least as large as the parts,
+        # the recording is already saved — just drop the now-redundant parts.
+        if os.path.isfile(final_path):
+            try:
+                if os.path.getsize(final_path) >= parts_total > 0:
+                    shutil.rmtree(pd, ignore_errors=True)
+                    continue
+            except OSError:
+                pass
+
+        result = _concat_parts_to_webm(upload_root, session_id)
+        if not result:
+            continue
+        fp, total = result
+        _remux_webm_inplace(fp)
+
+        db = SessionLocal()
+        try:
+            session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+            if not session:
+                _rec_logger.error(
+                    f"[Recording] SWEEPER — assembled {total / (1024*1024):.2f} MB for "
+                    f"session {session_id} but no matching DB session; left file at {fp}"
+                )
+                continue
+            who = _candidate_label(db, session)
+            saved = _save_recording_link(
+                db, session, f"/uploads/recordings/{session_id}.webm", ""
+            )
+            if saved:
+                shutil.rmtree(pd, ignore_errors=True)
+                recovered += 1
+                _rec_logger.info(
+                    f"[Recording] SAVED OK (sweeper) for {who} — "
+                    f"{total / (1024*1024):.2f} MB -> /uploads/recordings/{session_id}.webm "
+                    f"(client never finalized; server recovered the live parts)"
+                )
+            else:
+                _rec_logger.error(
+                    f"[Recording] SWEEPER SAVE PARTIAL for {who} — assembled at "
+                    f"/uploads/recordings/{session_id}.webm but the DB link could NOT "
+                    f"be updated (manual repair needed)."
+                )
+        finally:
+            db.close()
+
+    return recovered
 
 
 @router.post(
@@ -2653,13 +2996,28 @@ async def upload_screenshot(
 
     relative_path = f"/uploads/screenshots/{session_id}/{filename}"
 
-    # Use face count from frontend MediaPipe detection (much more accurate than server-side Haar cascade)
-    detected_faces = 1  # default: assume single face
-    if face_count.strip():
-        try:
-            detected_faces = int(face_count)
-        except ValueError:
+    # Count faces SERVER-SIDE (OpenCV). The browser no longer runs MediaPipe —
+    # that ~300 MB in-tab model was the main OOM-crash driver. Fall back to any
+    # client-provided hint (legacy clients), then to "assume single face".
+    detected_faces = await asyncio.to_thread(count_faces_in_image, raw_path)
+    if detected_faces is None:
+        if face_count.strip():
+            try:
+                detected_faces = int(face_count)
+            except ValueError:
+                detected_faces = 1
+        else:
             detected_faces = 1
+    elif detected_faces != 1:
+        # 0 = candidate not visible; >1 = another person in frame. Surface it in
+        # the backend logs for the proctoring audit (NOT auto-terminated here:
+        # Haar is less precise than MediaPipe, so a human reviews the flagged
+        # screenshots rather than risk wrongly ending a genuine candidate).
+        _proctor_logger.info(
+            f"[Proctor] session {session_id} — screenshot face_count={detected_faces} "
+            f"({'no face visible' if detected_faces == 0 else 'multiple faces in frame'}) "
+            f"-> {relative_path}"
+        )
 
     # Persist screenshot record to DB for proctoring audit trail. If the DB
     # write fails, the file IS already on disk — so we don't fail the request,
