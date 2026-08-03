@@ -229,6 +229,45 @@ STRICT RULES:
 
 # ── LLM-backed Fit Score Calculation ─────────────────────────────────────────
 
+# Weights for the five LLM-scored dimensions. Sum = 1.00.
+LLM_DIMENSION_WEIGHTS = {
+    "experience_relevance": 0.25,
+    "jd_requirement_match": 0.25,
+    "skills_and_tools": 0.25,
+    "consulting_alignment": 0.15,  # domain/industry alignment
+    "seniority_fit": 0.10,
+}
+
+
+def _composite_from_breakdown(score_breakdown: dict) -> Optional[int]:
+    """Weighted 0-100 composite of the five dimension scores.
+
+    Returns None if the model gave us nothing usable, so the caller can fall
+    back. Missing individual dimensions are dropped and the remaining weights
+    renormalised, so a partial breakdown still produces a sensible number
+    instead of being silently penalised toward zero.
+    """
+    if not isinstance(score_breakdown, dict):
+        return None
+
+    total_weight = 0.0
+    weighted = 0.0
+    for key, weight in LLM_DIMENSION_WEIGHTS.items():
+        val = score_breakdown.get(key)
+        if val is None:
+            continue
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            continue
+        weighted += max(0.0, min(100.0, num)) * weight
+        total_weight += weight
+
+    if total_weight <= 0:
+        return None
+    return max(0, min(100, int(round(weighted / total_weight))))
+
+
 async def calculate_fit_score(req: FitScoreRequest) -> FitScoreResponse:
     """
     Context-aware AI fit score engine using weighted semantic evaluation.
@@ -272,31 +311,40 @@ RESUME:
 \"\"\"
 
 SCORING PHILOSOPHY — Score like a REAL recruiter who wants to FILL the role:
-- If the candidate can DO the job with minimal training → HIGH FIT (75%+)
-- Core domain experience matters most. A bookkeeper with 3+ years = strong candidate.
-- Transferable skills ALWAYS count. US accounting → Canadian accounting = transferable.
-- Similar tools count. QuickBooks experience covers QBO requirement.
-- Missing 1-3 specific skills is NORMAL and trainable — do NOT heavily penalize.
-- Experience at or above the required range = FULL experience credit (25/25).
-- If candidate has 50%+ of listed skills + right experience → score 70%+.
+- Core domain experience matters most. Transferable skills ALWAYS count
+  (US accounting → Canadian accounting is transferable).
+- Similar tools count. QuickBooks experience covers a QBO requirement.
+- Missing 1-3 nice-to-have skills is NORMAL and trainable — penalise those
+  lightly. Penalise CRITICAL missing requirements heavily.
 
-CALIBRATION — you MUST follow these score ranges:
-- Candidate with required experience + 60%+ skills match → 78-90% HIGH FIT
-- Candidate with required experience + 40-60% skills match → 65-77% MEDIUM-HIGH
-- Candidate with some experience + some skills → 50-64% MEDIUM FIT
-- Wrong domain or missing most requirements → below 50% LOW FIT
+HOW TO SCORE — do NOT pick an overall percentage directly.
+Score each of the five dimensions below independently on a 0-100 scale. The
+overall percentage is computed from them afterwards, so your ONLY job is to get
+each dimension right on its own terms.
 
-IMPORTANT: Most real candidates who apply for a job have RELEVANT experience.
-A bookkeeper applying for a bookkeeping role should score 70%+ by default.
-Only penalize significantly for CRITICAL missing requirements, not nice-to-haves.
-If candidate has the core job function experience (e.g. bookkeeping for a bookkeeping role), start at 70% and adjust from there.
+  experience_relevance  — years AND relevance of experience vs the requirement.
+                          At/above the range with on-point work = 90-100.
+                          Right years but adjacent work = 50-70.
+                          Well short of the range = under 40.
+  jd_requirement_match  — how many of the JD's actual responsibilities this
+                          person has demonstrably OWNED (not merely assisted).
+  skills_and_tools      — coverage of the required skills/tools, counting
+                          genuine equivalents.
+  consulting_alignment  — domain/industry alignment: has this person worked in
+                          this business context before?
+  seniority_fit         — is this the right LEVEL (ownership, scope, autonomy),
+                          not too junior and not overqualified?
 
-SCORING BANDS:
-- 70-100 HIGH FIT: Has domain experience + most core skills
-- 50-69 MEDIUM FIT: Relevant background, notable gaps but trainable
-- 0-49 LOW FIT: Wrong domain or missing critical competencies
+DISCRIMINATION IS THE POINT. Two candidates are almost never equally good. If
+you find yourself giving the same dimension score to two profiles, look harder
+for what separates them: depth of ownership, number of entities/clients handled,
+whether they LED or merely supported, breadth of the tool stack, recency.
 
-Return ONLY valid JSON:
+Use the FULL 0-100 range on every dimension and use precise values — 73, 81, 46,
+not just 70, 80, 45. Do not round to multiples of 5.
+
+Return ONLY valid JSON ("fit_percentage" is ignored — the server recomputes it
+from score_breakdown, so spend your effort on the five dimension scores):
 {{
   "fit_level": "high/medium/low",
   "fit_percentage": 0,
@@ -332,7 +380,8 @@ Return ONLY valid JSON:
   "relevant_experience_summary": ""
 }}
 
-CRITICAL: Keep reasoning_points SHORT (4-6 bullets, each under 20 words). Keep summary to ONE sentence. Score GENEROUSLY for domain-relevant experience.
+CRITICAL: Keep reasoning_points SHORT (4-6 bullets, each under 20 words). Keep summary to ONE sentence.
+Every one of the five score_breakdown values MUST be filled with a precise integer.
 """
 
     result = await _ask_with_usage(prompt, model=SONNET, max_tokens=3500)
@@ -367,15 +416,39 @@ CRITICAL: Keep reasoning_points SHORT (4-6 bullets, each under 20 words). Keep s
             logger.error("Could not parse fit score JSON even after fix attempt")
             raise
 
-    raw_pct = data.get("fit_percentage", 0)
-    try:
-        fit_percentage = max(0, min(100, int(raw_pct)))
-    except (TypeError, ValueError):
-        fit_percentage = 0
+    # ── Derive the percentage from the five dimensions, don't take the model's ──
+    # An LLM asked for a single overall percentage is strongly MODAL: given a
+    # band it emits that band's canonical value, so every plausible in-domain
+    # applicant to the same job came back 82 (and every mediocre one 58). Real
+    # applicant pools are full of *similar* candidates, which is exactly where
+    # that collapse bites — the scores stopped ranking anyone.
+    #
+    # Scoring five independent dimensions and computing the weighted sum here
+    # fixes it: each dimension is an easier, more grounded judgement, and the
+    # arithmetic spreads the results out on its own. `fit_percentage` from the
+    # model is now only a fallback for when score_breakdown is missing.
+    score_breakdown = data.get("score_breakdown") or {}
+    composite = _composite_from_breakdown(score_breakdown)
+
+    if composite is not None:
+        fit_percentage = composite
+    else:
+        raw_pct = data.get("fit_percentage", 0)
+        try:
+            fit_percentage = max(0, min(100, int(raw_pct)))
+        except (TypeError, ValueError):
+            fit_percentage = 0
+        logger.warning("Fit score: score_breakdown missing/unusable, fell back to the model's fit_percentage")
 
     breakdown_data = data.get("breakdown", {})
+    # Derive the level from the final percentage rather than trusting the
+    # model's own label — otherwise a recomputed percentage and a model-supplied
+    # level can disagree (a 68% shown as "HIGH FIT"). Thresholds must match
+    # FIT_LEVEL_HIGH/MEDIUM in smart_scoring_service and the frontend badge.
+    fit_level = "high" if fit_percentage >= 70 else ("medium" if fit_percentage >= 50 else "low")
+
     return FitScoreResponse(
-        fit_level=data.get("fit_level", "low"),
+        fit_level=fit_level,
         fit_percentage=fit_percentage,
         summary=data.get("summary", ""),
         key_matching_skills=data.get("key_matching_skills", []),

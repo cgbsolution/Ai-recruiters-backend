@@ -18,7 +18,7 @@ from app.models.job_metadata import JobMetadata
 from app.models.resume_metadata import ResumeMetadata
 from app.services.feature_engineering import (
     FeatureVector,
-    ResumeData,
+    ResumeData,  # noqa: F401  — also re-used by feature_score_from_text below
     JobData,
     extract_features,
     resume_data_from_metadata,
@@ -49,6 +49,22 @@ WEIGHTS = {
 
 # Minimum skills overlap before penalty applies (lowered to avoid crushing domain-specific roles)
 _SKILLS_GATE_THRESHOLD = 0.10
+
+# Single source of truth for the level bands. The frontend badge and the LLM
+# scorer must use these same numbers — they previously disagreed (the badge
+# called anything >= 40 "MEDIUM FIT" while the backend stored it as "low"), so a
+# 45% candidate was saved one way and displayed another.
+FIT_LEVEL_HIGH = 70
+FIT_LEVEL_MEDIUM = 50
+
+
+def level_for_percentage(percentage: int) -> str:
+    """Map a 0-100 fit percentage onto high/medium/low."""
+    if percentage >= FIT_LEVEL_HIGH:
+        return "high"
+    if percentage >= FIT_LEVEL_MEDIUM:
+        return "medium"
+    return "low"
 
 
 # ── Result ───────────────────────────────────────────────────────────────────
@@ -83,7 +99,12 @@ class ScoringResult:
             "summary": self.summary,
             "key_matching_skills": self.key_matching_skills,
             "missing_skills": self.missing_skills,
+            # Alias: the LLM path calls this `missing_weak_areas`. Emitting both
+            # keys from both paths keeps the tooltip working regardless of which
+            # scorer produced the row.
+            "missing_weak_areas": self.missing_skills,
             "breakdown": self.breakdown,
+            "score_source": "features",
         }
 
 
@@ -109,15 +130,15 @@ def _score(features: FeatureVector, resume: ResumeData, job: JobData) -> Scoring
 
     percentage = max(0, min(100, int(round(raw * 100))))
 
-    # Soft cap: score should not exceed skills match by too much,
-    # but allow generous headroom since text similarity and keywords
-    # can capture domain alignment that skill keywords miss.
-    skills_pct = int(round(skills_score * 100))
-    max_allowed = skills_pct + 40  # allow at most +40% above skills match
-    if percentage > max_allowed:
-        percentage = max_allowed
+    # NOTE: a `max_allowed = skills_pct + 40` soft cap used to run here. It was a
+    # second clustering source: whenever it bound, the result became a function
+    # of keyword skills overlap ALONE and the other 70% of the weights were
+    # thrown away — so every candidate sharing a skills-overlap bucket collapsed
+    # onto the identical percentage. Skills overlap already carries the largest
+    # single weight (0.30) plus the gate penalty below it, so the cap was mostly
+    # double-counting the same signal. Removed.
 
-    fit_level = "high" if percentage >= 70 else ("medium" if percentage >= 50 else "low")
+    fit_level = level_for_percentage(percentage)
 
     # Per-dimension breakdown for the hover tooltip
     breakdown = {}
@@ -234,3 +255,109 @@ def compute_fit_score_for_metadata(
     if not job_meta:
         job_meta = db.query(JobMetadata).filter(JobMetadata.job_id == job.id).first()
     return compute_fit_score(resume_data_from_metadata(resume_meta), job_data_from_db(job, job_meta))
+
+
+# ── Blending with the LLM scorer ─────────────────────────────────────────────
+
+# The feature score adjusts the LLM composite; it does not average with it.
+#
+# A straight weighted average was tried first and was measurably worse. The
+# feature score is NOT a calibrated 0-100: several of its twelve features
+# (education, certifications, seniority, title similarity) score a hard zero
+# whenever the underlying structured field is absent, yet their weight is still
+# counted in the denominator. Resumes we only have raw TEXT for therefore land
+# around 25 almost regardless of quality. At a 0.35 weight that dragged an
+# excellent candidate from 96 to 72 and squeezed the top three into a 2-point
+# band — trading one distortion for another.
+#
+# So it is applied as a BOUNDED nudge instead. The LLM's per-dimension composite
+# sets the level; the feature score, which is genuinely continuous (TF-IDF
+# cosine and overlap ratios essentially never tie), separates near-ties and
+# pulls back candidates the LLM liked on narrative but who show little literal
+# evidence in the text. Capped so it can never move a candidate across a band on
+# its own.
+FEATURE_NUDGE_MAX = 8.0      # max points the feature score may move the result
+FEATURE_NUDGE_PIVOT = 50.0   # feature score that means "no adjustment"
+FEATURE_NUDGE_SLOPE = 0.16   # points of adjustment per point of feature score
+
+
+def blend_with_features(llm_percentage: int, feature_result: Optional[ScoringResult]) -> int:
+    """Adjust the LLM composite by a bounded amount driven by the feature score."""
+    base = max(0, min(100, int(llm_percentage)))
+    if feature_result is None:
+        return base
+    delta = (feature_result.fit_percentage - FEATURE_NUDGE_PIVOT) * FEATURE_NUDGE_SLOPE
+    delta = max(-FEATURE_NUDGE_MAX, min(FEATURE_NUDGE_MAX, delta))
+    return max(0, min(100, int(round(base + delta))))
+
+
+def feature_score_from_text(
+    db: Session,
+    resume_text: str,
+    job: Job,
+    job_meta: Optional[JobMetadata] = None,
+) -> Optional[ScoringResult]:
+    """Feature score for a candidate we only have raw resume TEXT for.
+
+    The LLM path runs on extracted text and often has no ResumeMetadata row to
+    read structured skills from. The feature extractors all accept `raw_text` as
+    a fallback (skills overlap, keyword overlap, tech-stack alignment and the
+    TF-IDF/text similarity all scan it), so an otherwise-empty ResumeData still
+    yields a usable continuous score. Returns None if there is nothing to score.
+    """
+    if not resume_text or not resume_text.strip():
+        return None
+    try:
+        if not job_meta:
+            job_meta = db.query(JobMetadata).filter(JobMetadata.job_id == job.id).first()
+        resume = ResumeData(
+            skills=[],
+            keywords=[],
+            experience_years=None,
+            education=[],
+            certifications=[],
+            work_experience=[],
+            current_designation=None,
+            location=None,
+            summary=None,
+            raw_text=resume_text,
+        )
+        return compute_fit_score(resume, job_data_from_db(job, job_meta))
+    except Exception:
+        logger.exception("feature_score_from_text failed — falling back to LLM-only score")
+        return None
+
+
+def feature_score_for_candidate(
+    db: Session,
+    candidate: Candidate,
+    job: Job,
+    resume_text: Optional[str] = None,
+) -> Optional[ScoringResult]:
+    """Best available feature score for a candidate.
+
+    Prefers a real ResumeMetadata row — structured skills, years and designation
+    make every feature measurable, so the score is fair. Falls back to scanning
+    raw resume text, which is systematically lower (see FEATURE_NUDGE_MAX) but
+    still monotone enough to be useful as a bounded nudge.
+    """
+    meta = None
+    try:
+        if candidate.resume_metadata_id:
+            meta = db.query(ResumeMetadata).filter(
+                ResumeMetadata.id == candidate.resume_metadata_id
+            ).first()
+        if not meta and candidate.email:
+            meta = db.query(ResumeMetadata).filter(
+                ResumeMetadata.candidate_email == candidate.email
+            ).first()
+    except Exception:
+        logger.exception("feature_score_for_candidate: metadata lookup failed")
+
+    if meta is not None:
+        try:
+            return compute_fit_score_for_metadata(db, meta, job)
+        except Exception:
+            logger.exception("feature_score_for_candidate: metadata scoring failed")
+
+    return feature_score_from_text(db, resume_text or "", job)

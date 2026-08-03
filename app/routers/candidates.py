@@ -1250,16 +1250,49 @@ async def _ai_fit_score_for_candidate(candidate: Candidate, db: Session, resume_
 
     result = await calculate_fit_score(req)
 
-    # Save to candidate
+    # ── Blend the LLM's semantic composite with the continuous feature score ──
+    # On its own the LLM collapses similar candidates onto identical values
+    # (every plausible applicant to one job came back 82%). The feature score is
+    # continuous and effectively never ties, so blending restores the ranking
+    # while keeping the LLM as the dominant signal. See the weights and the full
+    # rationale in smart_scoring_service.
+    from app.services.smart_scoring_service import (
+        blend_with_features,
+        feature_score_for_candidate,
+        level_for_percentage,
+    )
+
+    feature_result = feature_score_for_candidate(db, candidate, job, resume_text)
+    final_percentage = blend_with_features(result.fit_percentage, feature_result)
+    final_level = level_for_percentage(final_percentage)
+
+    logger.info(
+        "Fit score candidate=%s job=%s: llm=%s%% feature=%s%% -> blended=%s%% (%s)",
+        candidate.id, job.id, result.fit_percentage,
+        feature_result.fit_percentage if feature_result else "n/a",
+        final_percentage, final_level,
+    )
+
+    # Save to candidate. `breakdown` carries the per-dimension feature detail in
+    # the SAME shape the deterministic path writes, so the hover tooltip is
+    # populated no matter which path scored the candidate — previously the LLM
+    # path left it empty and the tooltip showed an all-zero breakdown.
     score_data = {
-        "fit_level": result.fit_level,
-        "fit_percentage": result.fit_percentage,
+        "fit_level": final_level,
+        "fit_percentage": final_percentage,
         "summary": result.summary,
         "key_matching_skills": result.key_matching_skills,
         "relevant_experience_summary": result.relevant_experience_summary,
         "missing_weak_areas": result.missing_weak_areas,
         "reasoning_points": result.reasoning_points,
         "verdict": result.verdict,
+        # Unified fields also emitted by smart_scoring_service.ScoringResult
+        "missing_skills": result.missing_weak_areas,
+        "breakdown": feature_result.breakdown if feature_result else {},
+        # Provenance so a score can always be traced back to how it was made.
+        "score_source": "llm+features" if feature_result else "llm",
+        "llm_percentage": result.fit_percentage,
+        "feature_percentage": feature_result.fit_percentage if feature_result else None,
     }
     details_data = {
         "score_breakdown": result.score_breakdown,
@@ -1272,7 +1305,7 @@ async def _ai_fit_score_for_candidate(candidate: Candidate, db: Session, resume_
         },
     }
 
-    candidate.resume_fit_score = f"{result.fit_percentage}%"
+    candidate.resume_fit_score = f"{final_percentage}%"
     candidate.fit_score_reasoning = json.dumps(score_data)
     candidate.fit_score_details = json.dumps(details_data)
     db.commit()

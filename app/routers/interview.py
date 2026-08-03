@@ -297,6 +297,36 @@ GOOGLE_TTS_VOICE_MAP = {
     "hi": {"languageCode": "hi-IN", "name": "hi-IN-Wavenet-A", "ssmlGender": "FEMALE"},
 }
 
+# Fallback TTS (edge-tts / Microsoft Neural) — same Indian female profile.
+# Used whenever Google TTS is unusable (missing key, billing disabled, quota,
+# timeout). Silence mid-interview is far worse than a slightly different voice.
+EDGE_TTS_VOICE_MAP = {
+    "en": "en-IN-NeerjaExpressiveNeural",
+    "hi": "hi-IN-SwaraNeural",
+}
+
+# Circuit breaker: a 401/403 from Google means a config/billing problem that
+# will not fix itself within one interview. Once seen, stop paying the network
+# round-trip on every single question and go straight to the fallback voice.
+_google_tts_blocked_until: float = 0.0
+_GOOGLE_TTS_COOLDOWN_SEC = 900  # 15 min
+
+
+async def _synthesize_edge_tts(text: str, language: str) -> str:
+    """Synthesize speech with edge-tts and return base64-encoded MP3."""
+    import base64
+    import edge_tts
+
+    voice = EDGE_TTS_VOICE_MAP.get(language, EDGE_TTS_VOICE_MAP["en"])
+    comm = edge_tts.Communicate(text, voice, rate="+5%")
+    chunks = bytearray()
+    async for chunk in comm.stream():
+        if chunk["type"] == "audio":
+            chunks.extend(chunk["data"])
+    if not chunks:
+        raise RuntimeError("edge-tts returned no audio")
+    return base64.b64encode(bytes(chunks)).decode("ascii")
+
 
 @router.post(
     "/interview/tts",
@@ -305,16 +335,16 @@ GOOGLE_TTS_VOICE_MAP = {
 )
 async def generate_tts(payload: dict):
     """
-    Convert text to speech using Google Cloud Text-to-Speech.
+    Convert text to speech using Google Cloud Text-to-Speech, falling back to
+    edge-tts (Microsoft Neural, same Indian female profile) whenever Google is
+    unavailable — missing key, billing disabled, quota, or timeout.
     Returns base64-encoded MP3 audio.
     Request: { "text": "...", "language": "en" | "hi" }
-    Response: { "audio": "base64-encoded-mp3" }
+    Response: { "audio": "base64-encoded-mp3", "provider": "google" | "edge" }
     """
+    global _google_tts_blocked_until
     from app.config import settings
     import httpx
-
-    if not settings.GOOGLE_TTS_API_KEY:
-        raise HTTPException(status_code=503, detail="Google TTS not configured")
 
     text = (payload.get("text") or "").strip()
     if not text:
@@ -341,34 +371,60 @@ async def generate_tts(payload: dict):
     language = payload.get("language", "en")
     voice = GOOGLE_TTS_VOICE_MAP.get(language, GOOGLE_TTS_VOICE_MAP["en"])
 
-    url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={settings.GOOGLE_TTS_API_KEY}"
-    body = {
-        "input": {"text": text},
-        "voice": voice,
-        "audioConfig": {
-            "audioEncoding": "MP3",
-            "speakingRate": 0.95,
-            "pitch": 0.0,
-            "volumeGainDb": 0.0,
-        },
-    }
+    # ── Primary: Google Cloud TTS ───────────────────────────────────────────
+    google_skipped_reason: Optional[str] = None
+    if not settings.GOOGLE_TTS_API_KEY:
+        google_skipped_reason = "no API key configured"
+    elif time.time() < _google_tts_blocked_until:
+        google_skipped_reason = "circuit breaker open (auth/billing failure)"
 
+    if google_skipped_reason is None:
+        url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={settings.GOOGLE_TTS_API_KEY}"
+        body = {
+            "input": {"text": text},
+            "voice": voice,
+            "audioConfig": {
+                "audioEncoding": "MP3",
+                "speakingRate": 0.95,
+                "pitch": 0.0,
+                "volumeGainDb": 0.0,
+            },
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(url, json=body)
+
+            if response.status_code == 200:
+                audio = (response.json() or {}).get("audioContent", "")
+                if audio:
+                    return {"audio": audio, "provider": "google"}
+                logging.error("[GoogleTTS] 200 with empty audioContent — falling back")
+            else:
+                logging.error(
+                    f"[GoogleTTS] API error {response.status_code}: {response.text[:300]}"
+                )
+                # 401/403 = bad key, API not enabled, or billing disabled. Not
+                # transient: stop hammering Google for the cooldown window.
+                if response.status_code in (401, 403):
+                    _google_tts_blocked_until = time.time() + _GOOGLE_TTS_COOLDOWN_SEC
+                    logging.error(
+                        "[GoogleTTS] auth/billing failure — using fallback voice for "
+                        f"the next {_GOOGLE_TTS_COOLDOWN_SEC}s"
+                    )
+        except httpx.TimeoutException:
+            logging.error("[GoogleTTS] timeout — falling back")
+        except Exception as e:
+            logging.error(f"[GoogleTTS] Failed: {e} — falling back")
+    else:
+        logging.warning(f"[GoogleTTS] skipped ({google_skipped_reason}) — using fallback voice")
+
+    # ── Fallback: edge-tts (free, no billing, same Indian female profile) ────
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(url, json=body)
-
-        if response.status_code != 200:
-            logging.error(f"[GoogleTTS] API error {response.status_code}: {response.text[:300]}")
-            raise HTTPException(status_code=502, detail=f"Google TTS error: {response.status_code}")
-
-        data = response.json()
-        return {"audio": data.get("audioContent", "")}
-
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Google TTS timeout")
+        audio = await _synthesize_edge_tts(text, language)
+        return {"audio": audio, "provider": "edge"}
     except Exception as e:
-        logging.error(f"[GoogleTTS] Failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(f"[EdgeTTS] fallback failed: {e}")
+        raise HTTPException(status_code=502, detail="Text-to-speech unavailable")
 
 
 @router.get(
