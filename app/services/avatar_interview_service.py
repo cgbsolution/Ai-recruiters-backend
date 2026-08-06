@@ -15,6 +15,7 @@ from app.models.interview import (
     Evaluation,
     InterviewMessage,
     InterviewSession,
+    InterviewStatusLog,
     Recommendation,
     SessionStatus,
 )
@@ -30,12 +31,67 @@ from app.services.credit_service import log_usage
 
 logger = logging.getLogger(__name__)
 
+# Candidate statuses that mean "still mid-flow" — safe to advance to a terminal
+# outcome. Anything else (Completed, Terminated – Cheating Detected, Ended by
+# Candidate, …) is already a final verdict and must never be overwritten.
+TRANSITIONAL_CANDIDATE_STATUSES = {
+    None,
+    "",
+    "New",
+    "Scheduled",
+    "Added from Database",
+    "Disconnected – Awaiting Rejoin",
+}
+
 VIOLATION_TERMINATE_THRESHOLD = 5
 LIVE_TURN_TIMEOUT_SECONDS = 38
 LIVE_LLM_ATTEMPT_1_TIMEOUT_SECONDS = 18
 LIVE_LLM_ATTEMPT_2_TIMEOUT_SECONDS = 12
 LIVE_LLM_REPAIR_TIMEOUT_SECONDS = 10
 LIVE_LLM_RETRIES = 1
+
+
+def _mark_candidate_interview_completed(
+    db: Session,
+    session: InterviewSession,
+    reason: str,
+    new_status: str = "Completed",
+) -> None:
+    """Advance the candidate row when the conversation engine ends a session.
+
+    The engine marks `session.status = completed` in three places (candidate
+    asked to stop, max-questions guard, model returned is_complete). None of
+    them used to touch the candidate row, so `interview_status` stayed on
+    "Scheduled" unless the client also reached POST /complete. If the tab was
+    closed on the completion screen — or the request failed — the candidate
+    looked un-interviewed forever in the recruiter list.
+
+    Caller is responsible for committing; this only stages the change so it
+    lands in the same transaction as the session status itself.
+    """
+    if not session.candidate_id:
+        return
+    candidate = db.query(Candidate).filter(Candidate.id == session.candidate_id).first()
+    if not candidate:
+        return
+    if candidate.interview_status not in TRANSITIONAL_CANDIDATE_STATUSES:
+        return  # already a terminal verdict — don't clobber it
+
+    db.add(InterviewStatusLog(
+        candidate_id=candidate.id,
+        previous_status=candidate.interview_status,
+        new_status=new_status,
+        changed_by="system",
+        reason=reason,
+    ))
+    candidate.interview_status = new_status
+    candidate.interview_date = session.started_at or datetime.utcnow()
+    if candidate.candidate_stage in (None, "", "Candidates"):
+        candidate.candidate_stage = "AI Round"
+    logger.info(
+        "[session %s] candidate %s -> %s (%s)",
+        session.id, candidate.id, new_status, reason,
+    )
 
 
 def _build_question_plan(job: Job, settings_obj: Optional[InterviewSettings]) -> tuple:
@@ -1007,6 +1063,11 @@ async def _conduct_turn_impl(
             db.add(closing_msg)
             session.status = SessionStatus.completed
             session.completed_at = datetime.utcnow()
+            _mark_candidate_interview_completed(
+                db, session,
+                reason="Candidate asked to end the interview",
+                new_status="Ended by Candidate",
+            )
             db.commit()
             return {
                 "session_id": session.id,
@@ -1044,6 +1105,9 @@ async def _conduct_turn_impl(
         db.add(closing_msg)
         session.status = SessionStatus.completed
         session.completed_at = datetime.utcnow()
+        _mark_candidate_interview_completed(
+            db, session, reason="All questions asked (max_questions guard)",
+        )
         db.commit()
         return {
             "session_id": session.id,
@@ -1502,6 +1566,9 @@ async def _conduct_turn_impl(
     if is_complete:
         session.status = SessionStatus.completed
         session.completed_at = datetime.utcnow()
+        _mark_candidate_interview_completed(
+            db, session, reason="Interview completed normally (AI closed the interview)",
+        )
 
     _safe_commit(db, f"conduct_turn session={session.id}")
 
@@ -1833,7 +1900,18 @@ Return ONLY valid JSON:
   ]
 }}"""
 
-    logging.info(f"[Evaluation] Sending prompt to AI for session {session.id} (transcript length: {len(transcript)} chars)")
+    # Timeout must scale with output size, not be a flat constant. The model
+    # emits ~250 output tokens per scored question (score + positives +
+    # negatives), plus the summary/strengths/weaknesses/skills block. A 20-question
+    # interview is therefore a multi-thousand-token generation that CANNOT finish
+    # inside the old flat 90s — every long interview failed all four attempts and
+    # produced a stub, while short ones passed and hid the bug.
+    eval_timeout = max(120, min(240, 60 + 12 * eval_question_count))
+    logging.info(
+        f"[Evaluation] Sending prompt to AI for session {session.id} "
+        f"(transcript {len(transcript)} chars, {eval_question_count} scored questions, "
+        f"timeout {eval_timeout}s)"
+    )
     try:
         llm_result = await _ask_with_system_usage(
             system="You are a senior technical evaluator. Return only valid JSON.",
@@ -1843,10 +1921,13 @@ Return ONLY valid JSON:
             # positives/negatives + scores + summary + skills) overflowed 4000 and
             # got truncated into unparseable JSON.
             max_tokens=8000,
-            # 90s/attempt × outer 360s wrapper × 4 retries = up to ~6 min total
-            # before we give up — fail fast so the candidate sees a real retry
-            # button instead of staring at "Generating…" for 7+ minutes.
-            timeout_seconds=90,
+            timeout_seconds=eval_timeout,
+            # Stream: with max_tokens=8000 the non-streaming request had to
+            # complete the whole generation before a single byte came back.
+            stream=True,
+            # Bounded so the caller's total budget is predictable:
+            # worst case here is 2 x eval_timeout + backoff.
+            retries=2,
         )
     except Exception as e:
         logging.error(f"[Evaluation] AI call failed for session {session.id}: {type(e).__name__}: {e}\n{traceback.format_exc()}")
@@ -1872,7 +1953,10 @@ Return ONLY valid JSON:
                 messages=[{"role": "user", "content": f"Convert the following into one strictly-valid JSON object:\n\n{llm_result.text}"}],
                 model=SONNET,
                 max_tokens=8000,
-                timeout_seconds=60,
+                # Re-emitting the whole object is as long as producing it — same
+                # streaming + scaled-timeout treatment as the call above.
+                timeout_seconds=eval_timeout,
+                stream=True,
             )
             data = _parse_json(repair.text)
             logging.info(f"[Evaluation] JSON repair succeeded for session {session.id}")
@@ -1936,8 +2020,12 @@ Return ONLY valid JSON:
         candidate.trust_score = max(0.0, 100.0 - violation_count * 20.0)
         # AI cheating score: higher = more cheating detected (0-100 scale)
         candidate.ai_cheating_score = min(100.0, violation_count * 20.0)
-        candidate.interview_status = "Completed"
-        candidate.interview_date = session.started_at or datetime.utcnow()
+        # Only advance a still-transitional row. A candidate who was terminated
+        # for cheating (or ended the call early) keeps that verdict — scoring
+        # their transcript must not silently relabel them as "Completed".
+        _mark_candidate_interview_completed(
+            db, session, reason="Evaluation generated",
+        )
         candidate.candidate_stage = "AI Round"
 
     db.commit()

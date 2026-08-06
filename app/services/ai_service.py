@@ -67,12 +67,17 @@ async def _ask_with_system_usage(
     max_tokens: int = 512,
     timeout_seconds: int = 25,
     retries: int = 3,
+    stream: bool = False,
 ) -> LLMResult:
-    """Like _ask_with_system but returns full LLMResult with token usage."""
+    """Like _ask_with_system but returns full LLMResult with token usage.
+
+    Pass `stream=True` for calls with a large `max_tokens` — a non-streaming
+    request has to complete the entire generation inside `timeout_seconds`.
+    """
     tier = "advanced" if model in ("advanced", "claude-opus-4-6", "gpt-4o", "gemini-2.5-pro") else "fast"
     return await _llm_ask_with_system_usage(
         system, messages, tier=tier, max_tokens=max_tokens,
-        timeout_seconds=timeout_seconds, retries=retries,
+        timeout_seconds=timeout_seconds, retries=retries, stream=stream,
     )
 
 

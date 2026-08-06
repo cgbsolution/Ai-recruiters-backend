@@ -1680,8 +1680,13 @@ async def _run_evaluation_background(session_id: int):
       and a failure-summary so GET /evaluation returns 200 (not 404) and the
       retry button in the UI actually has something to retry.
     """
-    MAX_RETRIES = 4
-    TOTAL_TIMEOUT = 360  # 6 minutes total — per-attempt LLM timeout is 90s
+    # Budget math has to actually add up, or the outer wrapper kills the task
+    # mid-attempt and every failure reports as a bare "timed out" no matter what
+    # really went wrong. Per attempt the evaluation makes up to 2 LLM calls of
+    # up to 240s each (see eval_timeout in generate_evaluation), so ~500s; two
+    # attempts plus backoff fit inside the 15-minute ceiling below.
+    MAX_RETRIES = 2
+    TOTAL_TIMEOUT = 900
 
     _set_eval_state(session_id, "processing")
     last_error: Optional[str] = None

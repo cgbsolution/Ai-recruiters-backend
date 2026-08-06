@@ -2067,12 +2067,24 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User 
     screenshots_list = []
 
     if latest_session:
+        # Surface the evaluation pipeline's own state. Without this the UI can
+        # only guess from the stub row's summary text, so a recruiter clicking
+        # "Re-generate" saw a generic "couldn't be generated" and had no way to
+        # tell a transient LLM timeout from a real, permanent failure.
+        try:
+            _meta = json.loads(latest_session.session_metadata or "{}")
+        except Exception:
+            _meta = {}
+
         session_info = {
             "id": latest_session.id,
             "started_at": (latest_session.started_at.isoformat() + "Z") if latest_session.started_at else None,
             "completed_at": (latest_session.completed_at.isoformat() + "Z") if latest_session.completed_at else None,
             "violation_count": latest_session.violation_count or 0,
             "status": latest_session.status.value,
+            "evaluation_state": _meta.get("evaluation_state", "idle"),
+            "evaluation_error": _meta.get("evaluation_error"),
+            "evaluation_state_at": _meta.get("evaluation_state_at"),
         }
 
         messages = (

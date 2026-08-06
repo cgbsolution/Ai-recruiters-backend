@@ -133,10 +133,18 @@ async def _anthropic_ask(prompt: str, model: str, max_tokens: int, retries: int)
 
 async def _anthropic_ask_with_system(
     system: str, messages: list, model: str, max_tokens: int,
-    timeout_seconds: int, retries: int,
+    timeout_seconds: int, retries: int, stream: bool = False,
 ) -> LLMResult:
     import anthropic
     client = _get_anthropic_client()
+
+    # We run our own retry loop below (with backoff + logging), so disable the
+    # SDK's built-in retries. Left at its default of 2, a single call could
+    # silently burn `timeout_seconds x 3` of wall-clock before raising — which
+    # blew straight through the evaluation task's total budget and surfaced as
+    # a bare "timed out" with no attempt ever completing. With max_retries=0
+    # the worst case is exactly `retries x timeout_seconds` + backoffs.
+    client = client.with_options(max_retries=0)
 
     # Prompt-cache the system block. The interview system prompt is large (~600
     # lines) and is resent on every turn, so caching it (Anthropic's ~5-min
@@ -154,13 +162,34 @@ async def _anthropic_ask_with_system(
 
     for attempt in range(retries):
         try:
-            response = await client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=system_param,
-                messages=messages,
-                timeout=timeout_seconds,
-            )
+            if stream:
+                # Long generations (a 20-question evaluation is several
+                # thousand output tokens) must stream: a non-streaming request
+                # holds one idle HTTP connection open for the whole generation
+                # and trips the client timeout well before the model is done.
+                # Streaming keeps bytes flowing, so the timeout only fires on a
+                # genuinely stalled connection.
+                async with client.messages.stream(
+                    model=model,
+                    max_tokens=max_tokens,
+                    system=system_param,
+                    messages=messages,
+                    timeout=timeout_seconds,
+                ) as s:
+                    response = await s.get_final_message()
+            else:
+                response = await client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    system=system_param,
+                    messages=messages,
+                    timeout=timeout_seconds,
+                )
+            if getattr(response, "stop_reason", None) == "max_tokens":
+                logger.warning(
+                    "[LLM] %s hit max_tokens (%s) — output is truncated and "
+                    "will likely fail JSON parsing", model, max_tokens,
+                )
             inp = getattr(response.usage, "input_tokens", 0) or 0
             out = getattr(response.usage, "output_tokens", 0) or 0
             return LLMResult(
@@ -173,9 +202,16 @@ async def _anthropic_ask_with_system(
                 estimated_cost=_estimate_cost(model, inp, out),
             )
         except anthropic.APIStatusError as exc:
-            if exc.status_code == 529 and attempt < retries - 1:
-                wait = min(3, 1 + attempt)  # 1s, 2s, 3s max — don't block server
-                logger.warning(f"[LLM] Anthropic 529 overloaded (attempt {attempt + 1}/{retries}), retry in {wait}s")
+            # Now that SDK-level retries are off, this loop owns retrying the
+            # whole transient family — not just 529. A 429/5xx used to be
+            # re-raised here and only survived because the SDK had quietly
+            # retried it underneath.
+            retryable = exc.status_code in (408, 409, 429, 500, 502, 503, 504, 529)
+            if retryable and attempt < retries - 1:
+                wait = min(5, 1 + 2 * attempt)  # 1s, 3s, 5s max — don't block server
+                logger.warning(
+                    f"[LLM] Anthropic {exc.status_code} (attempt {attempt + 1}/{retries}), retry in {wait}s"
+                )
                 await asyncio.sleep(wait)
                 continue
             raise
@@ -183,6 +219,13 @@ async def _anthropic_ask_with_system(
             if attempt < retries - 1:
                 wait = min(5, 2 * (attempt + 1))  # 2s, 4s, 5s max
                 logger.warning(f"[LLM] Anthropic timeout (attempt {attempt + 1}/{retries}), retrying in {wait}s...")
+                await asyncio.sleep(wait)
+                continue
+            raise
+        except anthropic.APIConnectionError as exc:
+            if attempt < retries - 1:
+                wait = min(5, 2 * (attempt + 1))
+                logger.warning(f"[LLM] Anthropic connection error ({exc}), retrying in {wait}s...")
                 await asyncio.sleep(wait)
                 continue
             raise
@@ -236,8 +279,10 @@ async def _gemini_ask(prompt: str, model: str, max_tokens: int, retries: int) ->
 
 async def _gemini_ask_with_system(
     system: str, messages: list, model: str, max_tokens: int,
-    timeout_seconds: int, retries: int,
+    timeout_seconds: int, retries: int, stream: bool = False,
 ) -> LLMResult:
+    # `stream` is an Anthropic-only transport hint; Gemini already runs off the
+    # event loop via to_thread with a hard asyncio.wait_for, so it's ignored.
     from google.genai import types
     client = _get_gemini_client()
 
@@ -323,8 +368,8 @@ async def _openai_ask(prompt: str, model: str, max_tokens: int, retries: int) ->
 
 async def _openai_ask_with_system(
     system: str, messages: list, model: str, max_tokens: int,
-    timeout_seconds: int, retries: int,
-) -> LLMResult:
+    timeout_seconds: int, retries: int, stream: bool = False,
+) -> LLMResult:  # `stream` is an Anthropic-only transport hint; ignored here.
     client = _get_openai_client()
 
     # Convert to OpenAI format
@@ -390,6 +435,7 @@ async def _ask_with_system_full(
     max_tokens: int = 512,
     timeout_seconds: int = 25,
     retries: int = 3,
+    stream: bool = False,
 ) -> LLMResult:
     provider = get_provider()
     model = get_model(tier)
@@ -401,7 +447,7 @@ async def _ask_with_system_full(
     fn = dispatch.get(provider)
     if fn is None:
         raise ValueError(f"Unknown provider: {provider}")
-    result = await fn(system, messages, model, max_tokens, timeout_seconds, retries)
+    result = await fn(system, messages, model, max_tokens, timeout_seconds, retries, stream)
     result.tier = tier
     return result
 
@@ -457,8 +503,14 @@ async def ask_with_system_usage(
     max_tokens: int = 512,
     timeout_seconds: int = 25,
     retries: int = 3,
+    stream: bool = False,
 ) -> LLMResult:
     """
     Send a system prompt + message history to the LLM. Returns full LLMResult with token usage.
+
+    Set `stream=True` for long generations (high max_tokens) so the request
+    doesn't sit on an idle connection and trip `timeout_seconds`.
     """
-    return await _ask_with_system_full(system, messages, tier, max_tokens, timeout_seconds, retries)
+    return await _ask_with_system_full(
+        system, messages, tier, max_tokens, timeout_seconds, retries, stream
+    )

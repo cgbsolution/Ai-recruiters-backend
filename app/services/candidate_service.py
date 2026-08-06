@@ -21,20 +21,27 @@ def _reconcile_stale_completed_candidates(
 ) -> None:
     """One-shot self-healing pass.
 
-    A candidate may have a full Evaluation row (real scores) but still carry
-    interview_status="Scheduled" and candidate_stage="Candidates" — typically
-    because an earlier Reschedule action overwrote those fields after the
-    interview had already been evaluated. Repair them here so the AI Round
-    tab and Interview Completed counters reflect reality on the next load.
+    A candidate may have actually sat (and finished) the interview but still
+    carry interview_status="Scheduled" and candidate_stage="Candidates" —
+    because an earlier Reschedule overwrote those fields, or because the
+    session was completed by the conversation engine on a path that never
+    touched the candidate row. Repair them here so the AI Round tab and
+    Interview Completed counters reflect reality on the next load.
 
-    Detection rule: candidate has a non-null overall score AND interview_status
-    is "Scheduled". Stub evaluations (failed eval, score is null) are skipped.
+    Detection rule: interview_status is still a transitional value AND the
+    candidate has a terminal (completed/terminated) interview session.
+
+    NOTE: this deliberately does NOT require a non-null score. Gating on the
+    score meant a candidate whose AI evaluation FAILED (stub row, score null)
+    was skipped forever and stayed stuck on "Scheduled" — the exact case this
+    self-heal exists for. Interview completion and evaluation success are
+    independent facts; the status reflects the former only.
     """
     from app.models.interview import InterviewSession, SessionStatus
 
+    stale_statuses = {"Scheduled", "New", "Disconnected – Awaiting Rejoin"}
     candidate_ids = [
-        c.id for c in candidates
-        if c.interview_status == "Scheduled" and c.score is not None
+        c.id for c in candidates if c.interview_status in stale_statuses
     ]
     if not candidate_ids:
         return
@@ -52,11 +59,11 @@ def _reconcile_stale_completed_candidates(
 
     dirty = False
     for c in candidates:
-        if c.id in completed_session_ids and c.interview_status == "Scheduled":
+        if c.id in completed_session_ids and c.interview_status in stale_statuses:
             logger.info(
-                "[reconcile] candidate=%s had score=%s but interview_status=Scheduled "
-                "— restoring Completed/AI Round",
-                c.id, c.score,
+                "[reconcile] candidate=%s has a terminal session but "
+                "interview_status=%s (score=%s) — restoring Completed/AI Round",
+                c.id, c.interview_status, c.score,
             )
             c.interview_status = "Completed"
             if c.candidate_stage in (None, "Candidates"):
