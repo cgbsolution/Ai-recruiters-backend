@@ -7,6 +7,8 @@ Create Date: 2026-03-28 16:00:00.000000
 from alembic import op
 import sqlalchemy as sa
 
+from app.migration_helpers import insert_row_if_missing
+
 revision = "o5p6q7r8s9t0"
 down_revision = "n4o5p6q7r8s9"
 branch_labels = None
@@ -32,13 +34,23 @@ def upgrade() -> None:
         op.create_index("ix_organizations_domain", "organizations", ["domain"], unique=True)
         op.create_index("ix_organizations_id", "organizations", ["id"])
 
-    # 2. Insert a default organization for existing data
-    op.execute(
-        """
-        INSERT INTO organizations (name, domain, is_active, created_at)
-        SELECT 'Default Organization', 'default.local', true, NOW()
-        WHERE NOT EXISTS (SELECT 1 FROM organizations WHERE domain = 'default.local')
-        """
+    # 2. Insert a default organization for existing data.
+    #
+    # This cannot be a fixed column list. On databases where `organizations`
+    # was created by `create_all()` the table already carries later columns
+    # such as `max_jobs INTEGER NOT NULL` with NO database default (the model
+    # declares a Python-side `default=0`, which emits no DDL default), so an
+    # INSERT naming only these four columns died with NotNullViolation.
+    # insert_row_if_missing() fills any such column it finds.
+    insert_row_if_missing(
+        "organizations",
+        {
+            "name": "Default Organization",
+            "domain": "default.local",
+            "is_active": True,
+            "created_at": sa.func.now(),
+        },
+        unique_column="domain",
     )
 
     # 3. Add organization_id columns (nullable first for safe backfill)

@@ -13,9 +13,12 @@ class Organization(Base):
     name = Column(String(255), nullable=False)
     domain = Column(String(255), unique=True, nullable=False, index=True)
     is_active = Column(Boolean, default=True, nullable=False)
-    # Quota limits — 0 means unlimited
-    max_jobs = Column(Integer, default=0, nullable=False)
-    max_candidates_per_job = Column(Integer, default=0, nullable=False)
+    # Quota limits — 0 means unlimited.
+    # `server_default` matters as much as `default`: the latter is applied in
+    # Python on ORM inserts only, so without it create_all() produced a NOT
+    # NULL column with no DDL default and any plain SQL INSERT failed.
+    max_jobs = Column(Integer, default=0, nullable=False, server_default="0")
+    max_candidates_per_job = Column(Integer, default=0, nullable=False, server_default="0")
     # Lifetime usage counters — never decremented on delete, reset only by super admin
     total_jobs_used = Column(Integer, default=0, nullable=False, server_default="0")
     total_candidates_used = Column(Integer, default=0, nullable=False, server_default="0")

@@ -156,6 +156,67 @@ def create_foreign_key_if_missing(
     return True
 
 
+def _zero_value_for(sa_type):
+    """A benign non-NULL value for a column type we must fill in."""
+    if isinstance(sa_type, sa.Boolean):
+        return False
+    if isinstance(sa_type, (sa.Integer, sa.Numeric, sa.Float)):
+        return 0
+    if isinstance(sa_type, (sa.String, sa.Text)):
+        return ""
+    if isinstance(sa_type, (sa.DateTime, sa.Date)):
+        return sa.func.now()
+    return None
+
+
+def insert_row_if_missing(table: str, values: dict, unique_column: str) -> bool:
+    """Insert one row unless a row with the same `unique_column` value exists.
+
+    Any column the caller does not supply that is NOT NULL *and* has no
+    database-level default is filled with a zero value for its type.
+
+    That matters because several models declare `Column(..., default=0,
+    nullable=False)`. SQLAlchemy's `default=` is applied in Python on ORM
+    inserts and emits NO `DEFAULT` clause in the DDL — so a database built by
+    `create_all()` ends up with a NOT NULL column that a plain INSERT cannot
+    satisfy, and a migration inserting a seed row dies with NotNullViolation
+    on a column it has never heard of.
+    """
+    if not has_table(table):
+        return False
+
+    columns = {c["name"]: c for c in _inspector().get_columns(table)}
+    payload = dict(values)
+
+    for name, col in columns.items():
+        if name in payload or col["nullable"] or col.get("default") is not None:
+            continue
+        if col.get("autoincrement") or col.get("primary_key"):
+            continue
+        filler = _zero_value_for(col["type"])
+        if filler is not None:
+            payload[name] = filler
+
+    cols = ", ".join(payload)
+    selects = ", ".join(
+        str(v) if isinstance(v, sa.sql.functions.Function) else f":{k}"
+        for k, v in payload.items()
+    )
+    binds = {
+        k: v for k, v in payload.items()
+        if not isinstance(v, sa.sql.functions.Function)
+    }
+
+    op.get_bind().execute(
+        sa.text(
+            f"INSERT INTO {table} ({cols}) SELECT {selects} "
+            f"WHERE NOT EXISTS (SELECT 1 FROM {table} WHERE {unique_column} = :__uq)"
+        ),
+        {**binds, "__uq": values[unique_column]},
+    )
+    return True
+
+
 def enum_type(name: str, values: Iterable[str]):
     """Return a column type for an enum, creating the PG type if needed.
 
