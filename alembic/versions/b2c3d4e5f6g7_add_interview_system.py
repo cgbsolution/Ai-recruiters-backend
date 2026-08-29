@@ -4,11 +4,21 @@ Revision ID: b2c3d4e5f6g7
 Revises: a1b2c3d4e5f6
 Create Date: 2026-02-26 00:00:00.000000
 
+Tables and indexes are created only when absent, and the PostgreSQL enum types
+are created with checkfirst — databases built by create_all() or by an earlier
+partial run already have some of these. See app/migration_helpers.py.
 """
 from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+
+from app.migration_helpers import (
+    create_index_if_missing,
+    create_table_if_missing,
+    enum_type,
+    has_table,
+)
 
 
 revision: str = 'b2c3d4e5f6g7'
@@ -18,8 +28,8 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # ── interview_tokens ─────────────────────────────────────────────────────
-    op.create_table(
+    # -- interview_tokens -----------------------------------------------------
+    create_table_if_missing(
         'interview_tokens',
         sa.Column('id', sa.Integer(), primary_key=True),
         sa.Column('job_id', sa.Integer(), sa.ForeignKey('jobs.id', ondelete='CASCADE'), nullable=False),
@@ -28,17 +38,17 @@ def upgrade() -> None:
         sa.Column('expires_at', sa.DateTime(), nullable=True),
         sa.Column('created_at', sa.DateTime(), nullable=True),
     )
-    op.create_index('ix_interview_tokens_token', 'interview_tokens', ['token'])
-    op.create_index('ix_interview_tokens_job_id', 'interview_tokens', ['job_id'])
+    create_index_if_missing('ix_interview_tokens_token', 'interview_tokens', ['token'])
+    create_index_if_missing('ix_interview_tokens_job_id', 'interview_tokens', ['job_id'])
 
-    # ── interview_sessions ───────────────────────────────────────────────────
-    op.create_table(
+    # -- interview_sessions ---------------------------------------------------
+    create_table_if_missing(
         'interview_sessions',
         sa.Column('id', sa.Integer(), primary_key=True),
         sa.Column('token_id', sa.Integer(), sa.ForeignKey('interview_tokens.id', ondelete='CASCADE'), nullable=False),
         sa.Column('candidate_id', sa.Integer(), sa.ForeignKey('candidates.id', ondelete='SET NULL'), nullable=True),
         sa.Column('job_id', sa.Integer(), sa.ForeignKey('jobs.id', ondelete='CASCADE'), nullable=False),
-        sa.Column('status', sa.Enum('pending', 'in_progress', 'completed', 'terminated', name='sessionstatus'), nullable=False, server_default='pending'),
+        sa.Column('status', enum_type('sessionstatus', ('pending', 'in_progress', 'completed', 'terminated')), nullable=False, server_default='pending'),
         sa.Column('started_at', sa.DateTime(), nullable=True),
         sa.Column('completed_at', sa.DateTime(), nullable=True),
         sa.Column('total_questions', sa.Integer(), nullable=True, server_default='0'),
@@ -47,13 +57,13 @@ def upgrade() -> None:
         sa.Column('session_metadata', sa.Text(), nullable=True),
         sa.Column('created_at', sa.DateTime(), nullable=True),
     )
-    op.create_index('ix_interview_sessions_token_id', 'interview_sessions', ['token_id'])
-    op.create_index('ix_interview_sessions_candidate_id', 'interview_sessions', ['candidate_id'])
-    op.create_index('ix_interview_sessions_job_id', 'interview_sessions', ['job_id'])
-    op.create_index('ix_interview_sessions_status', 'interview_sessions', ['status'])
+    create_index_if_missing('ix_interview_sessions_token_id', 'interview_sessions', ['token_id'])
+    create_index_if_missing('ix_interview_sessions_candidate_id', 'interview_sessions', ['candidate_id'])
+    create_index_if_missing('ix_interview_sessions_job_id', 'interview_sessions', ['job_id'])
+    create_index_if_missing('ix_interview_sessions_status', 'interview_sessions', ['status'])
 
-    # ── interview_messages ───────────────────────────────────────────────────
-    op.create_table(
+    # -- interview_messages ---------------------------------------------------
+    create_table_if_missing(
         'interview_messages',
         sa.Column('id', sa.Integer(), primary_key=True),
         sa.Column('session_id', sa.Integer(), sa.ForeignKey('interview_sessions.id', ondelete='CASCADE'), nullable=False),
@@ -62,21 +72,21 @@ def upgrade() -> None:
         sa.Column('question_index', sa.Integer(), nullable=True),
         sa.Column('created_at', sa.DateTime(), nullable=True),
     )
-    op.create_index('ix_interview_messages_session_id', 'interview_messages', ['session_id'])
+    create_index_if_missing('ix_interview_messages_session_id', 'interview_messages', ['session_id'])
 
-    # ── violations ───────────────────────────────────────────────────────────
-    op.create_table(
+    # -- violations -----------------------------------------------------------
+    create_table_if_missing(
         'violations',
         sa.Column('id', sa.Integer(), primary_key=True),
         sa.Column('session_id', sa.Integer(), sa.ForeignKey('interview_sessions.id', ondelete='CASCADE'), nullable=False),
-        sa.Column('violation_type', sa.Enum('tab_switch', 'fullscreen_exit', 'face_not_detected', 'multiple_faces', name='violationtype'), nullable=False),
+        sa.Column('violation_type', enum_type('violationtype', ('tab_switch', 'fullscreen_exit', 'face_not_detected', 'multiple_faces')), nullable=False),
         sa.Column('details', sa.Text(), nullable=True),
         sa.Column('occurred_at', sa.DateTime(), nullable=True),
     )
-    op.create_index('ix_violations_session_id', 'violations', ['session_id'])
+    create_index_if_missing('ix_violations_session_id', 'violations', ['session_id'])
 
-    # ── evaluations ──────────────────────────────────────────────────────────
-    op.create_table(
+    # -- evaluations ----------------------------------------------------------
+    create_table_if_missing(
         'evaluations',
         sa.Column('id', sa.Integer(), primary_key=True),
         sa.Column('session_id', sa.Integer(), sa.ForeignKey('interview_sessions.id', ondelete='CASCADE'), nullable=False, unique=True),
@@ -86,7 +96,7 @@ def upgrade() -> None:
         sa.Column('problem_solving_score', sa.Float(), nullable=True),
         sa.Column('confidence_score', sa.Float(), nullable=True),
         sa.Column('overall_score', sa.Float(), nullable=True),
-        sa.Column('recommendation', sa.Enum('Strong Hire', 'Hire', 'Maybe', 'No Hire', name='recommendation'), nullable=True),
+        sa.Column('recommendation', enum_type('recommendation', ('Strong Hire', 'Hire', 'Maybe', 'No Hire')), nullable=True),
         sa.Column('summary', sa.Text(), nullable=True),
         sa.Column('strengths', sa.Text(), nullable=True),
         sa.Column('weaknesses', sa.Text(), nullable=True),
@@ -94,10 +104,10 @@ def upgrade() -> None:
         sa.Column('meets_threshold', sa.Boolean(), nullable=True, server_default='false'),
         sa.Column('created_at', sa.DateTime(), nullable=True),
     )
-    op.create_index('ix_evaluations_candidate_id', 'evaluations', ['candidate_id'])
+    create_index_if_missing('ix_evaluations_candidate_id', 'evaluations', ['candidate_id'])
 
-    # ── candidate_feedback ───────────────────────────────────────────────────
-    op.create_table(
+    # -- candidate_feedback ---------------------------------------------------
+    create_table_if_missing(
         'candidate_feedback',
         sa.Column('id', sa.Integer(), primary_key=True),
         sa.Column('session_id', sa.Integer(), sa.ForeignKey('interview_sessions.id', ondelete='CASCADE'), nullable=False, unique=True),
@@ -108,8 +118,8 @@ def upgrade() -> None:
         sa.Column('created_at', sa.DateTime(), nullable=True),
     )
 
-    # ── meeting_slots ─────────────────────────────────────────────────────────
-    op.create_table(
+    # -- meeting_slots --------------------------------------------------------
+    create_table_if_missing(
         'meeting_slots',
         sa.Column('id', sa.Integer(), primary_key=True),
         sa.Column('job_id', sa.Integer(), sa.ForeignKey('jobs.id', ondelete='CASCADE'), nullable=False),
@@ -118,30 +128,34 @@ def upgrade() -> None:
         sa.Column('is_booked', sa.Boolean(), nullable=False, server_default='false'),
         sa.Column('created_at', sa.DateTime(), nullable=True),
     )
-    op.create_index('ix_meeting_slots_job_id', 'meeting_slots', ['job_id'])
+    create_index_if_missing('ix_meeting_slots_job_id', 'meeting_slots', ['job_id'])
 
-    # ── meeting_schedules ─────────────────────────────────────────────────────
-    op.create_table(
+    # -- meeting_schedules ----------------------------------------------------
+    create_table_if_missing(
         'meeting_schedules',
         sa.Column('id', sa.Integer(), primary_key=True),
         sa.Column('session_id', sa.Integer(), sa.ForeignKey('interview_sessions.id', ondelete='CASCADE'), nullable=False, unique=True),
         sa.Column('slot_id', sa.Integer(), sa.ForeignKey('meeting_slots.id', ondelete='CASCADE'), nullable=False),
         sa.Column('candidate_id', sa.Integer(), sa.ForeignKey('candidates.id', ondelete='CASCADE'), nullable=False),
-        sa.Column('status', sa.Enum('scheduled', 'cancelled', name='meetingschedulestatus'), nullable=True, server_default='scheduled'),
+        sa.Column('status', enum_type('meetingschedulestatus', ('scheduled', 'cancelled')), nullable=True, server_default='scheduled'),
         sa.Column('created_at', sa.DateTime(), nullable=True),
     )
-    op.create_index('ix_meeting_schedules_candidate_id', 'meeting_schedules', ['candidate_id'])
+    create_index_if_missing('ix_meeting_schedules_candidate_id', 'meeting_schedules', ['candidate_id'])
 
 
 def downgrade() -> None:
-    op.drop_table('meeting_schedules')
-    op.drop_table('meeting_slots')
-    op.drop_table('candidate_feedback')
-    op.drop_table('evaluations')
-    op.drop_table('violations')
-    op.drop_table('interview_messages')
-    op.drop_table('interview_sessions')
-    op.drop_table('interview_tokens')
+    for table in (
+        'meeting_schedules',
+        'meeting_slots',
+        'candidate_feedback',
+        'evaluations',
+        'violations',
+        'interview_messages',
+        'interview_sessions',
+        'interview_tokens',
+    ):
+        if has_table(table):
+            op.drop_table(table)
 
     op.execute("DROP TYPE IF EXISTS meetingschedulestatus")
     op.execute("DROP TYPE IF EXISTS recommendation")

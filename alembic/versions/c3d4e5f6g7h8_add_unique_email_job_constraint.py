@@ -10,6 +10,11 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
+from app.migration_helpers import (
+    create_unique_constraint_if_missing,
+    has_unique_constraint,
+)
+
 
 revision: str = 'c3d4e5f6g7h8'
 down_revision: Union[str, None] = 'b2c3d4e5f6g7'
@@ -57,9 +62,13 @@ def upgrade() -> None:
             "DELETE FROM candidates WHERE id = :dup_id"
         ), {"dup_id": dup_id})
 
-    # Step 2: Add unique constraint
-    op.create_unique_constraint('uq_candidate_email_job', 'candidates', ['email', 'job_id'])
+    # Step 2: Add unique constraint (skipped when the database already has it —
+    # create_all() and re-runs on a partially migrated DB both get here)
+    create_unique_constraint_if_missing(
+        'uq_candidate_email_job', 'candidates', ['email', 'job_id']
+    )
 
 
 def downgrade() -> None:
-    op.drop_constraint('uq_candidate_email_job', 'candidates', type_='unique')
+    if has_unique_constraint('candidates', 'uq_candidate_email_job'):
+        op.drop_constraint('uq_candidate_email_job', 'candidates', type_='unique')

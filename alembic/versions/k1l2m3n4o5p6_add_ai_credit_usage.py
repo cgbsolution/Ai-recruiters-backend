@@ -7,6 +7,8 @@ Create Date: 2026-03-26 00:00:00.000000
 from alembic import op
 import sqlalchemy as sa
 
+from app.migration_helpers import create_table_if_missing, has_table
+
 # revision identifiers
 revision = "k1l2m3n4o5p6"
 down_revision = "j0k1l2m3n4o5"
@@ -15,7 +17,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.create_table(
+    create_table_if_missing(
         "ai_credit_usage",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
         sa.Column("feature", sa.String(50), nullable=False, index=True),
@@ -34,4 +36,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_table("ai_credit_usage")
+    if has_table("ai_credit_usage"):
+        op.drop_table("ai_credit_usage")

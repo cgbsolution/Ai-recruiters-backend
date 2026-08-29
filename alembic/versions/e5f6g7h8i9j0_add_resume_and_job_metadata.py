@@ -7,6 +7,17 @@ Create Date: 2026-03-11 12:00:00.000000
 from alembic import op
 import sqlalchemy as sa
 
+from app.migration_helpers import (
+    add_column_if_missing,
+    create_foreign_key_if_missing,
+    create_index_if_missing,
+    create_table_if_missing,
+    has_column,
+    has_foreign_key,
+    has_index,
+    has_table,
+)
+
 # revision identifiers
 revision = "e5f6g7h8i9j0"
 down_revision = "d4e5f6g7h8i9"
@@ -16,7 +27,7 @@ depends_on = None
 
 def upgrade() -> None:
     # ── resume_metadata table ────────────────────────────────────────────────
-    op.create_table(
+    create_table_if_missing(
         "resume_metadata",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
         sa.Column("candidate_email", sa.String(255), nullable=False, unique=True, index=True),
@@ -42,7 +53,7 @@ def upgrade() -> None:
     )
 
     # ── job_metadata table ───────────────────────────────────────────────────
-    op.create_table(
+    create_table_if_missing(
         "job_metadata",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
         sa.Column("job_id", sa.Integer(), sa.ForeignKey("jobs.id"), nullable=False, unique=True, index=True),
@@ -60,22 +71,26 @@ def upgrade() -> None:
     )
 
     # ── New columns on candidates ────────────────────────────────────────────
-    op.add_column("candidates", sa.Column("resume_metadata_id", sa.Integer(), nullable=True))
-    op.add_column("candidates", sa.Column("parsing_status", sa.String(20), nullable=True))
-    op.create_foreign_key(
+    add_column_if_missing("candidates", sa.Column("resume_metadata_id", sa.Integer(), nullable=True))
+    add_column_if_missing("candidates", sa.Column("parsing_status", sa.String(20), nullable=True))
+    create_foreign_key_if_missing(
         "fk_candidates_resume_metadata",
         "candidates",
         "resume_metadata",
         ["resume_metadata_id"],
         ["id"],
     )
-    op.create_index("ix_candidates_resume_metadata_id", "candidates", ["resume_metadata_id"])
+    create_index_if_missing("ix_candidates_resume_metadata_id", "candidates", ["resume_metadata_id"])
 
 
 def downgrade() -> None:
-    op.drop_index("ix_candidates_resume_metadata_id", table_name="candidates")
-    op.drop_constraint("fk_candidates_resume_metadata", "candidates", type_="foreignkey")
-    op.drop_column("candidates", "parsing_status")
-    op.drop_column("candidates", "resume_metadata_id")
-    op.drop_table("job_metadata")
-    op.drop_table("resume_metadata")
+    if has_index("candidates", "ix_candidates_resume_metadata_id"):
+        op.drop_index("ix_candidates_resume_metadata_id", table_name="candidates")
+    if has_foreign_key("candidates", "fk_candidates_resume_metadata"):
+        op.drop_constraint("fk_candidates_resume_metadata", "candidates", type_="foreignkey")
+    for column in ("parsing_status", "resume_metadata_id"):
+        if has_column("candidates", column):
+            op.drop_column("candidates", column)
+    for table in ("job_metadata", "resume_metadata"):
+        if has_table(table):
+            op.drop_table(table)

@@ -1,4 +1,7 @@
 venv/
+.venv/
+env/
+.env.local
 __pycache__/
 *.pyc
 *.pyo

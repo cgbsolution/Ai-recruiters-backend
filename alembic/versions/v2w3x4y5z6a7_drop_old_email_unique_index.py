@@ -11,6 +11,8 @@ Create Date: 2026-03-29 07:45:00.000000
 """
 from alembic import op
 
+from app.migration_helpers import create_index_if_missing, has_table
+
 # revision identifiers
 revision = "v2w3x4y5z6a7"
 down_revision = "u1v2w3x4y5z6"
@@ -19,9 +21,13 @@ depends_on = None
 
 
 def upgrade() -> None:
+    if not has_table("resume_metadata"):
+        return
     op.drop_index("ix_resume_metadata_candidate_email", table_name="resume_metadata", if_exists=True)
     # Re-create as a non-unique index for query performance
-    op.create_index("ix_resume_metadata_candidate_email", "resume_metadata", ["candidate_email"], unique=False)
+    create_index_if_missing(
+        "ix_resume_metadata_candidate_email", "resume_metadata", ["candidate_email"], unique=False
+    )
 
 
 def downgrade() -> None:

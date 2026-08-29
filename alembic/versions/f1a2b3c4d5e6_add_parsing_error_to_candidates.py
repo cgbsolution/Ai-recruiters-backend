@@ -10,6 +10,8 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
+from app.migration_helpers import add_column_if_missing, has_column
+
 
 revision: str = 'f1a2b3c4d5e6'
 down_revision: Union[str, None] = '3e1b80492f43'
@@ -18,8 +20,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column('candidates', sa.Column('parsing_error', sa.Text(), nullable=True))
+    add_column_if_missing('candidates', sa.Column('parsing_error', sa.Text(), nullable=True))
 
 
 def downgrade() -> None:
-    op.drop_column('candidates', 'parsing_error')
+    if has_column('candidates', 'parsing_error'):
+        op.drop_column('candidates', 'parsing_error')

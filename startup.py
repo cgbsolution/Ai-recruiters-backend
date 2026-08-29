@@ -1,6 +1,12 @@
 """
-Startup script: ensures all required DB tables/columns exist,
-then runs alembic upgrade to stay in sync.
+Startup script: a BACKSTOP that ensures required DB tables/columns exist.
+
+Alembic owns the schema and runs first (see the Dockerfile CMD); this script
+only patches over columns that older deployments created outside Alembic. Keep
+every type and default here identical to the migration and the SQLAlchemy
+model that define the column — when this ran *before* Alembic it silently won
+the race, and the narrower types it created (interview_timezone VARCHAR(50),
+joining_flexibility VARCHAR(20)) became production's real schema.
 """
 import logging
 import time
@@ -63,13 +69,13 @@ REQUIRED_COLUMNS = [
     ("candidates", "resume_metadata_id", "INTEGER", None),
     ("candidates", "interview_date", "TIMESTAMP", None),
     ("candidates", "interview_link", "VARCHAR(500)", None),
-    ("candidates", "interview_status", "VARCHAR(30)", "'New'"),
-    ("candidates", "candidate_stage", "VARCHAR(50)", "'Applied'"),
+    ("candidates", "interview_status", "VARCHAR(60)", "'New'"),
+    ("candidates", "candidate_stage", "VARCHAR(50)", "'Candidates'"),
     ("candidates", "recording_link", "VARCHAR(500)", None),
     ("candidates", "schedule_email_template", "TEXT", None),
     # Migration: d4e5f6g7h8i9_add_status_log_and_cancel
-    ("candidates", "interview_timezone", "VARCHAR(50)", None),
-    ("candidates", "joining_flexibility", "VARCHAR(20)", "'anytime'"),
+    ("candidates", "interview_timezone", "VARCHAR(100)", None),
+    ("candidates", "joining_flexibility", "VARCHAR(30)", "'anytime'"),
     ("candidates", "allow_candidate_reschedule", "BOOLEAN", "FALSE"),
     # Migration: f6g7h8i9j0k1_add_selected_hired_status
     ("candidates", "video_duration", "VARCHAR(50)", None),
