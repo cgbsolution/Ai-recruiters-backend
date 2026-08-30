@@ -53,6 +53,15 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+
 class UserOut(BaseModel):
     id: int
     name: str
@@ -301,6 +310,127 @@ def change_password(
     db.commit()
 
     return {"message": "Password updated successfully"}
+
+
+# ── Forgot / Reset Password ─────────────────────────────────────────────────
+
+# How long a reset link stays usable.
+RESET_TOKEN_TTL = timedelta(hours=1)
+
+# Returned no matter what, so the endpoint cannot be used to discover which
+# email addresses have accounts.
+_FORGOT_PASSWORD_REPLY = {
+    "message": "If an account exists for that email, a reset link has been sent."
+}
+
+
+def _send_password_reset_email(user: User, token: str) -> bool:
+    """Compose and send the reset link. Returns False if SMTP is unconfigured."""
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    # Reuse the SMTP sender the interview emails already go through rather than
+    # standing up a third copy of the connection/retry logic.
+    from app.services.interview_service import _send_email_sync
+
+    link = f"{settings.frontend_base_url}/reset-password?token={token}"
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "Reset your password"
+    msg["From"] = f"{settings.EMAIL_FROM or 'No Reply'} <{settings.SMTP_USER}>"
+    msg["To"] = user.email
+
+    hours = int(RESET_TOKEN_TTL.total_seconds() // 3600)
+    msg.attach(MIMEText(
+        f"Hi {user.name},\n\n"
+        f"We received a request to reset your password.\n\n"
+        f"Reset it here (the link expires in {hours} hour(s)):\n{link}\n\n"
+        f"If you did not request this, you can ignore this email — your "
+        f"password will not change.\n",
+        "plain",
+    ))
+    msg.attach(MIMEText(
+        f"""
+        <div style="font-family:Arial,sans-serif;font-size:15px;color:#1f2937">
+          <p>Hi {user.name},</p>
+          <p>We received a request to reset your password.</p>
+          <p style="margin:24px 0">
+            <a href="{link}" style="background:#465fff;color:#fff;padding:12px 24px;
+               border-radius:8px;text-decoration:none;font-weight:600">Reset Password</a>
+          </p>
+          <p style="color:#6b7280;font-size:13px">
+            This link expires in {hours} hour(s). If you did not request a reset,
+            you can ignore this email — your password will not change.
+          </p>
+        </div>
+        """,
+        "html",
+    ))
+
+    return _send_email_sync(msg, [user.email])
+
+
+@router.post("/forgot-password")
+def forgot_password(body: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    """Email a single-use password reset link.
+
+    Always returns the same message. Reporting whether the address was found
+    would turn this into an account-enumeration oracle.
+    """
+    email = body.email.strip().lower()
+    user = db.query(User).filter(User.email == email).first()
+
+    if not user or not user.is_active:
+        logger.info("Password reset requested for unknown/inactive address: %s", email)
+        return _FORGOT_PASSWORD_REPLY
+
+    user.password_reset_token = secrets.token_urlsafe(32)
+    user.password_reset_expires = datetime.utcnow() + RESET_TOKEN_TTL
+    db.commit()
+
+    try:
+        sent = _send_password_reset_email(user, user.password_reset_token)
+    except Exception:
+        logger.exception("Failed to send password reset email to %s", email)
+        sent = False
+
+    if not sent:
+        # Leave the token in place — the user can retry — but make the failure
+        # visible in the logs instead of silently pretending the mail went out.
+        logger.error("Password reset email could NOT be delivered to %s", email)
+
+    return _FORGOT_PASSWORD_REPLY
+
+
+@router.post("/reset-password")
+def reset_password(body: ResetPasswordRequest, db: Session = Depends(get_db)):
+    """Set a new password using a token from the reset email."""
+    if len(body.new_password) < 6:
+        raise HTTPException(status_code=422, detail="Password must be at least 6 characters")
+
+    token = (body.token or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Reset link is invalid")
+
+    user = db.query(User).filter(User.password_reset_token == token).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Reset link is invalid or has already been used")
+
+    if not user.password_reset_expires or user.password_reset_expires < datetime.utcnow():
+        raise HTTPException(status_code=410, detail="Reset link has expired. Please request a new one.")
+
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="This account is inactive")
+
+    user.password_hash = hash_password(body.new_password)
+    # Single use — clear the token so the same link cannot be replayed.
+    user.password_reset_token = None
+    user.password_reset_expires = None
+    user.updated_at = datetime.utcnow()
+    db.commit()
+
+    logger.info("Password reset completed for %s", user.email)
+    return {"message": "Password updated successfully. You can now sign in."}
 
 
 # ── Email Verification ───────────────────────────────────────────────────────

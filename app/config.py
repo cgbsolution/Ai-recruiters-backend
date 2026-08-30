@@ -76,6 +76,15 @@ class Settings(BaseSettings):
     # ── Live Observer (P2P WebRTC) ──────────────────────────────────────────
     # Public frontend base used to build observer share links sent in emails.
     OBSERVER_LINK_BASE_URL: str = "http://localhost:3000"
+
+    # Public frontend base for links in transactional email (password reset).
+    # Defaults to OBSERVER_LINK_BASE_URL so existing deployments, which already
+    # set that one, need no new environment variable.
+    FRONTEND_BASE_URL: str = ""
+
+    @property
+    def frontend_base_url(self) -> str:
+        return (self.FRONTEND_BASE_URL or self.OBSERVER_LINK_BASE_URL).rstrip("/")
     # STUN: Google's free public servers, comma-separated.
     OBSERVER_STUN_URLS: str = "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302"
     # TURN (optional): Metered.ca free tier credentials. Leave empty to run STUN-only.

@@ -36,6 +36,10 @@ class User(Base):
     is_email_verified = Column(Boolean, default=False, nullable=False)
     email_verify_token = Column(String(128), nullable=True)
     email_verify_expires = Column(DateTime, nullable=True)
+    # Forgot-password flow. Single-use: both are cleared the moment the
+    # password is actually changed, so a reset link cannot be replayed.
+    password_reset_token = Column(String(128), nullable=True)
+    password_reset_expires = Column(DateTime, nullable=True)
     organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=True, index=True)
 
     # ── Google OAuth2 (per-user, for Google Meet / Calendar integration) ─────
