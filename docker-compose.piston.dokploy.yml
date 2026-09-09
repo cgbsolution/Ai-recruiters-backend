@@ -1,0 +1,97 @@
+# Piston code-execution sandbox — Dokploy deployment.
+#
+# Deploy as: Create Service → Compose → Provider "Raw" → paste this file.
+# Compose Type MUST be "Docker Compose" (not Stack/Swarm): Swarm ignores
+# `container_name` and does not support `privileged`, both of which Piston needs.
+#
+# Afterwards, set on the Backend-api service:
+#   PISTON_API_URL=http://piston:2000/api/v2
+#
+# Local dev still uses docker-compose.yml (which bundles the backend too).
+
+services:
+  piston:
+    image: ghcr.io/engineer-man/piston:latest
+    # Fixed name so other Dokploy services can reach it as http://piston:2000.
+    # Without this, Compose prefixes the project name and DNS lookups fail.
+    container_name: piston
+    restart: unless-stopped
+    # Piston runs each job under its own uid in an isolated namespace; it
+    # needs privileged to set that up. This is why it can't be a Dokploy
+    # "Application" service.
+    privileged: true
+    environment:
+      # Slow JVM-based compilers (Kotlin, Scala) blow the default 10s CPU cap
+      # on cold start. Piston enforces wall-clock AND aggregate CPU time.
+      - PISTON_COMPILE_TIMEOUT=60000
+      - PISTON_COMPILE_CPU_TIME=60000
+    volumes:
+      # Installed runtimes live here — survives redeploys, so the installer
+      # below is a no-op on every boot after the first.
+      - piston_data:/piston/packages
+    tmpfs:
+      # Job scratch space. MUST be exec — compiled binaries run from here.
+      - /piston/jobs:exec
+    # No `ports:` — the sandbox is reachable only inside dokploy-network.
+    # Never expose 2000 publicly: it is an unauthenticated code-exec endpoint.
+    networks:
+      - dokploy-network
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:2000/api/v2/runtimes',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # One-shot runtime installer. Runs on every deploy; ppman skips versions
+  # already present in the piston_data volume, so re-runs are cheap.
+  # Versions here must match LANGUAGE_CONFIG in
+  #   app/services/code_execution_service.py
+  piston-init:
+    image: curlimages/curl:latest
+    container_name: piston-init
+    depends_on:
+      piston:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - dokploy-network
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        API=http://piston:2000/api/v2
+        install() {
+          echo ">> installing $$1=$$2"
+          # 200 = newly installed, 400 = "already installed". Both are fine.
+          code=$$(curl -sS -o /dev/null -w "%{http_code}" -X POST "$$API/packages" \
+              -H "content-type: application/json" \
+              -d "{\"language\":\"$$1\",\"version\":\"$$2\"}")
+          if [ "$$code" = "200" ] || [ "$$code" = "400" ]; then
+            echo "   ok ($$code)"
+          else
+            echo "   ⚠ unexpected HTTP $$code"
+          fi
+        }
+        # Core set (~4 GB). Add more from install-piston-runtimes.sh as needed —
+        # each extra runtime costs 100-500 MB of disk on the Dokploy host.
+        install python 3.10.0
+        install node 18.15.0
+        install typescript 5.0.3
+        install java 15.0.2
+        install gcc 10.2.0
+        install dotnet 5.0.201
+        install go 1.16.2
+        install rust 1.68.2
+        install ruby 3.0.1
+        install php 8.2.3
+        install kotlin 1.8.20
+        install bash 5.2.0
+        echo "✅ piston-init done"
+
+volumes:
+  piston_data:
+
+networks:
+  dokploy-network:
+    external: true

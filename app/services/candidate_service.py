@@ -5,7 +5,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.candidate import Candidate, CandidateStatus
+from app.models.candidate import Candidate, CandidateStatus, EmailLog
 from app.models.job import Job
 from app.schemas.candidate import CandidateCreate, CandidateUpdate
 
@@ -371,6 +371,15 @@ def delete_candidate(db: Session, candidate_id: int) -> bool:
 
     # Clean up associated files before deleting the DB record
     _cleanup_candidate_files(db, candidate)
+
+    # Clear email logs explicitly. Their FK gained ON DELETE CASCADE only in
+    # migration j4k5l6m7n8o9; on a database that has not reached it yet the
+    # constraint is still NO ACTION and the DELETE below would fail with a
+    # ForeignKeyViolation for any candidate who was ever emailed. Every other
+    # child row is removed by the database's own cascade.
+    db.query(EmailLog).filter(EmailLog.candidate_id == candidate_id).delete(
+        synchronize_session=False
+    )
 
     db.delete(candidate)
     db.commit()

@@ -156,6 +156,79 @@ def create_foreign_key_if_missing(
     return True
 
 
+# PostgreSQL pg_constraint.confdeltype codes.
+_PG_DELETE_RULES = {
+    "a": "NO ACTION",
+    "r": "RESTRICT",
+    "c": "CASCADE",
+    "n": "SET NULL",
+    "d": "SET DEFAULT",
+}
+
+
+def set_fk_ondelete(table: str, column: str, referent_table: str, ondelete: str) -> bool:
+    """Rewrite an existing single-column foreign key's ON DELETE rule in place.
+
+    A database built by ``create_all()`` *before* the model gained
+    ``ondelete=`` carries a NO ACTION constraint that no later ``CREATE TABLE
+    IF NOT EXISTS`` can repair — deleting the parent row then fails with a
+    ForeignKeyViolation. This drops and re-adds the constraint under its
+    original name, preserving the referenced columns.
+
+    Idempotent: a no-op when the rule already matches, when the constraint or
+    table is absent, or on non-PostgreSQL dialects (the test suite builds its
+    schema from the models, which already carry the right rule).
+
+    Returns True if a constraint was rewritten.
+    """
+    bind = op.get_bind()
+    if bind.dialect.name != "postgresql":
+        return False
+
+    want = ondelete.strip().upper()
+    code = next((k for k, v in _PG_DELETE_RULES.items() if v == want), None)
+    if code is None:
+        raise ValueError(f"unsupported ON DELETE action: {ondelete!r}")
+
+    rows = bind.execute(
+        sa.text(
+            """
+            SELECT c.conname,
+                   (SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY k.ord)
+                      FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                      JOIN pg_attribute a
+                        ON a.attrelid = c.conrelid AND a.attnum = k.attnum) AS local_cols,
+                   (SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY k.ord)
+                      FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+                      JOIN pg_attribute a
+                        ON a.attrelid = c.confrelid AND a.attnum = k.attnum) AS remote_cols
+              FROM pg_constraint c
+              JOIN pg_class child ON child.oid = c.conrelid
+              JOIN pg_class parent ON parent.oid = c.confrelid
+              JOIN pg_attribute src
+                ON src.attrelid = c.conrelid AND src.attnum = c.conkey[1]
+             WHERE c.contype = 'f'
+               AND child.relname = :table
+               AND parent.relname = :referent
+               AND src.attname = :column
+               AND array_length(c.conkey, 1) = 1
+               AND c.confdeltype <> :code
+               AND pg_catalog.pg_table_is_visible(child.oid)
+            """
+        ),
+        {"table": table, "referent": referent_table, "column": column, "code": code},
+    ).fetchall()
+
+    for name, local_cols, remote_cols in rows:
+        op.execute(f'ALTER TABLE "{table}" DROP CONSTRAINT "{name}"')
+        op.execute(
+            f'ALTER TABLE "{table}" ADD CONSTRAINT "{name}" '
+            f'FOREIGN KEY ({local_cols}) REFERENCES "{referent_table}" ({remote_cols}) '
+            f"ON DELETE {want}"
+        )
+    return bool(rows)
+
+
 def _zero_value_for(sa_type):
     """A benign non-NULL value for a column type we must fill in."""
     if isinstance(sa_type, sa.Boolean):

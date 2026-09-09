@@ -40,7 +40,11 @@ google-api-python-client>=2.130.0
 
 # ── Rate Limiting ───────────────────────────────────────────────────────────
 slowapi>=0.1.9
-opencv-python-headless>=4.8.0
+# Pinned below 5.0: OpenCV 5 removed CascadeClassifier and stopped shipping the
+# haarcascade XMLs (cv2/data is now empty), which silently disabled server-side
+# proctoring face detection with "module 'cv2' has no attribute
+# 'CascadeClassifier'" on every screenshot.
+opencv-python-headless>=4.8.0,<5
 
 # ── Video Conversion (bundled ffmpeg binary for WebM→MP4) ──────────────────
 imageio-ffmpeg>=0.5.1

@@ -20,6 +20,7 @@ from app.models.secondary_cam import (
     SecondaryCamSession,
     SecondaryCamSnapshot,
 )
+from app.utils.face_detection import detect_faces
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +294,7 @@ async def verify_frame(
 
     person_detected = False
     screen_detected = False
+    face_detection_ran = False
 
     try:
         import cv2
@@ -303,12 +305,13 @@ async def verify_frame(
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
 
-        # 1. Face detection using Haar Cascade
-        face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
-        person_detected = len(faces) > 0
+        # 1. Face detection using the shared Haar cascade. Returns None when the
+        # installed OpenCV can't provide one (OpenCV 5 dropped CascadeClassifier)
+        # — the brightness fallback below then keeps pairing usable.
+        faces = detect_faces(gray, min_neighbors=4, min_size=(40, 40))
+        if faces is not None:
+            face_detection_ran = True
+            person_detected = len(faces) > 0
 
         # 2. Screen/laptop detection — look for bright rectangular regions
         # A laptop screen appears as a bright, roughly rectangular area
@@ -327,20 +330,24 @@ async def verify_frame(
                     break
 
     except ImportError:
-        # OpenCV not available — do basic brightness check
+        pass  # OpenCV not installed — handled by the brightness fallback below
+    except Exception as e:
+        logger.warning("Frame verification error: %s", e)
+
+    if not face_detection_ran:
+        # No usable face detector (OpenCV missing, or a build without the Haar
+        # cascade) — fall back to a basic brightness check so the phone can still
+        # be paired. Screen detection may already have succeeded above.
         try:
             from PIL import Image
             import io
-            img = Image.open(io.BytesIO(contents))
-            pixels = np.array(img)
-            avg_brightness = pixels.mean()
+            pil_img = Image.open(io.BytesIO(contents))
+            avg_brightness = np.array(pil_img).mean()
             # If avg brightness > 80, something is in frame (not blank/black)
-            person_detected = avg_brightness > 60
-            screen_detected = avg_brightness > 80
+            person_detected = person_detected or avg_brightness > 60
+            screen_detected = screen_detected or avg_brightness > 80
         except Exception:
             pass
-    except Exception as e:
-        logger.warning("Frame verification error: %s", e)
 
     # Update heartbeat while we're at it
     cam_session.last_heartbeat = datetime.utcnow()

@@ -3,7 +3,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.models.candidate import Candidate
+from app.models.candidate import Candidate, EmailLog
 from app.models.job import Job  # noqa: F401 - registers job tables for metadata
 from app.models.organization import Organization  # noqa: F401 - registers org table
 from app.models.resume_metadata import ResumeMetadata  # noqa: F401 - registers FK table
@@ -76,3 +76,24 @@ def test_update_candidate_allows_same_email_in_different_job(db_session):
 
     assert updated is not None
     assert updated.email == "taken@example.com"
+
+
+def test_delete_candidate_removes_email_logs(db_session):
+    """A candidate who had ever been emailed used to be undeletable: the
+    email_logs FK carried no ON DELETE rule, so the DELETE raised
+    ForeignKeyViolation on Postgres."""
+    candidate = _add_candidate(db_session, "Emailed", "emailed@example.com", 1)
+    db_session.add(EmailLog(candidate_id=candidate.id, subject="Interview scheduled"))
+    db_session.commit()
+    candidate_id = candidate.id
+
+    assert candidate_service.delete_candidate(db_session, candidate_id) is True
+    assert db_session.query(Candidate).filter_by(id=candidate_id).count() == 0
+    assert db_session.query(EmailLog).filter_by(candidate_id=candidate_id).count() == 0
+
+
+def test_email_log_fk_declares_cascade():
+    """The database-level half of the fix: without ondelete on the model,
+    create_all() rebuilds the constraint that made candidates undeletable."""
+    fk = next(iter(EmailLog.__table__.c.candidate_id.foreign_keys))
+    assert fk.ondelete == "CASCADE"

@@ -2348,42 +2348,11 @@ _rec_logger = logging.getLogger("app.recording")
 _proctor_logger = logging.getLogger("app.proctor")
 
 
-# Cached OpenCV Haar-cascade face classifier (ships with opencv — no model
-# download). Built lazily on first use so it doesn't slow cold starts.
-_face_cascade = None
-
-
-def count_faces_in_image(path: str):
-    """Count faces in a screenshot using OpenCV's Haar cascade. Returns an int,
-    or None if detection couldn't run (so the caller can fall back to 'unknown').
-
-    This replaces the old in-browser MediaPipe face detector, which loaded ~300
-    MB of WASM + model INTO the candidate's tab and was the primary driver of
-    the 'Aw, Snap! STATUS_BREAKPOINT' out-of-memory crash. Running detection
-    server-side keeps the candidate's tab light while preserving the proctoring
-    signal (face count per screenshot)."""
-    global _face_cascade
-    try:
-        import cv2
-        if _face_cascade is None:
-            _face_cascade = cv2.CascadeClassifier(
-                cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-            )
-        if _face_cascade is None or _face_cascade.empty():
-            return None
-        img = cv2.imread(path)
-        if img is None:
-            return None
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # minNeighbors=6 / minSize=60 keep false positives low (a stricter pass
-        # than defaults) so background objects aren't miscounted as faces.
-        faces = _face_cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=6, minSize=(60, 60)
-        )
-        return int(len(faces))
-    except Exception as exc:
-        logging.warning(f"[Proctor] server-side face detection failed: {exc}")
-        return None
+# Server-side face detection lives in app.utils.face_detection so this router
+# and the secondary-camera router share one cached classifier — and one
+# warning when the installed OpenCV cannot provide one, instead of a failure
+# logged per screenshot.
+from app.utils.face_detection import count_faces_in_image  # noqa: E402
 
 
 def _candidate_label(db: Session, session: InterviewSession) -> str:

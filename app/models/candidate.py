@@ -93,7 +93,12 @@ class EmailLog(Base):
     __tablename__ = "email_logs"
 
     id = Column(Integer, primary_key=True, index=True)
-    candidate_id = Column(Integer, ForeignKey("candidates.id"), nullable=False, index=True)
+    # ON DELETE CASCADE: an email log is meaningless once its candidate is gone,
+    # and without it every DELETE /candidates/{id} for a candidate who was ever
+    # emailed fails with a ForeignKeyViolation.
+    candidate_id = Column(
+        Integer, ForeignKey("candidates.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     subject = Column(String(500), nullable=False)
     triggered_by = Column(String(100), nullable=True, default="SYSTEM")  # "SYSTEM" | user email
     trigger_event = Column(String(100), nullable=True)  # "schedule" | "reschedule" | "cancel" | "candidate-end" | "drop" | "complete"
