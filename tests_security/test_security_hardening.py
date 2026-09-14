@@ -335,3 +335,62 @@ def test_late_upload_rescues_a_missing_recording_but_never_replaces_one(client, 
     assert replaced.status_code == 409, replaced.text
     with open(path, "rb") as fh:
         assert fh.read().startswith(b"rescued-")
+
+
+# Kept last: claiming moves EVERY org-less row, including any an earlier test left behind.
+def test_super_admin_can_claim_unassigned_data_for_an_organization(client, world):
+    from app.auth import hash_password
+    from app.models import Job, ResumeMetadata, User, UserRole
+    from app.models.job import JobStatus
+
+    db = SessionLocal()
+    try:
+        def account(email):
+            return User(name=email.split("@")[0], email=email, password_hash=hash_password("correct-horse-battery"),
+                        role=UserRole.admin, organization_id=None, is_active=True, is_email_verified=True)
+
+        orphan_job = Job(title="Orphan Job", department="Ops", location="Remote", job_type="Full-time",
+                         status=JobStatus.open, organization_id=None)
+        late, outsider = account("late@orga.test"), account("outsider@elsewhere.test")
+        db.add_all([
+            orphan_job, late, outsider,
+            ResumeMetadata(organization_id=world.org_a, candidate_email="dup@mailbox.co", parsing_status="completed"),
+            ResumeMetadata(organization_id=None, candidate_email="dup@mailbox.co", parsing_status="completed"),
+            ResumeMetadata(organization_id=None, candidate_email="twin@mailbox.co", parsing_status="completed"),
+            ResumeMetadata(organization_id=None, candidate_email="twin@mailbox.co", parsing_status="completed"),
+        ])
+        db.commit()
+        job_ref, late_id, outsider_id = encode_ref("job", orphan_job.id), late.id, outsider.id
+    finally:
+        db.close()
+
+    org_a_ref = encode_ref("org", world.org_a)
+    claim = f"/organizations/{org_a_ref}/claim-unassigned"
+    assert client.post(claim, json={}, headers=world.admin_a).status_code == 403
+    assert client.post(f"/organizations/{encode_ref('org', world.org_off)}/claim-unassigned",
+                       json={}, headers=world.root).status_code == 422
+    assert client.post(claim, json={"user_ids": [outsider_id]}, headers=world.root).status_code == 422
+
+    preview = client.get(f"/organizations/{org_a_ref}/unassigned", headers=world.root)
+    assert preview.status_code == 200, preview.text
+    listed = {u["id"] for u in preview.json()["users"]}
+    assert late_id in listed and outsider_id not in listed
+    assert preview.json()["data"]["jobs"] >= 1
+
+    assert client.get(f"/jobs/{job_ref}", headers=world.admin_a).status_code in (403, 404)
+
+    r = client.post(claim, json={"user_ids": [late_id]}, headers=world.root)
+    assert r.status_code == 200, r.text
+    assert r.json()["users"] == 1 and r.json()["jobs"] >= 1
+
+    assert client.get(f"/jobs/{job_ref}", headers=world.admin_a).status_code == 200
+    assert client.get("/organizations/unassigned/summary", headers=world.root).json()["jobs"] == 0
+    db = SessionLocal()
+    try:
+        assert db.get(User, late_id).organization_id == world.org_a
+        assert db.get(User, outsider_id).organization_id is None
+        emails_in_a = [e for (e,) in db.query(ResumeMetadata.candidate_email)
+                       .filter(ResumeMetadata.organization_id == world.org_a).all()]
+        assert emails_in_a.count("dup@mailbox.co") == 1 and emails_in_a.count("twin@mailbox.co") == 1
+    finally:
+        db.close()

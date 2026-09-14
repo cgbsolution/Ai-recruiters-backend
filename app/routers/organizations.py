@@ -8,7 +8,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -19,6 +19,8 @@ from app.models.user import User, UserRole
 from app.models.job import Job
 from app.models.candidate import Candidate
 from app.models.ai_credit_usage import AiCreditUsage
+from app.models.question import Question
+from app.models.resume_metadata import ResumeMetadata
 from app.refs import OrgId, encode_ref
 
 logger = logging.getLogger(__name__)
@@ -442,6 +444,154 @@ def reset_usage_counters(org_id: OrgId, db: Session = Depends(get_db)):
 
     logger.info("Usage counters reset for org %s (id=%d)", org.name, org.id)
     return {"message": f"Usage counters reset for '{org.name}'"}
+
+
+# ── Unassigned Data ──────────────────────────────────────────────────────────
+#
+# A super admin with no organization stores everything it creates (jobs,
+# questions, resumes) with organization_id NULL. Only a global super admin can
+# see such rows, so the admins of the tenant that really owns them get an empty
+# dashboard. These endpoints move that data, and the tenant's users, into an
+# organization.
+
+class ClaimUnassignedRequest(BaseModel):
+    # Users to link to the organization; each must be on the organization's
+    # email domain (see _domain_users_outside).
+    user_ids: list[int] = []
+
+
+def _unassigned_counts(db: Session) -> dict:
+    return {
+        "jobs": db.query(func.count(Job.id)).filter(Job.organization_id.is_(None)).scalar() or 0,
+        "candidates": (
+            db.query(func.count(Candidate.id))
+            .join(Job, Candidate.job_id == Job.id)
+            .filter(Job.organization_id.is_(None))
+            .filter(~Candidate.email.like("pending_%@resume.local"))
+            .scalar() or 0
+        ),
+        "questions": db.query(func.count(Question.id)).filter(Question.organization_id.is_(None)).scalar() or 0,
+        "resumes": db.query(func.count(ResumeMetadata.id)).filter(ResumeMetadata.organization_id.is_(None)).scalar() or 0,
+        "ai_credit_usage": db.query(func.count(AiCreditUsage.id)).filter(AiCreditUsage.organization_id.is_(None)).scalar() or 0,
+    }
+
+
+def _domain_users_outside(db: Session, org: Organization) -> list[User]:
+    """Users whose email is on the organization's domain but who are not in it."""
+    domain = (org.domain or "").strip().lower()
+    if not domain:
+        return []
+    candidates = db.query(User).filter(
+        (User.organization_id.is_(None)) | (User.organization_id != org.id)
+    ).all()
+    return [u for u in candidates if u.email.lower().endswith("@" + domain)]
+
+
+@router.get("/unassigned/summary")
+def unassigned_summary(db: Session = Depends(get_db)):
+    """Counts of data that belongs to no organization."""
+    return _unassigned_counts(db)
+
+
+@router.get("/{org_id}/unassigned")
+def unassigned_preview(org_id: OrgId, db: Session = Depends(get_db)):
+    """What claiming the unassigned data for this organization would move."""
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    users = _domain_users_outside(db, org)
+    org_names = {
+        o.id: o.name
+        for o in db.query(Organization).filter(
+            Organization.id.in_({u.organization_id for u in users if u.organization_id})
+        ).all()
+    } if users else {}
+
+    return {
+        "data": _unassigned_counts(db),
+        "users": [
+            {
+                "id": u.id,
+                "name": u.name,
+                "email": u.email,
+                "role": u.role.value,
+                "organization_name": org_names.get(u.organization_id),
+            }
+            for u in users
+        ],
+    }
+
+
+@router.post("/{org_id}/claim-unassigned")
+def claim_unassigned(
+    org_id: OrgId,
+    body: ClaimUnassignedRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.super_admin)),
+):
+    """Move every row with no organization into this organization, and link the
+    selected users on its domain."""
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if not org.is_active:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Organization '{org.name}' is inactive. Activate it before assigning data to it.",
+        )
+
+    eligible = {u.id: u for u in _domain_users_outside(db, org)}
+    not_eligible = [uid for uid in body.user_ids if uid not in eligible]
+    if not_eligible:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Only users with an @{org.domain} email who are not already in '{org.name}' can be linked.",
+        )
+
+    moved = {}
+    for key, model in (("jobs", Job), ("questions", Question), ("ai_credit_usage", AiCreditUsage)):
+        moved[key] = (
+            db.query(model)
+            .filter(model.organization_id.is_(None))
+            .update({model.organization_id: org.id}, synchronize_session=False)
+        )
+
+    # Resumes are unique per (email, organization): skip an email the
+    # organization already has, and move only one row per email.
+    already_in_org = select(ResumeMetadata.candidate_email).where(ResumeMetadata.organization_id == org.id)
+    one_per_email = (
+        select(func.min(ResumeMetadata.id))
+        .where(
+            ResumeMetadata.organization_id.is_(None),
+            ResumeMetadata.candidate_email.not_in(already_in_org),
+        )
+        .group_by(ResumeMetadata.candidate_email)
+    )
+    moved["resumes"] = (
+        db.query(ResumeMetadata)
+        .filter(ResumeMetadata.id.in_(one_per_email))
+        .update({ResumeMetadata.organization_id: org.id}, synchronize_session=False)
+    )
+    moved["resumes_skipped"] = (
+        db.query(func.count(ResumeMetadata.id)).filter(ResumeMetadata.organization_id.is_(None)).scalar() or 0
+    )
+
+    for uid in body.user_ids:
+        eligible[uid].organization_id = org.id
+        eligible[uid].updated_at = datetime.utcnow()
+    moved["users"] = len(body.user_ids)
+
+    # Keep the lifetime job counter in step with the jobs the org now owns.
+    org.total_jobs_used = (org.total_jobs_used or 0) + moved["jobs"]
+    org.updated_at = datetime.utcnow()
+    db.commit()
+
+    logger.info(
+        "Unassigned data claimed for %s (id=%d) by %s: %s",
+        org.name, org.id, current_user.email, moved,
+    )
+    return moved
 
 
 # ── Dashboard Stats ──────────────────────────────────────────────────────────
