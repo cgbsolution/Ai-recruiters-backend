@@ -122,6 +122,36 @@ def test_organization_with_users_cannot_be_deleted(client, world):
         db.close()
 
 
+def test_super_admin_can_link_an_orgless_user_to_an_organization(client, world):
+    from app.models import User, UserRole
+    from app.auth import hash_password
+
+    db = SessionLocal()
+    try:
+        stray = User(name="stray", email="stray@strayco.com", password_hash=hash_password("correct-horse-battery"),
+                     role=UserRole.admin, organization_id=None, is_active=True, is_email_verified=True)
+        db.add(stray)
+        db.commit()
+        stray_id = stray.id
+    finally:
+        db.close()
+
+    login = {"email": "stray@strayco.com", "password": "correct-horse-battery"}
+    assert client.post("/auth/login", json=login).status_code == 403
+
+    org_a_ref = encode_ref("org", world.org_a)
+    # An admin cannot move users between organizations, and an inactive org is refused
+    assert client.patch(f"/auth/users/{stray_id}", json={"organization_id": org_a_ref},
+                        headers=world.admin_a).status_code == 403
+    assert client.patch(f"/auth/users/{stray_id}", json={"organization_id": world.org_off},
+                        headers=world.root).status_code == 422
+
+    r = client.patch(f"/auth/users/{stray_id}", json={"organization_id": org_a_ref}, headers=world.root)
+    assert r.status_code == 200, r.text
+    assert r.json()["organization_id"] == world.org_a
+    assert client.post("/auth/login", json=login).status_code == 200
+
+
 # ── Private media ────────────────────────────────────────────────────────────
 
 def test_public_upload_and_recording_routes_are_gone(client, world):

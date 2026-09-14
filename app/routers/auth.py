@@ -100,6 +100,9 @@ class UpdateUserRequest(BaseModel):
     name: str | None = None
     role: UserRole | None = None
     is_active: bool | None = None
+    # Super admins only: link the user to an organization (ref or id). This is
+    # how accounts left with organization_id NULL are given access again.
+    organization_id: Optional[OrgId] = None
 
 
 # ── Sign Up ──────────────────────────────────────────────────────────────────
@@ -660,12 +663,28 @@ def update_user(
     if body.role == UserRole.super_admin and current_user.role != UserRole.super_admin:
         raise HTTPException(status_code=403, detail="Admins cannot assign super admin role")
 
+    # Only a super admin moves users between organizations; an admin must not be
+    # able to pull users into, or push them out of, their own tenant.
+    new_org = None
+    if body.organization_id is not None:
+        if current_user.role != UserRole.super_admin:
+            raise HTTPException(status_code=403, detail="Only super admins can change a user's organization")
+        new_org = db.query(Organization).filter(Organization.id == body.organization_id).first()
+        if not new_org:
+            raise HTTPException(status_code=422, detail="Organization not found")
+        if not new_org.is_active:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Organization '{new_org.name}' is inactive. Activate it before adding users to it.",
+            )
+
     # An admin/recruiter needs an organization: demoting an org-less super
     # admin would create a tenant user with organization_id NULL.
-    if body.role is not None and body.role != UserRole.super_admin and target.organization_id is None:
+    org_id_after = new_org.id if new_org else target.organization_id
+    if body.role is not None and body.role != UserRole.super_admin and org_id_after is None:
         raise HTTPException(
             status_code=422,
-            detail="This user has no organization, so they can only be a super admin. Create the user inside an organization instead.",
+            detail="This user has no organization. Link them to an organization first, then change the role.",
         )
 
     if body.name is not None:
@@ -674,6 +693,13 @@ def update_user(
         target.role = body.role
     if body.is_active is not None:
         target.is_active = body.is_active
+    if new_org is not None:
+        if target.organization_id != new_org.id:
+            logger.info(
+                "User %s linked to organization %s (id=%d) by %s",
+                target.email, new_org.name, new_org.id, current_user.email,
+            )
+        target.organization_id = new_org.id
 
     target.updated_at = datetime.utcnow()
     db.commit()
