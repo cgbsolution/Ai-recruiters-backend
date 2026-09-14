@@ -5,7 +5,7 @@ Super Admin only.
 import os
 import logging
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import require_roles
 from app.database import get_db
+from app.media import UPLOAD_ROOT, sign_media_url
 from app.models.user import UserRole
 
 logger = logging.getLogger(__name__)
@@ -21,8 +22,7 @@ router = APIRouter(
     dependencies=[Depends(require_roles(UserRole.super_admin))],
 )
 
-_IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
-_UPLOAD_ROOT = "/tmp/uploads" if _IS_SERVERLESS else "uploads"
+_UPLOAD_ROOT = UPLOAD_ROOT  # app.media is the single source of truth
 
 ALLOWED_FOLDERS = {"jd", "photos", "recordings", "resumes", "screenshots"}
 
@@ -35,6 +35,9 @@ class FileInfo(BaseModel):
     size: int  # bytes
     modified: str  # ISO timestamp
     is_dir: bool
+    # Signed /media URL for viewing; None for files that are never served
+    # (e.g. jd, recording temp/sidecar files)
+    url: Optional[str] = None
 
 
 class FileListResponse(BaseModel):
@@ -62,12 +65,23 @@ def _validate_folder(folder: str) -> str:
     return dir_path
 
 
-def _safe_filename(filename: str) -> str:
-    """Prevent path traversal by stripping directory components."""
-    base = os.path.basename(filename)
-    if not base or base in (".", ".."):
-        raise HTTPException(status_code=400, detail="Invalid filename")
-    return base
+def _resolve_in_folder(dir_path: str, name: str) -> Optional[str]:
+    """Absolute path for a folder-relative name ("file.pdf", or for screenshots
+    "{session_id}/file.jpg"), or None unless it resolves strictly inside the
+    folder. Absolute paths, drive letters, empty parts and '..' are refused."""
+    if not name or "\x00" in name:
+        return None
+    parts = name.replace("\\", "/").split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return None
+    root = os.path.realpath(dir_path)
+    full = os.path.realpath(os.path.join(root, *parts))
+    try:
+        if full == root or os.path.commonpath([root, full]) != root:
+            return None
+    except ValueError:  # different drives on Windows
+        return None
+    return full
 
 
 def _collect_files(dir_path: str, folder: str) -> List[FileInfo]:
@@ -101,74 +115,9 @@ def _collect_files(dir_path: str, folder: str) -> List[FileInfo]:
 
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
-@router.get("/files/{folder}", response_model=FileListResponse)
-def list_files(folder: str, page: int = 1, page_size: int = 50):
-    """List files in a given upload folder with pagination."""
-    dir_path = _validate_folder(folder)
-    all_files = _collect_files(dir_path, folder)
-    total = len(all_files)
-
-    start = (page - 1) * page_size
-    end = start + page_size
-    page_files = all_files[start:end]
-
-    return FileListResponse(
-        folder=folder,
-        files=page_files,
-        total=total,
-        page=page,
-        page_size=page_size,
-        has_more=end < total,
-    )
-
-
-@router.delete("/files/{folder}/{filename}")
-def delete_file(folder: str, filename: str):
-    """Delete a single file from an upload folder."""
-    dir_path = _validate_folder(folder)
-    safe_name = _safe_filename(filename)
-    file_path = os.path.join(dir_path, safe_name)
-
-    if not os.path.isfile(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    os.remove(file_path)
-    logger.info("File deleted: %s/%s", folder, safe_name)
-    return {"deleted": safe_name}
-
-
-@router.post("/files/bulk-delete")
-def bulk_delete_files(body: BulkDeleteRequest):
-    """Delete multiple files from an upload folder."""
-    dir_path = _validate_folder(body.folder)
-    deleted = []
-    not_found = []
-
-    for filename in body.filenames:
-        safe_name = _safe_filename(filename)
-        file_path = os.path.join(dir_path, safe_name)
-
-        # Also check subdirectories (for screenshots/{session_id}/file.jpg)
-        if not os.path.isfile(file_path):
-            # Try to find by matching the full relative path
-            full_check = os.path.join(_UPLOAD_ROOT, body.folder, filename.replace("/", os.sep))
-            if os.path.isfile(full_check):
-                file_path = full_check
-            else:
-                not_found.append(filename)
-                continue
-
-        try:
-            os.remove(file_path)
-            deleted.append(filename)
-        except OSError as e:
-            logger.warning("Failed to delete %s: %s", file_path, e)
-            not_found.append(filename)
-
-    logger.info("Bulk delete in %s: %d deleted, %d not found", body.folder, len(deleted), len(not_found))
-    return {"deleted": deleted, "not_found": not_found, "deleted_count": len(deleted)}
-
-
+# Declared BEFORE /files/{folder}: routes match in order, so with the dynamic
+# route first every call to /files/stats was answered by list_files as
+# "Invalid folder: stats" (400) and this endpoint was unreachable.
 @router.get("/files/stats")
 def folder_stats():
     """Return file count and total size for each upload folder."""
@@ -192,3 +141,70 @@ def folder_stats():
         stats.append({"folder": folder, "file_count": file_count, "total_size": total_size})
 
     return stats
+
+
+@router.get("/files/{folder}", response_model=FileListResponse)
+def list_files(folder: str, page: int = 1, page_size: int = 50):
+    """List files in a given upload folder with pagination."""
+    dir_path = _validate_folder(folder)
+    all_files = _collect_files(dir_path, folder)
+    total = len(all_files)
+
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_files = all_files[start:end]
+    # Sign only the page being returned (router is super-admin only)
+    for f in page_files:
+        f.url = sign_media_url(f.path)
+
+    return FileListResponse(
+        folder=folder,
+        files=page_files,
+        total=total,
+        page=page,
+        page_size=page_size,
+        has_more=end < total,
+    )
+
+
+@router.delete("/files/{folder}/{filename:path}")
+def delete_file(folder: str, filename: str):
+    """Delete a single file from an upload folder."""
+    dir_path = _validate_folder(folder)
+    # Same resolver as bulk-delete, and `{filename:path}` so nested names match:
+    # basename-only handling meant deleting one screenshot ("{session_id}/x.jpg")
+    # always 404'd, while still being the place traversal had to be stopped.
+    file_path = _resolve_in_folder(dir_path, filename)
+    if not file_path or not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    os.remove(file_path)
+    logger.info("File deleted: %s/%s", folder, filename)
+    return {"deleted": filename}
+
+
+@router.post("/files/bulk-delete")
+def bulk_delete_files(body: BulkDeleteRequest):
+    """Delete multiple files from an upload folder."""
+    dir_path = _validate_folder(body.folder)
+    deleted = []
+    not_found = []
+
+    for filename in body.filenames:
+        # Names are relative to the folder ("file.pdf", or for screenshots
+        # "{session_id}/file.jpg") and must resolve inside it — the old
+        # fallback joined the raw name, so "../../app/main.py" escaped.
+        file_path = _resolve_in_folder(dir_path, filename)
+        if not file_path or not os.path.isfile(file_path):
+            not_found.append(filename)
+            continue
+
+        try:
+            os.remove(file_path)
+            deleted.append(filename)
+        except OSError as e:
+            logger.warning("Failed to delete %s: %s", file_path, e)
+            not_found.append(filename)
+
+    logger.info("Bulk delete in %s: %d deleted, %d not found", body.folder, len(deleted), len(not_found))
+    return {"deleted": deleted, "not_found": not_found, "deleted_count": len(deleted)}

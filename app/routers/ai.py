@@ -24,9 +24,19 @@ from app.schemas.ai import (
     SuggestQuestionsResponse,
 )
 from app.auth import get_current_user
+from app.media import UPLOAD_ROOT
 from app.services import ai_service
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(dependencies=[Depends(get_current_user)])
+
+
+def _ai_failure(action: str, exc: Exception) -> HTTPException:
+    """500 for a failed AI call. The provider/internal error text goes to the log
+    instead of the response body (it can carry SQL, paths or provider details)."""
+    logger.error("[AI] %s failed: %s: %s", action, type(exc).__name__, exc, exc_info=exc)
+    return HTTPException(status_code=500, detail=f"{action} failed. Please try again.")
 
 
 @router.post(
@@ -40,7 +50,7 @@ async def generate_jd(request: Request, payload: GenerateJDRequest):
     try:
         return await ai_service.generate_jd(payload)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI generation failed: {str(e)}")
+        raise _ai_failure("AI generation", e)
 
 
 ALLOWED_JD_EXTENSIONS = {".pdf", ".doc", ".docx"}
@@ -67,8 +77,7 @@ async def parse_jd_file(request: Request, file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"File exceeds {settings.MAX_UPLOAD_SIZE_MB}MB limit")
 
     # Save to temp location for text extraction
-    _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
-    upload_dir = "/tmp/uploads/jd" if _is_serverless else settings.UPLOAD_DIR
+    upload_dir = os.path.join(UPLOAD_ROOT, "jd")
     os.makedirs(upload_dir, exist_ok=True)
     filename = f"{uuid.uuid4()}{ext}"
     path = os.path.join(upload_dir, filename)
@@ -77,7 +86,13 @@ async def parse_jd_file(request: Request, file: UploadFile = File(...)):
         with open(path, "wb") as f:
             f.write(content)
 
-        jd_text = extract_text(path)
+        try:
+            jd_text = extract_text(path)
+        except RuntimeError as e:
+            # extract_text's RuntimeErrors describe the uploaded file itself
+            # (e.g. a scanned, image-only PDF) and are meant for the user.
+            logging.warning(f"[JD Parse] text extraction failed for file '{file.filename}': {e}")
+            raise HTTPException(status_code=500, detail=f"JD parsing failed: {e}")
         if not jd_text.strip():
             raise HTTPException(status_code=422, detail="Could not extract any text from the uploaded file")
 
@@ -86,7 +101,7 @@ async def parse_jd_file(request: Request, file: UploadFile = File(...)):
         raise
     except Exception as e:
         logging.error(f"[JD Parse] FAILED for file '{file.filename}': {type(e).__name__}: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"JD parsing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="JD parsing failed. Please try again.")
     finally:
         # Clean up temp file
         if os.path.exists(path):
@@ -104,7 +119,7 @@ async def generate_questions(request: Request, payload: GenerateQuestionsRequest
     try:
         return await ai_service.generate_questions(payload)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI generation failed: {str(e)}")
+        raise _ai_failure("AI generation", e)
 
 
 @router.post(
@@ -118,7 +133,7 @@ async def evaluate_answer(request: Request, payload: EvaluateCandidateRequest):
     try:
         return await ai_service.evaluate_answer(payload)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI evaluation failed: {str(e)}")
+        raise _ai_failure("AI evaluation", e)
 
 
 @router.post(
@@ -132,7 +147,7 @@ async def suggest_questions(request: Request, payload: SuggestQuestionsRequest):
     try:
         return await ai_service.suggest_questions(payload)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI suggestion failed: {str(e)}")
+        raise _ai_failure("AI suggestion", e)
 
 
 @router.post(
@@ -152,7 +167,7 @@ async def parse_resume(request: Request, payload: ParseResumeRequest):
     try:
         return await ai_service.parse_resume(payload)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Resume parsing failed: {str(e)}")
+        raise _ai_failure("Resume parsing", e)
 
 
 @router.post(
@@ -177,4 +192,4 @@ async def calculate_fit_score(request: Request, payload: FitScoreRequest):
     try:
         return await ai_service.calculate_fit_score(payload)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Fit score calculation failed: {str(e)}")
+        raise _ai_failure("Fit score calculation", e)

@@ -3,13 +3,20 @@ Authentication router — signup, login, me, change-password, email verification
 """
 import secrets
 import logging
+import threading
+import time
 from datetime import datetime, timedelta
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 
 from app.auth import (
+    ALGORITHM,
     create_access_token,
     get_current_user,
     get_org_id,
@@ -21,10 +28,16 @@ from app.config import settings
 from app.database import get_db
 from app.models.organization import Organization
 from app.models.user import User, UserRole
+from app.refs import OrgId
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Per-IP throttling of the unauthenticated credential endpoints (same slowapi
+# pattern as candidates.py). RateLimitExceeded is an HTTPException, so a hit
+# is answered with 429 and the error_message given on each route.
+limiter = Limiter(key_func=get_remote_address)
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -34,6 +47,12 @@ class SignUpRequest(BaseModel):
     email: EmailStr
     password: str
     role: UserRole = UserRole.recruiter
+
+
+class CreateUserRequest(SignUpRequest):
+    # Super admins only: the organization to create the user in (ref or id).
+    # When omitted, the organization is matched by the email's domain.
+    organization_id: Optional[OrgId] = None
 
 
 class SignInRequest(BaseModel):
@@ -86,7 +105,8 @@ class UpdateUserRequest(BaseModel):
 # ── Sign Up ──────────────────────────────────────────────────────────────────
 
 @router.post("/signup", response_model=TokenResponse, status_code=201)
-def signup(body: SignUpRequest, db: Session = Depends(get_db)):
+@limiter.limit("5/minute", error_message="Too many sign-up attempts. Please wait a minute and try again.")
+def signup(request: Request, body: SignUpRequest, db: Session = Depends(get_db)):
     """Register a new user. First user is auto-promoted to super_admin."""
     existing = db.query(User).filter(User.email == body.email.lower()).first()
     if existing:
@@ -176,7 +196,8 @@ def signup(body: SignUpRequest, db: Session = Depends(get_db)):
 # ── Sign In ──────────────────────────────────────────────────────────────────
 
 @router.post("/login", response_model=TokenResponse)
-def login(body: SignInRequest, db: Session = Depends(get_db)):
+@limiter.limit("10/minute", error_message="Too many login attempts. Please wait a minute and try again.")
+def login(request: Request, body: SignInRequest, db: Session = Depends(get_db)):
     """Authenticate and return a JWT token."""
     user = db.query(User).filter(User.email == body.email.lower()).first()
     if not user or not verify_password(body.password, user.password_hash):
@@ -188,17 +209,34 @@ def login(body: SignInRequest, db: Session = Depends(get_db)):
             detail="Your account is pending approval by your organization admin.",
         )
 
-    token = create_access_token(user.id, user.role.value, org_id=user.organization_id)
-    logger.info("User logged in: %s", user.email)
-
-    # Fetch org name if user belongs to one
-    org_name = None
+    org = None
     if user.organization_id:
         try:
             org = db.query(Organization).filter(Organization.id == user.organization_id).first()
-            org_name = org.name if org else None
         except Exception:
-            pass  # org columns may not exist yet — don't crash login
+            if user.role != UserRole.super_admin:
+                raise
+            # org columns may not exist yet — don't crash a super admin's login
+
+    # Tenant users need an ACTIVE organization, the same rule get_current_user
+    # applies to every request. Without this, users of a deleted or suspended
+    # organization were still issued a fresh token.
+    if user.role != UserRole.super_admin:
+        if org is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Your account is not assigned to an organization. Contact your administrator.",
+            )
+        if not org.is_active:
+            raise HTTPException(
+                status_code=403,
+                detail="Your organization's account is suspended. Contact support.",
+            )
+
+    token = create_access_token(user.id, user.role.value, org_id=user.organization_id)
+    logger.info("User logged in: %s", user.email)
+
+    org_name = org.name if org else None
 
     return TokenResponse(
         access_token=token,
@@ -371,7 +409,8 @@ def _send_password_reset_email(user: User, token: str) -> bool:
 
 
 @router.post("/forgot-password")
-def forgot_password(body: ForgotPasswordRequest, db: Session = Depends(get_db)):
+@limiter.limit("5/minute", error_message="Too many password reset requests. Please wait a minute and try again.")
+def forgot_password(request: Request, body: ForgotPasswordRequest, db: Session = Depends(get_db)):
     """Email a single-use password reset link.
 
     Always returns the same message. Reporting whether the address was found
@@ -471,9 +510,11 @@ def list_users(
     q = db.query(User)
 
     if user.role == UserRole.admin:
-        # Admins see only users in their own organization (recruiters + admins)
+        # Admins see only users in their own organization (recruiters + admins).
+        # get_org_id refuses an admin with no organization; filtering on
+        # organization_id == NULL used to list every org-less user.
         q = q.filter(
-            User.organization_id == user.organization_id,
+            User.organization_id == get_org_id(user),
             User.role.in_([UserRole.recruiter, UserRole.admin]),
         )
     # Super admin sees everyone
@@ -503,7 +544,7 @@ def list_users(
 
 @router.post("/users", response_model=UserOut, status_code=201)
 def create_user(
-    body: SignUpRequest,
+    body: CreateUserRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles(UserRole.super_admin, UserRole.admin)),
 ):
@@ -511,6 +552,9 @@ def create_user(
     existing = db.query(User).filter(User.email == body.email.lower()).first()
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
+
+    if len(body.password) < 6:
+        raise HTTPException(status_code=422, detail="Password must be at least 6 characters")
 
     # Admins cannot create super_admin users
     if current_user.role == UserRole.admin and body.role == UserRole.super_admin:
@@ -520,16 +564,50 @@ def create_user(
     if body.role == UserRole.super_admin and current_user.role != UserRole.super_admin:
         raise HTTPException(status_code=403, detail="Only super admins can create super admin users")
 
-    # Determine organization: admin creates in own org, super_admin can specify via email domain
-    org_id = None
+    # Determine organization. An admin or recruiter must always land in an
+    # existing, active organization: a NULL organization_id used to be read as
+    # "global" by every scoped query, so it is refused instead of defaulted.
+    email_domain = body.email.lower().split("@")[1]
+    org = None
     if current_user.role == UserRole.admin:
-        org_id = current_user.organization_id
+        # Admins create users only in their own organization, on its domain
+        admin_org_id = get_org_id(current_user)
+        if body.organization_id is not None and body.organization_id != admin_org_id:
+            raise HTTPException(status_code=403, detail="Admins can only create users in their own organization")
+        org = db.query(Organization).filter(Organization.id == admin_org_id).first()
+        if not org:
+            raise HTTPException(
+                status_code=403,
+                detail="Your account is not assigned to an organization. Contact your administrator.",
+            )
+        if email_domain != (org.domain or "").strip().lower():
+            raise HTTPException(
+                status_code=422,
+                detail=f"The email address must use your organization's domain ({org.domain}).",
+            )
     else:
-        # Super admin: match org by email domain
-        email_domain = body.email.lower().split("@")[1]
-        org = db.query(Organization).filter(Organization.domain == email_domain).first()
-        if org:
-            org_id = org.id
+        # Super admin: explicit organization, otherwise match by email domain
+        if body.organization_id is not None:
+            org = db.query(Organization).filter(Organization.id == body.organization_id).first()
+            if not org:
+                raise HTTPException(status_code=422, detail="Organization not found")
+        else:
+            org = db.query(Organization).filter(Organization.domain == email_domain).first()
+        if body.role != UserRole.super_admin:
+            if not org:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"No organization is registered for the domain '{email_domain}'. "
+                        "Create the organization first, or choose the organization explicitly."
+                    ),
+                )
+            if not org.is_active:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Organization '{org.name}' is inactive. Activate it before adding users to it.",
+                )
+    org_id = org.id if org else None
 
     new_user = User(
         name=body.name.strip(),
@@ -552,7 +630,7 @@ def create_user(
         "is_active": new_user.is_active,
         "is_email_verified": new_user.is_email_verified,
         "organization_id": new_user.organization_id,
-        "organization_name": org.name if org_id and current_user.role == UserRole.super_admin and org else None,
+        "organization_name": org.name if org else None,
         "created_at": new_user.created_at,
     }
 
@@ -569,17 +647,26 @@ def update_user(
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Admin can only modify users in their own organization
-    if current_user.role == UserRole.admin and target.organization_id != current_user.organization_id:
+    # Admin can only modify users in their own organization. get_org_id refuses
+    # an org-less admin (None != None used to let one manage every org-less user).
+    if current_user.role == UserRole.admin and target.organization_id != get_org_id(current_user):
         raise HTTPException(status_code=403, detail="Cannot modify users outside your organization")
 
     # Cannot modify a super_admin unless you are super_admin
     if target.role == UserRole.super_admin and current_user.role != UserRole.super_admin:
         raise HTTPException(status_code=403, detail="Cannot modify super admin users")
 
-    # Admins cannot promote to super_admin
-    if body.role and current_user.role == UserRole.admin and body.role == UserRole.super_admin:
+    # Only a super admin can grant the super admin role
+    if body.role == UserRole.super_admin and current_user.role != UserRole.super_admin:
         raise HTTPException(status_code=403, detail="Admins cannot assign super admin role")
+
+    # An admin/recruiter needs an organization: demoting an org-less super
+    # admin would create a tenant user with organization_id NULL.
+    if body.role is not None and body.role != UserRole.super_admin and target.organization_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="This user has no organization, so they can only be a super admin. Create the user inside an organization instead.",
+        )
 
     if body.name is not None:
         target.name = body.name.strip()
@@ -610,8 +697,8 @@ def delete_user(
     if target.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot delete your own account")
 
-    # Admin can only delete users in their own organization
-    if current_user.role == UserRole.admin and target.organization_id != current_user.organization_id:
+    # Admin can only delete users in their own organization (see update_user)
+    if current_user.role == UserRole.admin and target.organization_id != get_org_id(current_user):
         raise HTTPException(status_code=403, detail="Cannot delete users outside your organization")
 
     # Cannot delete a super_admin unless you are super_admin
@@ -626,6 +713,55 @@ def delete_user(
 
 # ── Google OAuth2 (Connect / Callback / Disconnect) ─────────────────────────
 
+# The OAuth `state` is a dedicated token, NOT the user's 24h access JWT (which
+# then sat in Google/redirect URLs and logs and worked as an API credential).
+# It has no `sub` claim, so get_current_user never accepts it; it expires after
+# 10 minutes and its nonce is single-use within this process.
+GOOGLE_OAUTH_STATE_TYP = "google_oauth_state"
+GOOGLE_OAUTH_STATE_TTL = timedelta(minutes=10)
+_used_google_state_nonces: dict = {}  # nonce -> expiry (unix seconds)
+_google_state_lock = threading.Lock()
+
+
+def _create_google_oauth_state(user_id: int) -> str:
+    now = datetime.utcnow()
+    return jwt.encode(
+        {
+            "typ": GOOGLE_OAUTH_STATE_TYP,
+            "uid": str(user_id),
+            "nonce": secrets.token_urlsafe(16),
+            "iat": now,
+            "exp": now + GOOGLE_OAUTH_STATE_TTL,
+        },
+        settings.SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+
+def _consume_google_oauth_state(state: str) -> int:
+    """User id from a valid, unexpired, not-yet-used OAuth state; 400 otherwise."""
+    invalid = HTTPException(status_code=400, detail="Invalid or expired state token")
+    try:
+        payload = jwt.decode(state, settings.SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = int(payload["uid"])
+        nonce = str(payload["nonce"])
+        expires = float(payload["exp"])
+    except (JWTError, KeyError, TypeError, ValueError):
+        raise invalid
+    if payload.get("typ") != GOOGLE_OAUTH_STATE_TYP:
+        raise invalid
+
+    with _google_state_lock:
+        now = time.time()
+        for used, used_until in list(_used_google_state_nonces.items()):
+            if used_until < now:
+                del _used_google_state_nonces[used]
+        if nonce in _used_google_state_nonces:
+            raise invalid
+        _used_google_state_nonces[nonce] = expires
+    return user_id
+
+
 @router.get("/google/connect")
 def google_connect(user: User = Depends(get_current_user)):
     """
@@ -637,8 +773,8 @@ def google_connect(user: User = Depends(get_current_user)):
 
     from app.services.google_calendar_service import build_oauth_url
 
-    # Use a short-lived JWT as the state parameter (CSRF protection)
-    state_token = create_access_token(user.id, user.role.value, org_id=user.organization_id)
+    # Dedicated short-lived state token (see _create_google_oauth_state)
+    state_token = _create_google_oauth_state(user.id)
     auth_url = build_oauth_url(state=state_token)
 
     return {"url": auth_url}
@@ -651,17 +787,12 @@ def google_callback(code: str, state: str, db: Session = Depends(get_db)):
     Exchanges the code for tokens, stores them on the user, and returns
     an HTML page that notifies the opener window and closes itself.
     """
-    from app.auth import decode_access_token
     from app.services.google_calendar_service import exchange_code_for_tokens
 
-    # Verify state (contains user JWT)
-    try:
-        payload = decode_access_token(state)
-        user_id = int(payload["sub"])
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid or expired state token")
+    # Verify state: only a google_oauth_state token, each usable once
+    user_id = _consume_google_oauth_state(state)
 
-    user = db.query(User).filter(User.id == user_id).first()
+    user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 

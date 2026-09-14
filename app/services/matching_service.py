@@ -38,6 +38,7 @@ BATCH_SIZE = 200  # DB fetch batch; progress updates per-resume
 class MatchTask:
     task_id: str
     job_id: int
+    organization_id: Optional[int] = None  # the job's org when started; checked on every read
     status: str = "running"          # running | completed | failed
     total_resumes: int = 0
     filtered_count: int = 0          # after SQL pre-filter
@@ -119,6 +120,12 @@ def _run_matching(task_id: str, job_id: int, threshold: int):
             task.status = "failed"
             task.error = "Job not found"
             return
+        # Resume databases are per organization. A job with no organization has
+        # none — never fall back to scanning every tenant's resumes (fail closed).
+        if job.organization_id is None:
+            task.status = "failed"
+            task.error = "This job is not assigned to an organization, so there is no resume database to match against."
+            return
 
         # Build JD data
         jd_meta = db.query(JobMetadata).filter(JobMetadata.job_id == job_id).first()
@@ -148,10 +155,9 @@ def _run_matching(task_id: str, job_id: int, threshold: int):
         base_q = db.query(ResumeMetadata).filter(
             ResumeMetadata.parsing_status == "completed",
             ~ResumeMetadata.candidate_email.like("%@pending.local"),
+            # Organization scoping: only match resumes from the job's own org
+            ResumeMetadata.organization_id == job.organization_id,
         )
-        # Organization scoping: only match resumes from the same org
-        if job.organization_id:
-            base_q = base_q.filter(ResumeMetadata.organization_id == job.organization_id)
 
         skill_filter = _build_skill_filters(jd_skills)
         if skill_filter is not None:
@@ -165,9 +171,10 @@ def _run_matching(task_id: str, job_id: int, threshold: int):
         task.total_resumes = total_all
         task.filtered_count = total_filtered
 
+        # Task ids are bearer-like handles for the results — keep them out of INFO logs.
         logger.info(
-            "Match task %s: job=%s, total=%d, pre-filtered=%d, skills=%d",
-            task_id, job_id, total_all, total_filtered, len(jd_skills)
+            "Match task started: job=%s, total=%d, pre-filtered=%d, skills=%d",
+            job_id, total_all, total_filtered, len(jd_skills)
         )
 
         # ── Process in batches ───────────────────────────────────────────
@@ -251,14 +258,14 @@ def _run_matching(task_id: str, job_id: int, threshold: int):
         task.status = "completed"
 
         logger.info(
-            "Match task %s completed: scanned=%d, matched=%d",
-            task_id, total_filtered, len(results)
+            "Match task completed: job=%s, scanned=%d, matched=%d",
+            job_id, total_filtered, len(results)
         )
 
     except Exception as e:
-        logger.error("Match task %s failed: %s", task_id, e, exc_info=True)
+        logger.error("Match task failed: job=%s: %s", job_id, e, exc_info=True)
         task.status = "failed"
-        task.error = str(e)
+        task.error = "An internal error occurred while matching. Please try again."  # details stay in the log
     finally:
         db.close()
 
@@ -291,11 +298,14 @@ class _RowProxy:
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
-def start_match_task(job_id: int, threshold: int = 30) -> str:
-    """Start a background matching task. Returns task_id for polling."""
+def start_match_task(job_id: int, threshold: int = 30, organization_id: Optional[int] = None) -> str:
+    """Start a background matching task. Returns task_id for polling.
+
+    Call only with a job the caller is authorized for, passing that job's
+    organization_id; readers must check both job_id and organization_id."""
     _cleanup_old_tasks()
-    task_id = uuid.uuid4().hex[:12]
-    task = MatchTask(task_id=task_id, job_id=job_id, threshold=threshold)
+    task_id = uuid.uuid4().hex  # full 122-bit id (was 48 bits)
+    task = MatchTask(task_id=task_id, job_id=job_id, organization_id=organization_id, threshold=threshold)
     with _tasks_lock:
         _tasks[task_id] = task
 
@@ -321,7 +331,8 @@ def match_candidates_for_job(
     from app.services.feature_engineering import _canonicalize_skill, _safe_json
 
     job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
+    # A job with no organization has no resume database (fail closed, see _run_matching).
+    if not job or job.organization_id is None:
         return {"total_scanned": 0, "matched_count": 0, "candidates": []}
 
     jd_meta = db.query(JobMetadata).filter(JobMetadata.job_id == job_id).first()
@@ -350,10 +361,9 @@ def match_candidates_for_job(
     base_q = db.query(ResumeMetadata).filter(
         ResumeMetadata.parsing_status == "completed",
         ~ResumeMetadata.candidate_email.like("%@pending.local"),
+        # Organization scoping
+        ResumeMetadata.organization_id == job.organization_id,
     )
-    # Organization scoping
-    if job.organization_id:
-        base_q = base_q.filter(ResumeMetadata.organization_id == job.organization_id)
     skill_filter = _build_skill_filters(jd_skills)
     if skill_filter is not None:
         base_q = base_q.filter(skill_filter)

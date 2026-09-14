@@ -55,6 +55,18 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     SECRET_KEY: str = "change-me-in-production"
     SESSION_TIMEOUT_MINUTES: int = 60 * 24  # 24 hours — override via .env
+    # HMAC keys for signed media URLs (app.media) and opaque page-URL refs
+    # (app.refs). Optional: when empty they are derived from SECRET_KEY with
+    # domain separation. Rotating a key invalidates outstanding links/refs.
+    MEDIA_SIGNING_KEY: str = ""
+    URL_REF_KEY: str = ""
+
+    @property
+    def secret_key_is_weak(self) -> bool:
+        """True for the shipped placeholder or a trivially short key — JWTs
+        signed with it can be forged by anyone who has read this repo."""
+        key = (self.SECRET_KEY or "").strip()
+        return len(key) < 32 or key.lower().startswith("change-me") or "your-secret" in key.lower()
 
     # ── Email / SMTP ─────────────────────────────────────────────────────────
     SMTP_HOST: str = ""

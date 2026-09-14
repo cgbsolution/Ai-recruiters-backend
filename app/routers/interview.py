@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile, status
-from sqlalchemy import or_, func
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -37,7 +38,16 @@ from app.models.job import Job
 from app.models.organization import Organization
 from app.models.user import User, UserRole
 from app.database import SessionLocal
-from app.auth import require_roles
+from app.auth import get_current_user, require_roles
+from app.authz import authorize_session
+from app.invites import email_access_allowed
+from app.media import UPLOAD_ROOT, client_resume_path, safe_upload_name
+from app.session_auth import (
+    require_session_token,
+    require_session_token_or_query,
+    session_token_matches,
+    stored_session_token,
+)
 
 
 def _check_and_increment_candidate_quota(db, job_id: int) -> None:
@@ -73,9 +83,6 @@ def _check_and_increment_candidate_quota(db, job_id: int) -> None:
 from app.schemas.interview import (
     ApplyForJobRequest,
     ApplyForJobResponse,
-    CandidateLoginRequest,
-    CandidateRegisterRequest,
-    CandidateRegisterResponse,
     EvaluationRead,
     FeedbackRequest,
     FeedbackResponse,
@@ -178,35 +185,59 @@ def _get_session_or_404(session_id: int, db: Session) -> InterviewSession:
 
 def _get_or_mint_session_access_token(session: InterviewSession, db: Session) -> str:
     """Return the session's access token, minting one into session_metadata if
-    missing. Sent to the candidate at register/verify/login time; enforced on
-    /interview/sessions/{id}/* by the middleware in app.main. Sessions created
-    before this feature have no token and are grandfathered (no enforcement)."""
+    missing. Sent to the candidate by verify-access; required on every
+    /interview/sessions/{id}/* route by app.session_auth.require_session_token.
+
+    Fails closed: if a freshly minted token can't be persisted (and no
+    concurrent request stored one), raise 503 instead of handing the client a
+    token the server doesn't know — every session call would then be refused."""
+    existing = stored_session_token(session)
+    if existing:
+        return existing
+    sid = session.id
     try:
         meta = json.loads(session.session_metadata or "{}")
     except Exception:
         meta = {}
-    tok = meta.get("access_token")
-    if not tok:
-        tok = secrets.token_urlsafe(32)
-        meta["access_token"] = tok
-        session.session_metadata = json.dumps(meta)
+    if not isinstance(meta, dict):
+        meta = {}
+    tok = secrets.token_urlsafe(32)
+    meta["access_token"] = tok
+    session.session_metadata = json.dumps(meta)
+    try:
+        db.commit()
+        return tok
+    except Exception as exc:
+        logging.error(f"[SessionAuth] could not persist access token for session {sid}: {exc}")
         try:
-            db.commit()
-        except Exception:
             db.rollback()
-            # Fall back to whatever is now in the DB (concurrent mint), else
-            # return the unpersisted token — worst case the client holds a
-            # token the server doesn't know, and enforcement skips (legacy).
-            try:
-                db.refresh(session)
-                meta = json.loads(session.session_metadata or "{}")
-                tok = meta.get("access_token") or tok
-            except Exception:
-                pass
-    return tok
+        except Exception:
+            pass
+    # A concurrent request may have minted and stored one — use it if so.
+    try:
+        db.refresh(session)
+        stored = stored_session_token(session)
+    except Exception:
+        stored = None
+    if stored:
+        return stored
+    raise HTTPException(
+        status_code=503,
+        detail="Could not start your interview session right now. Please try again in a moment.",
+    )
 
 
 # ── Public Endpoints ──────────────────────────────────────────────────────────
+
+def _session_rate_key(request: Request) -> str:
+    """Rate-limit bucket keyed on the `session_id` query parameter, falling back
+    to the client IP. Candidates behind one shared office IP must not share a
+    bucket, or they trip each other's limit mid-interview."""
+    sid = (request.query_params.get("session_id") or "").strip()
+    if sid.isascii() and sid.isdigit() and len(sid) <= 18:
+        return f"session:{int(sid)}"
+    return _client_ip(request)
+
 
 # Deepgram token — MUST be before /interview/{token} to avoid wildcard match
 @router.get(
@@ -214,7 +245,7 @@ def _get_or_mint_session_access_token(session: InterviewSession, db: Session) ->
     summary="Get a short-lived Deepgram STT token for an active session",
     tags=["Interview"],
 )
-@limiter.limit("30/minute")
+@limiter.limit("30/minute", key_func=_session_rate_key)
 async def get_deepgram_token(
     request: Request,
     session_id: int = 0,
@@ -223,7 +254,7 @@ async def get_deepgram_token(
     """Previously this returned the raw master DEEPGRAM_API_KEY to ANY
     unauthenticated caller — abuse burned the STT quota and live interviews
     lost transcription. Now it:
-      1. requires an active interview session (and its X-Session-Token when set),
+      1. requires an active interview session and its X-Session-Token,
       2. returns a short-lived scoped token via Deepgram's /v1/auth/grant,
          falling back to the master key only if the grant API itself is down
          (so a Deepgram control-plane outage can't kill live interviews).
@@ -238,18 +269,13 @@ async def get_deepgram_token(
     if not session_id:
         raise HTTPException(status_code=401, detail="session_id is required")
     session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
-    if not session or session.status not in (SessionStatus.pending, SessionStatus.in_progress):
+    # Token first, compared in constant time and failing closed (a session with
+    # no stored token is refused), with one answer for "no such session" and
+    # "wrong token" so ids can't be probed. Only then must it still be active.
+    if not session or not session_token_matches(session, request.headers.get("x-session-token")):
+        raise HTTPException(status_code=403, detail="Invalid or missing session token")
+    if session.status not in (SessionStatus.pending, SessionStatus.in_progress):
         raise HTTPException(status_code=403, detail="No active interview session")
-    # Honour the per-session access token when the session has one.
-    try:
-        _meta = json.loads(session.session_metadata or "{}")
-    except Exception:
-        _meta = {}
-    _expected = _meta.get("access_token")
-    if _expected:
-        _provided = request.headers.get("x-session-token") or request.query_params.get("st")
-        if _provided != _expected:
-            raise HTTPException(status_code=403, detail="Invalid or missing session token")
 
     # Prefer a short-lived SCOPED token (Deepgram /v1/auth/grant) so the raw
     # master key never reaches the browser. BUT many API keys lack the scope to
@@ -333,7 +359,13 @@ async def _synthesize_edge_tts(text: str, language: str) -> str:
     summary="Generate speech audio from text using Google Cloud TTS",
     tags=["Interview"],
 )
-async def generate_tts(payload: dict):
+# Unauthenticated by necessity: the avatar speaks before the client has anything
+# to prove but the job link, and its caller (useGoogleTTS) sends no session
+# token. The ceiling is an anti-abuse bound, not a fairness limit: a 429 leaves
+# the avatar silent mid-interview (the client has no voice fallback), and whole
+# offices share one public IP, so it must sit far above real usage.
+@limiter.limit("300/minute")
+async def generate_tts(payload: dict, request: Request):
     """
     Convert text to speech using Google Cloud Text-to-Speech, falling back to
     edge-tts (Microsoft Neural, same Indian female profile) whenever Google is
@@ -486,17 +518,24 @@ def get_interview_config(token: str, db: Session = Depends(get_db)):
 
 # ── Verify Access (invitation-based) ─────────────────────────────────────────
 
+# Interview statuses of candidates who were never scheduled for an interview:
+# added by a recruiter, applied through the public link, or imported from the
+# resume database. Like any candidate holding a personal invite, they can't be
+# admitted by email alone.
+_NEVER_SCHEDULED_STATUSES = {"New", "Applied", "Added from Database"}
+
+
 @router.post(
     "/interview/{token}/verify-access",
     response_model=VerifyAccessResponse,
-    summary="Verify candidate access by email",
+    summary="Verify candidate access by personal invite (or legacy email)",
     description=(
-        "Checks if the candidate's email is associated with an invited candidate for this job.\n\n"
-        "Returns 'granted' if the candidate was invited (exists in candidates table for this job) "
-        "AND has a resume in the database.\n"
-        "Returns 'apply' if the email is not found — candidate should use Apply for Job.\n"
-        "Returns 'completed' if candidate already finished the interview.\n"
-        "Returns 'terminated' if candidate's session was terminated."
+        "Admits a candidate to this job's interview. Body: `{ invite?, email? }` (at least one).\n\n"
+        "- `invite` valid for this job → 'granted', 'completed' or 'terminated' for that candidate.\n"
+        "- `invite` invalid or for another job → 'invalid_invite'.\n"
+        "- `email` only: a candidate who has a personal invite, or was never scheduled → "
+        "'invite_required'; a legacy scheduled candidate without an invite → the normal flow; "
+        "an email that is not on this job → 'apply'."
     ),
     tags=["Interview"],
 )
@@ -507,40 +546,52 @@ def verify_access(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    from app.models.resume_metadata import ResumeMetadata
-
     tok = _get_token_or_404(token, db)
-    email_str = str(payload.email).strip().lower()
 
-    # 1. Check if candidate exists for this job (invited by recruiter).
-    #    Match is case-insensitive: candidates added via resume parsing or
-    #    manual recruiter entry may be stored with the original casing
-    #    (e.g. "Coder.Shadab92@gmail.com"), but the URL/form value gets
-    #    lowercased above. Without func.lower the join silently misses,
-    #    sending an already-invited candidate to the apply form.
-    candidate = db.query(Candidate).filter(
-        func.lower(Candidate.email) == email_str,
-        Candidate.job_id == tok.job_id,
-    ).first()
-
-    if not candidate:
-        # Also check resume_metadata — if resume exists but not invited for this job.
-        # Same case-insensitivity caveat as the candidate query above.
-        meta = db.query(ResumeMetadata).filter(
-            func.lower(ResumeMetadata.candidate_email) == email_str
+    if payload.invite:
+        # 1a. Personal invite link: the secret identifies the candidate and
+        #     must belong to THIS job's link.
+        candidate = db.query(Candidate).filter(
+            Candidate.invite_token == payload.invite,
+            Candidate.job_id == tok.job_id,
+        ).first()
+        if not candidate or not hmac.compare_digest(
+            (candidate.invite_token or "").encode("utf-8"), payload.invite.encode("utf-8")
+        ):
+            return VerifyAccessResponse(
+                access="invalid_invite",
+                message="This interview link is invalid or no longer active. Please use the latest link from your email, or contact HR.",
+            )
+    else:
+        # 1b. Email only (legacy ?candidate=<email> links).
+        #     Match is case-insensitive: candidates added via resume parsing or
+        #     manual recruiter entry may be stored with the original casing
+        #     (e.g. "Coder.Shadab92@gmail.com"), but the URL/form value gets
+        #     lowercased here. Without func.lower the join silently misses,
+        #     sending an already-invited candidate to the apply form.
+        email_str = str(payload.email).strip().lower()
+        candidate = db.query(Candidate).filter(
+            func.lower(Candidate.email) == email_str,
+            Candidate.job_id == tok.job_id,
         ).first()
 
-        if meta:
+        if not candidate:
+            # Not on this job. Nothing from other records (the resume database,
+            # other organizations) is revealed to an anonymous caller.
             return VerifyAccessResponse(
                 access="apply",
-                candidate_name=meta.candidate_name,
-                message="Your resume is on file but you haven't been invited for this position. You can apply for this job.",
+                message="No record found. Please apply for this job by uploading your resume.",
             )
 
-        return VerifyAccessResponse(
-            access="apply",
-            message="No record found. Please apply for this job by uploading your resume.",
-        )
+        # Anyone who knows an email could otherwise open — or take over — that
+        # candidate's interview. Email alone admits only legacy candidates who
+        # were scheduled before personal invite links existed.
+        _status = (candidate.interview_status or "New").strip()
+        if not email_access_allowed(candidate) or _status in _NEVER_SCHEDULED_STATUSES:
+            return VerifyAccessResponse(
+                access="invite_required",
+                message="Please open the personal interview link sent to your email to continue.",
+            )
 
     # 2. Check for completed session
     completed_session = (
@@ -556,8 +607,6 @@ def verify_access(
         return VerifyAccessResponse(
             access="completed",
             candidate_name=candidate.name,
-            session_id=completed_session.id,
-            candidate_id=candidate.id,
             message="You have already completed your interview for this position.",
         )
 
@@ -577,8 +626,6 @@ def verify_access(
         return VerifyAccessResponse(
             access="terminated",
             candidate_name=candidate.name,
-            session_id=terminated.id,
-            candidate_id=candidate.id,
             message="Your previous interview was terminated. Please contact HR.",
         )
 
@@ -646,8 +693,6 @@ def verify_access(
                     return VerifyAccessResponse(
                         access="terminated",
                         candidate_name=candidate.name,
-                        session_id=active_session.id,
-                        candidate_id=candidate.id,
                         message="Your interview session timed out because you disconnected for too long. Please contact HR.",
                     )
             except Exception:
@@ -675,6 +720,8 @@ def verify_access(
     metadata_json = json.dumps({
         "user_agent": request.headers.get("user-agent", ""),
         "ip": request.client.host if request.client else "",
+        # Stored with the row itself, so the session never exists without its token.
+        "access_token": secrets.token_urlsafe(32),
     })
     settings_obj = job.interview_settings if job else None
     interview_session = InterviewSession(
@@ -703,6 +750,11 @@ def verify_access(
 
 # ── Upload resume file (no candidate record — just save file) ────────────────
 
+_RESUME_EXTS = {".pdf", ".doc", ".docx"}
+# ~2 GB: a 45-minute interview is ~750 MB at the highest quality tier.
+MAX_RECORDING_SIZE = 2 * 1024 * 1024 * 1024
+
+
 @router.post(
     "/interview/{token}/upload-resume",
     summary="Upload a resume file for job application",
@@ -716,6 +768,8 @@ async def upload_resume_for_apply(
     db: Session = Depends(get_db),
 ):
     """Save a resume file to disk and return the path. No candidate record is created."""
+    from app.config import settings
+
     _get_token_or_404(token, db)  # validate token
 
     allowed = {
@@ -725,16 +779,38 @@ async def upload_resume_for_apply(
     }
     if file.content_type not in allowed:
         raise HTTPException(status_code=400, detail="Only PDF, DOC, or DOCX files are accepted.")
+    # The stored name is built server-side: the client file name is reduced to
+    # a safe stem plus an allowed extension (it used to be written verbatim).
+    safe = safe_upload_name(file.filename, _RESUME_EXTS)
+    if safe is None:
+        raise HTTPException(status_code=400, detail="Only PDF, DOC, or DOCX files are accepted.")
+    stem, ext = safe
 
-    upload_dir = "uploads/resumes"
+    upload_dir = os.path.join(UPLOAD_ROOT, "resumes")
     os.makedirs(upload_dir, exist_ok=True)
 
-    safe_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{file.filename}"
+    safe_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{stem}{ext}"
     file_path = os.path.join(upload_dir, safe_name)
 
+    max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    total = 0
     with open(file_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+        while chunk := await file.read(65536):
+            total += len(chunk)
+            if total > max_bytes:
+                break
+            f.write(chunk)
+    if total == 0 or total > max_bytes:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+        if total == 0:
+            raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+        raise HTTPException(
+            status_code=413,
+            detail=f"Resume is too large (max {settings.MAX_UPLOAD_SIZE_MB} MB).",
+        )
 
     return {"resume_path": file_path}
 
@@ -765,33 +841,44 @@ def apply_for_job(
 
     tok = _get_token_or_404(token, db)
     job = db.query(Job).filter(Job.id == tok.job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
     email_str = str(payload.email).strip().lower()
 
-    # Check if resume metadata already exists for this email
-    existing_meta = db.query(ResumeMetadata).filter(
-        ResumeMetadata.candidate_email == email_str
-    ).first()
+    # The resume path is echoed back from /upload-resume. Accept only a file
+    # that really is in the resumes upload folder — the value used to be stored
+    # verbatim and was later read, served and deleted from disk.
+    resume_path = client_resume_path(payload.resume_path)
+    if not resume_path:
+        raise HTTPException(status_code=400, detail="Resume upload not found. Please upload your resume again.")
 
-    if existing_meta:
-        # Update the existing record with new resume
-        existing_meta.candidate_name = payload.name
-        existing_meta.phone = payload.phone
-        existing_meta.resume_file_path = payload.resume_path
-        existing_meta.parsing_status = "pending"
-        db.commit()
-        meta_id = existing_meta.id
-    else:
-        # Create new resume metadata record
-        meta = ResumeMetadata(
-            candidate_email=email_str,
-            candidate_name=payload.name,
-            phone=payload.phone,
-            resume_file_path=payload.resume_path,
-            parsing_status="pending",
-        )
-        db.add(meta)
-        db.commit()
-        db.refresh(meta)
+    # Resume-database rows belong to an organization: look them up and create
+    # them only inside the job's organization. This lookup used to match the
+    # email across ALL tenants and overwrote another company's record. A job
+    # without an organization gets no resume-database row at all.
+    meta_id: Optional[int] = None
+    if job.organization_id is not None:
+        meta = db.query(ResumeMetadata).filter(
+            func.lower(ResumeMetadata.candidate_email) == email_str,
+            ResumeMetadata.organization_id == job.organization_id,
+        ).first()
+        if meta is None:
+            meta = ResumeMetadata(candidate_email=email_str, organization_id=job.organization_id)
+            db.add(meta)
+        # Fill the new record, or update this organization's record, with the new resume
+        meta.candidate_name = payload.name
+        meta.phone = payload.phone
+        meta.resume_file_path = resume_path
+        meta.parsing_status = "pending"
+        try:
+            db.commit()
+        except IntegrityError:
+            # A concurrent submit for the same email created the row first.
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="Your application is already being submitted. Please try again in a moment.",
+            )
         meta_id = meta.id
 
     # Also create/update a candidate record for this job
@@ -806,18 +893,24 @@ def apply_for_job(
             name=payload.name,
             email=email_str,
             phone=payload.phone or None,
-            role=job.title if job else None,
+            role=job.title,
             job_id=tok.job_id,
-            resume_path=payload.resume_path,
+            resume_path=resume_path,
             interview_status="Applied",
             candidate_stage="Candidates",
             resume_metadata_id=meta_id,
         )
         db.add(candidate)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # A concurrent submit created this candidate first; the quota
+            # increment made in this transaction is rolled back with it.
+            db.rollback()
 
     # Queue background parsing
-    background_tasks.add_task(_parse_resume_metadata_bg, meta_id)
+    if meta_id is not None:
+        background_tasks.add_task(_parse_resume_metadata_bg, meta_id)
 
     return ApplyForJobResponse(
         success=True,
@@ -914,477 +1007,9 @@ def _parse_resume_metadata_bg(meta_id: int):
                 pass
 
 
-@router.post(
-    "/interview/{token}/register",
-    response_model=CandidateRegisterResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Register candidate & create session",
-    description=(
-        "Registers the candidate for this interview.\n\n"
-        "**Email-exists logic:**\n"
-        "- If the email already exists → reuses the existing candidate record.\n"
-        "- If the candidate has an active (pending/in_progress) session → reuses it (can_resume=True).\n"
-        "- If the candidate already completed → returns already_completed=True.\n"
-        "- Otherwise creates a new session.\n\n"
-        "**Returns:** `session_id`, `candidate_id`, `is_existing_user`, `can_resume`, `session_status`.\n\n"
-        "**Errors:** `404` if the token is invalid."
-    ),
-    tags=["Interview"],
-)
-@limiter.limit("5/minute")
-def register_candidate(
-    token: str,
-    payload: CandidateRegisterRequest,
-    background_tasks: BackgroundTasks,
-    request: Request,
-    db: Session = Depends(get_db),
-):
-    tok = _get_token_or_404(token, db)
-    job = db.query(Job).filter(Job.id == tok.job_id).first()
-
-    # Resume is mandatory
-    if not payload.resume_path:
-        raise HTTPException(status_code=422, detail="Resume is required to register for this interview.")
-
-    # Per-job duplicate check: match by email OR phone (if phone provided)
-    email_str = str(payload.email).strip().lower()
-    phone_str = (payload.phone or "").strip()
-
-    filters = [
-        (func.lower(Candidate.email) == email_str) & (Candidate.job_id == tok.job_id),
-    ]
-    if phone_str:
-        filters.append(
-            (Candidate.phone == phone_str) & (Candidate.job_id == tok.job_id)
-        )
-
-    existing = db.query(Candidate).filter(or_(*filters)).first()
-
-    is_existing = bool(existing)
-
-    if existing:
-        candidate = existing
-
-        # Check if this candidate already completed an interview for this job
-        completed_session = (
-            db.query(InterviewSession)
-            .filter(
-                InterviewSession.candidate_id == candidate.id,
-                InterviewSession.job_id == tok.job_id,
-                InterviewSession.status == SessionStatus.completed,
-            )
-            .first()
-        )
-        if completed_session:
-            return CandidateRegisterResponse(
-                session_id=completed_session.id,
-                candidate_id=candidate.id,
-                is_existing_user=True,
-                already_completed=True,
-                message="You have already completed your interview for this position.",
-            )
-
-        # Check for resumable session (pending or in_progress)
-        active_session = (
-            db.query(InterviewSession)
-            .filter(
-                InterviewSession.candidate_id == candidate.id,
-                InterviewSession.job_id == tok.job_id,
-                InterviewSession.status.in_([SessionStatus.pending, SessionStatus.in_progress]),
-            )
-            .order_by(InterviewSession.created_at.desc())
-            .first()
-        )
-        if active_session:
-            # Update profile data but reuse session
-            candidate.name = payload.name
-            candidate.email = email_str
-            if phone_str:
-                candidate.phone = phone_str
-            candidate.resume_path = payload.resume_path
-            db.commit()
-            return CandidateRegisterResponse(
-                session_id=active_session.id,
-                candidate_id=candidate.id,
-                is_existing_user=True,
-                already_completed=False,
-                can_resume=True,
-                session_status=active_session.status.value,
-                message="Welcome back! You have an existing interview session. Resuming where you left off.",
-                session_token=_get_or_mint_session_access_token(active_session, db),
-            )
-
-        # Check for terminated session — don't allow re-interview, prompt to contact HR
-        terminated_session = (
-            db.query(InterviewSession)
-            .filter(
-                InterviewSession.candidate_id == candidate.id,
-                InterviewSession.job_id == tok.job_id,
-                InterviewSession.status == SessionStatus.terminated,
-            )
-            .first()
-        )
-        if terminated_session:
-            return CandidateRegisterResponse(
-                session_id=terminated_session.id,
-                candidate_id=candidate.id,
-                is_existing_user=True,
-                already_completed=True,
-                message="Your previous interview session was terminated. Please contact HR for further steps.",
-            )
-
-        # No active session — update profile and create a new one
-        candidate.name = payload.name
-        candidate.email = email_str
-        if phone_str:
-            candidate.phone = phone_str
-        candidate.resume_path = payload.resume_path
-        db.flush()
-    else:
-        # Create new candidate — check quota and use try/except for race condition protection
-        _check_and_increment_candidate_quota(db, tok.job_id)
-        candidate = Candidate(
-            name=payload.name,
-            email=email_str,
-            phone=phone_str or None,
-            role=job.title if job else None,
-            job_id=tok.job_id,
-            resume_path=payload.resume_path,
-            interview_status="Scheduled",
-        )
-        db.add(candidate)
-        try:
-            db.flush()
-        except IntegrityError:
-            db.rollback()
-            # Race condition: another request created this candidate first — retry lookup
-            existing = db.query(Candidate).filter(
-                func.lower(Candidate.email) == email_str,
-                Candidate.job_id == tok.job_id,
-            ).first()
-            if existing:
-                # Recursively handle as existing candidate
-                candidate = existing
-                is_existing = True
-                active_session = (
-                    db.query(InterviewSession)
-                    .filter(
-                        InterviewSession.candidate_id == candidate.id,
-                        InterviewSession.job_id == tok.job_id,
-                        InterviewSession.status.in_([SessionStatus.pending, SessionStatus.in_progress]),
-                    )
-                    .order_by(InterviewSession.created_at.desc())
-                    .first()
-                )
-                if active_session:
-                    return CandidateRegisterResponse(
-                        session_id=active_session.id,
-                        candidate_id=candidate.id,
-                        is_existing_user=True,
-                        can_resume=True,
-                        session_status=active_session.status.value,
-                        message="Welcome back! Resuming your interview.",
-                        session_token=_get_or_mint_session_access_token(active_session, db),
-                    )
-            else:
-                raise HTTPException(status_code=409, detail="Registration conflict. Please try again.")
-
-    # Build session metadata
-    metadata = json.dumps({
-        "user_agent": request.headers.get("user-agent", ""),
-        "ip": request.client.host if request.client else "",
-    })
-
-    # Create interview session
-    settings_obj = job.interview_settings if job else None
-    interview_session = InterviewSession(
-        token_id=tok.id,
-        candidate_id=candidate.id,
-        job_id=tok.job_id,
-        status=SessionStatus.pending,
-        total_questions=settings_obj.max_questions if settings_obj else 8,
-        session_metadata=metadata,
-    )
-    db.add(interview_session)
-    db.commit()
-    db.refresh(interview_session)
-
-    # Compute fit score in background (non-blocking)
-    background_tasks.add_task(_compute_fit_score_bg, candidate.id, tok.job_id)
-
-    return CandidateRegisterResponse(
-        session_id=interview_session.id,
-        candidate_id=candidate.id,
-        is_existing_user=is_existing,
-        already_completed=False,
-        can_resume=False,
-        message="Session created. Ready to start interview.",
-        session_token=_get_or_mint_session_access_token(interview_session, db),
-    )
-
-
-@router.post(
-    "/interview/{token}/auto-register",
-    response_model=CandidateRegisterResponse,
-    summary="Auto-register candidate from resume database (no form required)",
-    description=(
-        "Automatically registers a candidate for the interview using their email.\n"
-        "Looks up the resume database for candidate metadata (name, phone, resume path).\n"
-        "If found, creates a Candidate record and InterviewSession without any registration form.\n\n"
-        "Use this when sending interview links directly to known candidates from the resume database.\n"
-        "Falls back to the candidate table if not in resume_metadata.\n\n"
-        "**Query param:** `email` — the candidate's email address."
-    ),
-    tags=["Interview"],
-)
-@limiter.limit("10/minute")
-def auto_register_candidate(
-    token: str,
-    email: str,
-    background_tasks: BackgroundTasks,
-    request: Request,
-    db: Session = Depends(get_db),
-):
-    from app.models.resume_metadata import ResumeMetadata
-
-    tok = _get_token_or_404(token, db)
-    job = db.query(Job).filter(Job.id == tok.job_id).first()
-    email_str = email.strip().lower()
-
-    if not email_str:
-        raise HTTPException(status_code=400, detail="Email is required")
-
-    # Check for existing candidate for this job
-    existing = db.query(Candidate).filter(
-        func.lower(Candidate.email) == email_str,
-        Candidate.job_id == tok.job_id,
-    ).first()
-
-    if existing:
-        # Check completed/active sessions (same logic as register)
-        completed_session = (
-            db.query(InterviewSession)
-            .filter(
-                InterviewSession.candidate_id == existing.id,
-                InterviewSession.job_id == tok.job_id,
-                InterviewSession.status == SessionStatus.completed,
-            )
-            .first()
-        )
-        if completed_session:
-            return CandidateRegisterResponse(
-                session_id=completed_session.id,
-                candidate_id=existing.id,
-                is_existing_user=True,
-                already_completed=True,
-                message="You have already completed your interview for this position.",
-            )
-
-        active_session = (
-            db.query(InterviewSession)
-            .filter(
-                InterviewSession.candidate_id == existing.id,
-                InterviewSession.job_id == tok.job_id,
-                InterviewSession.status.in_([SessionStatus.pending, SessionStatus.in_progress]),
-            )
-            .order_by(InterviewSession.created_at.desc())
-            .first()
-        )
-        if active_session:
-            return CandidateRegisterResponse(
-                session_id=active_session.id,
-                candidate_id=existing.id,
-                is_existing_user=True,
-                can_resume=True,
-                session_status=active_session.status.value,
-                message="Welcome back! Resuming your interview.",
-                session_token=_get_or_mint_session_access_token(active_session, db),
-            )
-
-        terminated = (
-            db.query(InterviewSession)
-            .filter(
-                InterviewSession.candidate_id == existing.id,
-                InterviewSession.job_id == tok.job_id,
-                InterviewSession.status == SessionStatus.terminated,
-            )
-            .first()
-        )
-        if terminated:
-            return CandidateRegisterResponse(
-                session_id=terminated.id,
-                candidate_id=existing.id,
-                is_existing_user=True,
-                already_completed=True,
-                message="Your previous interview was terminated. Please contact HR.",
-            )
-
-        candidate = existing
-        is_existing = True
-    else:
-        # Look up resume database for metadata
-        meta = db.query(ResumeMetadata).filter(
-            ResumeMetadata.candidate_email == email_str
-        ).first()
-
-        candidate_name = email_str.split("@")[0].replace(".", " ").title()
-        candidate_phone = None
-        resume_path = None
-
-        if meta:
-            candidate_name = meta.candidate_name or candidate_name
-            candidate_phone = meta.phone
-            resume_path = meta.resume_file_path
-
-        _check_and_increment_candidate_quota(db, tok.job_id)
-        candidate = Candidate(
-            name=candidate_name,
-            email=email_str,
-            phone=candidate_phone,
-            role=job.title if job else None,
-            job_id=tok.job_id,
-            resume_path=resume_path,
-            interview_status="Scheduled",
-            resume_metadata_id=meta.id if meta else None,
-        )
-        db.add(candidate)
-        db.commit()
-        db.refresh(candidate)
-        is_existing = False
-
-    # Create session
-    metadata_json = json.dumps({
-        "user_agent": request.headers.get("user-agent", ""),
-        "ip": request.client.host if request.client else "",
-        "auto_registered": True,
-    })
-    settings_obj = job.interview_settings if job else None
-    interview_session = InterviewSession(
-        token_id=tok.id,
-        candidate_id=candidate.id,
-        job_id=tok.job_id,
-        status=SessionStatus.pending,
-        total_questions=settings_obj.max_questions if settings_obj else 8,
-        session_metadata=metadata_json,
-    )
-    db.add(interview_session)
-    db.commit()
-    db.refresh(interview_session)
-
-    # Background fit score
-    if candidate.resume_path:
-        background_tasks.add_task(_compute_fit_score_bg, candidate.id, tok.job_id)
-
-    return CandidateRegisterResponse(
-        session_id=interview_session.id,
-        candidate_id=candidate.id,
-        is_existing_user=is_existing,
-        already_completed=False,
-        can_resume=False,
-        message="Auto-registered successfully. Ready to start interview.",
-        session_token=_get_or_mint_session_access_token(interview_session, db),
-    )
-
-
-@router.post(
-    "/interview/{token}/login",
-    response_model=CandidateRegisterResponse,
-    summary="Login returning candidate by email",
-    description=(
-        "Allows a returning candidate (or admin-added candidate) to log in with just their email.\n"
-        "Finds the candidate by email + job_id, then reuses or creates a session.\n\n"
-        "**Errors:** `404` if no candidate found with this email for this job."
-    ),
-    tags=["Interview"],
-)
-def login_candidate(
-    token: str,
-    payload: CandidateLoginRequest,
-    db: Session = Depends(get_db),
-):
-    tok = _get_token_or_404(token, db)
-    job = db.query(Job).filter(Job.id == tok.job_id).first()
-
-    candidate = db.query(Candidate).filter(
-        func.lower(Candidate.email) == str(payload.email).strip().lower(),
-        Candidate.job_id == tok.job_id,
-    ).first()
-
-    if not candidate:
-        raise HTTPException(
-            status_code=404,
-            detail="No candidate found with this email for this position. Please register first.",
-        )
-
-    # Check completed
-    completed_session = (
-        db.query(InterviewSession)
-        .filter(
-            InterviewSession.candidate_id == candidate.id,
-            InterviewSession.job_id == tok.job_id,
-            InterviewSession.status == SessionStatus.completed,
-        )
-        .first()
-    )
-    if completed_session:
-        return CandidateRegisterResponse(
-            session_id=completed_session.id,
-            candidate_id=candidate.id,
-            is_existing_user=True,
-            already_completed=True,
-            message="You have already completed your interview for this position.",
-        )
-
-    # Check for resumable session
-    active_session = (
-        db.query(InterviewSession)
-        .filter(
-            InterviewSession.candidate_id == candidate.id,
-            InterviewSession.job_id == tok.job_id,
-            InterviewSession.status.in_([SessionStatus.pending, SessionStatus.in_progress]),
-        )
-        .order_by(InterviewSession.created_at.desc())
-        .first()
-    )
-
-    if active_session:
-        return CandidateRegisterResponse(
-            session_id=active_session.id,
-            candidate_id=candidate.id,
-            is_existing_user=True,
-            already_completed=False,
-            can_resume=True,
-            session_status=active_session.status.value,
-            message="Welcome back! Resuming your interview.",
-            session_token=_get_or_mint_session_access_token(active_session, db),
-        )
-
-    # No active session — create a new one
-    settings_obj = job.interview_settings if job else None
-    new_session = InterviewSession(
-        token_id=tok.id,
-        candidate_id=candidate.id,
-        job_id=tok.job_id,
-        status=SessionStatus.pending,
-        total_questions=settings_obj.max_questions if settings_obj else 8,
-    )
-    db.add(new_session)
-    db.commit()
-    db.refresh(new_session)
-
-    return CandidateRegisterResponse(
-        session_id=new_session.id,
-        candidate_id=candidate.id,
-        is_existing_user=True,
-        already_completed=False,
-        can_resume=False,
-        message="Session created. Ready to start interview.",
-        session_token=_get_or_mint_session_access_token(new_session, db),
-    )
-
-
 @router.get(
     "/interview/sessions/{session_id}/resume",
+    dependencies=[Depends(require_session_token)],
     response_model=ResumeSessionResponse,
     summary="Get session state for recovery",
     description="Returns the current session state including all messages for interview recovery after disconnect.",
@@ -1417,6 +1042,7 @@ def resume_session(session_id: int, db: Session = Depends(get_db)):
 
 @router.post(
     "/interview/sessions/{session_id}/message",
+    dependencies=[Depends(require_session_token)],
     response_model=InterviewMessageResponse,
     summary="Send answer → receive next AI question",
     description=(
@@ -1488,6 +1114,7 @@ async def interview_message(
 
 @router.post(
     "/interview/sessions/{session_id}/start",
+    dependencies=[Depends(require_session_token)],
     response_model=InterviewMessageResponse,
     summary="Start interview → AI opening message",
     description=(
@@ -1522,6 +1149,7 @@ async def start_interview(
 
 @router.post(
     "/interview/sessions/{session_id}/violation",
+    dependencies=[Depends(require_session_token)],
     response_model=ViolationResponse,
     summary="Log a cheating / integrity violation",
     description=(
@@ -1794,6 +1422,7 @@ async def _run_evaluation_background(session_id: int):
 
 @router.post(
     "/interview/sessions/{session_id}/complete",
+    dependencies=[Depends(require_session_token)],
     status_code=202,
     summary="Complete interview & trigger evaluation",
     description=(
@@ -1896,6 +1525,7 @@ async def complete_interview(
 
 @router.post(
     "/interview/sessions/{session_id}/drop",
+    dependencies=[Depends(require_session_token_or_query)],
     status_code=200,
     summary="Mark session as dropped (tab close / network disconnect)",
     description=(
@@ -1945,6 +1575,7 @@ def drop_interview(session_id: int, db: Session = Depends(get_db)):
 
 @router.post(
     "/interview/sessions/{session_id}/recording-finalize-beacon",
+    dependencies=[Depends(require_session_token_or_query)],
     status_code=200,
     summary="Tab-close beacon: assemble live-uploaded recording parts now",
     description=(
@@ -1974,6 +1605,7 @@ async def recording_finalize_beacon(
 
 @router.get(
     "/interview/sessions/{session_id}/evaluation",
+    dependencies=[Depends(require_session_token)],
     response_model=EvaluationRead,
     summary="Get evaluation result",
     description=(
@@ -1994,6 +1626,7 @@ def get_evaluation(session_id: int, db: Session = Depends(get_db)):
 
 @router.get(
     "/interview/sessions/{session_id}/evaluation-status",
+    dependencies=[Depends(require_session_token)],
     summary="Cheap status probe for the evaluation background task",
     description=(
         "Returns one of: `done` (evaluation row exists), `processing` (background "
@@ -2019,6 +1652,7 @@ def get_evaluation_status(session_id: int, db: Session = Depends(get_db)):
 
 @router.post(
     "/interview/sessions/{session_id}/feedback",
+    dependencies=[Depends(require_session_token)],
     response_model=FeedbackResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Submit candidate experience feedback",
@@ -2059,6 +1693,7 @@ def submit_feedback(
 
 @router.get(
     "/interview/sessions/{session_id}/slots",
+    dependencies=[Depends(require_session_token)],
     response_model=List[MeetingSlotRead],
     summary="List available meeting slots",
     description=(
@@ -2086,6 +1721,7 @@ def get_meeting_slots(session_id: int, db: Session = Depends(get_db)):
 
 @router.post(
     "/interview/sessions/{session_id}/schedule-meeting",
+    dependencies=[Depends(require_session_token)],
     response_model=ScheduleMeetingResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Book a post-interview meeting slot",
@@ -2108,9 +1744,14 @@ def schedule_meeting(
     if session.meeting_schedule:
         raise HTTPException(status_code=400, detail="Meeting already scheduled for this session")
 
+    # The slot must belong to THIS session's job: filtering on id alone let a
+    # candidate book (and so block) any tenant's slot by trying slot ids, and
+    # read its times back in the response.
     slot = db.query(MeetingSlot).filter(
         MeetingSlot.id == payload.slot_id,
+        MeetingSlot.job_id == session.job_id,
         MeetingSlot.is_booked == False,
+        MeetingSlot.start_time > datetime.utcnow(),
     ).first()
     if not slot:
         raise HTTPException(status_code=404, detail="Slot not available")
@@ -2136,6 +1777,7 @@ def schedule_meeting(
 
 @router.post(
     "/interview/sessions/{session_id}/upload-recording",
+    dependencies=[Depends(require_session_token)],
     response_model=RecordingUploadResponse,
     summary="Upload interview recording",
     description="Stores the candidate's interview video recording and updates the candidate record with the link and duration.",
@@ -2153,17 +1795,31 @@ async def upload_recording(
 ):
     session = _get_session_or_404(session_id, db)
 
-    _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
-    _upload_root = "/tmp/uploads" if _is_serverless else "uploads"
+    _upload_root = UPLOAD_ROOT
     os.makedirs(f"{_upload_root}/recordings", exist_ok=True)
+    # Server-chosen extension. It used to be taken from the client filename,
+    # which decided both the stored name and — while /uploads was public — the
+    # Content-Type it was served with, so an "x.html" upload became HTML on the
+    # API origin and repointed the candidate's recording link at it.
+    # Fixed, not merely allow-listed: letting the client pick ".mp4" also side-
+    # stepped the "keep the larger existing file" guard below, which compares
+    # against {sid}{ext} — a different path — so a 1-byte ".mp4" could repoint
+    # the candidate's recording link while {sid}.webm sat untouched on disk.
     ext = ".webm"
-    if file.filename and "." in file.filename:
-        ext = "." + file.filename.rsplit(".", 1)[-1]
     final_path = f"{_upload_root}/recordings/{session_id}{ext}"
+    # Refuse only to REPLACE evidence that already exists. A blanket "interview
+    # is over" check would kill orphan recovery, which re-uploads a recording
+    # the browser kept in IndexedDB on some later app load (hours or days after
+    # a crash) — the only path left to rescue a video the server never got.
+    if os.path.isfile(final_path):
+        _reject_late_evidence(session)
     # Stream to a temp path first so a partial write never clobbers a good
     # prior recording. We promote to the final path only after we've verified
     # the upload is non-empty AND at least as big as what's already on disk.
-    tmp_path = f"{final_path}.incoming-{int(time.time())}"
+    # uuid, not a second-resolution timestamp: two uploads for one session in
+    # the same second shared a temp path, and the first os.replace() renamed it
+    # out from under the second writer, corrupting the result.
+    tmp_path = f"{final_path}.incoming-{uuid.uuid4().hex}"
 
     who = _candidate_label(db, session)
     tag = f"{who} recording_id={recording_id or '-'} recovery={bool(recovery)}"
@@ -2172,8 +1828,22 @@ async def upload_recording(
         with open(tmp_path, "wb") as f:
             while chunk := await file.read(65536):  # 64KB chunks for faster streaming
                 total_size += len(chunk)
+                # A 45-minute interview is ~750 MB at the highest quality tier;
+                # anything past this is not a recording, and the loop had no
+                # cap at all, so one caller could fill the disk.
+                if total_size > MAX_RECORDING_SIZE:
+                    raise HTTPException(status_code=413, detail="Recording is too large.")
                 f.write(chunk)
         _rec_logger.info(f"[Recording] Wrote {total_size / (1024*1024):.2f} MB to {tmp_path} ({tag})")
+    except HTTPException:
+        # e.g. the 413 above — keep the real status (the client's telemetry and
+        # its retry policy both key on it) instead of reporting a generic 500.
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
     except Exception as e:
         logging.error(f"[Recording] FAILED to save for session {session_id}: {e} ({tag})")
         try:
@@ -2382,6 +2052,36 @@ def _sanitize_recid(recording_id: str) -> str:
     clients that never send one) maps to '_legacy'."""
     rid = "".join(c for c in (recording_id or "").strip() if c.isalnum() or c in "-_")
     return rid or "_legacy"
+
+
+def _reject_late_evidence(session) -> None:
+    """Proctoring evidence may only be written while the interview is live, or
+    during a short grace window after it ends — the client legitimately finishes
+    uploading its tail then.
+
+    Session tokens are never rotated, so without this a candidate who was
+    auto-terminated for cheating keeps a valid token and can replace their
+    recording, identity photo or screenshots days later, and the recruiter's
+    evaluation page would show the fabricated evidence."""
+    from datetime import timedelta
+
+    # Generous windows on purpose: a 700 MB upload over a poor connection, with
+    # retries, legitimately runs for a long time after /complete stamps
+    # completed_at, and an auto-terminated candidate's upload is exactly the
+    # evidence worth keeping. Tampering is bounded by the callers, which only
+    # apply this when something would be overwritten.
+    grace = {
+        SessionStatus.completed: timedelta(hours=6),
+        SessionStatus.terminated: timedelta(hours=1),
+    }.get(session.status)
+    if grace is None:
+        return  # pending / in_progress — the interview is still live
+    ended = session.completed_at or datetime.utcnow()
+    if datetime.utcnow() - ended > grace:
+        raise HTTPException(
+            status_code=409,
+            detail="This interview has ended — new recordings or photos are no longer accepted.",
+        )
 
 
 def _session_is_terminal(session) -> bool:
@@ -2641,6 +2341,7 @@ def _save_recording_link(db: Session, session: InterviewSession, recording_link:
 
 @router.post(
     "/interview/sessions/{session_id}/recording-part",
+    dependencies=[Depends(require_session_token)],
     status_code=200,
     summary="Upload one part of an in-progress interview recording",
     tags=["Interview"],
@@ -2655,6 +2356,7 @@ async def upload_recording_part(
     db: Session = Depends(get_db),
 ):
     session = _get_session_or_404(session_id, db)
+    _reject_late_evidence(session)
     upload_root = _recording_upload_root()
     # Store parts under a per-recording subdir so a drop+rejoin (which mints a
     # NEW recording id) cannot overwrite the earlier segment's parts. Assembly
@@ -2691,6 +2393,7 @@ async def upload_recording_part(
 
 @router.post(
     "/interview/sessions/{session_id}/recording-finalize",
+    dependencies=[Depends(require_session_token)],
     response_model=RecordingUploadResponse,
     summary="Stitch uploaded recording parts into the final video",
     tags=["Interview"],
@@ -2743,18 +2446,40 @@ async def finalize_recording(
     )
 
 
-def _finalize_recording_safety_net(session_id: int):
+# At most two assemblies at a time, and never two for the same session. This
+# task is queued by /complete (twice), by the tab-close beacon and by the
+# sweeper, and each run waits 45s and then runs ffmpeg. While it was a plain
+# `def`, Starlette ran it in the AnyIO worker threadpool — the same ~40 threads
+# that serve every sync route — so one candidate could stall the API for every
+# tenant just by re-triggering it.
+_FINALIZE_SLOTS = asyncio.Semaphore(2)
+_finalize_in_flight: set = set()
+
+
+async def _finalize_recording_safety_net(session_id: int):
     """Server-side backstop: if the candidate's browser died before calling
     /recording-finalize, stitch whatever parts DID arrive into a playable video
     so a recording is present even when the client never finishes. Idempotent
     and size-guarded, so it can never clobber a good single-shot upload."""
     upload_root = _recording_upload_root()
-    final_path = f"{upload_root}/recordings/{session_id}.webm"
-    pd = _parts_dir(upload_root, session_id)
-    if not os.path.isdir(pd):
+    if not os.path.isdir(_parts_dir(upload_root, session_id)):
         return  # no live parts — nothing to recover
-    # Give the client a window to upload its tail + call finalize itself first.
-    time.sleep(45)
+    if session_id in _finalize_in_flight:
+        return  # already waiting from /complete or the tab-close beacon
+    _finalize_in_flight.add(session_id)
+    try:
+        # Give the client a window to upload its tail + call finalize itself first.
+        await asyncio.sleep(45)
+        async with _FINALIZE_SLOTS:
+            await asyncio.to_thread(_finalize_recording_now, session_id)
+    finally:
+        _finalize_in_flight.discard(session_id)
+
+
+def _finalize_recording_now(session_id: int):
+    """The blocking half of the safety net (ffmpeg + DB). Always run in a thread."""
+    upload_root = _recording_upload_root()
+    pd = _parts_dir(upload_root, session_id)
     # If a full recording already exists (client finalize or single-shot landed),
     # only re-stitch if parts somehow total MORE (handled by the size guard).
     result = _concat_parts_to_webm(upload_root, session_id)
@@ -2802,6 +2527,37 @@ def _finalize_recording_safety_net(session_id: int):
 _STALE_PARTS_SECONDS = 600
 
 
+# Upload sidecars ({sid}.webm.incoming-*) are deliberately kept when an upload is
+# rejected for being smaller than the recording already on disk, so an operator
+# can recover from one. Nothing ever reaped them, and each can be up to
+# MAX_RECORDING_SIZE.
+_INCOMING_TTL_SECONDS = 24 * 3600
+
+
+def _reap_stale_incoming(upload_root: str) -> int:
+    """Delete upload sidecars older than a day. Never raises."""
+    rec_dir = f"{upload_root}/recordings"
+    cutoff = time.time() - _INCOMING_TTL_SECONDS
+    removed = 0
+    try:
+        names = os.listdir(rec_dir)
+    except OSError:
+        return 0
+    for name in names:
+        if ".incoming-" not in name:
+            continue
+        path = os.path.join(rec_dir, name)
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        _rec_logger.info(f"[Recording] sweeper removed {removed} stale .incoming-* sidecar(s)")
+    return removed
+
+
 def sweep_orphan_recording_parts() -> int:
     """Backstop sweeper: assemble any interview recordings whose live-uploaded
     parts were never stitched into a final video — e.g. the candidate's tab/
@@ -2816,6 +2572,7 @@ def sweep_orphan_recording_parts() -> int:
     video landed on disk — even when the browser never told us the interview
     ended. Returns the number of recordings newly assembled."""
     upload_root = _recording_upload_root()
+    _reap_stale_incoming(upload_root)
     parts_root = f"{upload_root}/recordings/.parts"
     if not os.path.isdir(parts_root):
         return 0
@@ -2913,6 +2670,7 @@ def sweep_orphan_recording_parts() -> int:
 
 @router.post(
     "/interview/sessions/{session_id}/capture-photo",
+    dependencies=[Depends(require_session_token)],
     status_code=200,
     summary="Capture and save candidate profile photo",
     description="Accepts a JPEG photo from the candidate's webcam during the pre-interview photo capture step.",
@@ -2928,42 +2686,51 @@ async def capture_candidate_photo(
     session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
     if not session or not session.candidate_id:
         raise HTTPException(status_code=404, detail="Session or candidate not found")
+    _reject_late_evidence(session)
 
     candidate = db.query(Candidate).filter(Candidate.id == session.candidate_id).first()
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
-    _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
-    _upload_root = "/tmp/uploads" if _is_serverless else "uploads"
-    photo_dir = f"{_upload_root}/photos"
+    photo_dir = f"{UPLOAD_ROOT}/photos"
     os.makedirs(photo_dir, exist_ok=True)
 
-    ext = ".jpg"
-    if file.filename and "." in file.filename:
-        ext = "." + file.filename.rsplit(".", 1)[-1].lower()
-    file_path = f"{photo_dir}/{candidate.id}{ext}"
+    # Always a re-encoded JPEG under a server-chosen name. The extension used to
+    # come from the client filename, so an ".html"/".svg" "photo" was stored —
+    # and, while /uploads was public, served — as that type; a PIL failure was
+    # swallowed, which kept the raw bytes. Unreadable uploads are now rejected.
+    file_path = f"{photo_dir}/{candidate.id}.jpg"
+    tmp_path = f"{file_path}.incoming-{uuid.uuid4().hex}"
 
     MAX_PHOTO_SIZE = 5 * 1024 * 1024  # 5 MB
     total_size = 0
-    with open(file_path, "wb") as f:
-        while chunk := await file.read(8192):
-            total_size += len(chunk)
-            if total_size > MAX_PHOTO_SIZE:
-                f.close()
-                os.remove(file_path)
-                raise HTTPException(status_code=413, detail="Photo too large (max 5 MB)")
-            f.write(chunk)
-
-    # Compress photo: resize to max 400x500, JPEG quality 80
     try:
+        with open(tmp_path, "wb") as f:
+            while chunk := await file.read(8192):
+                total_size += len(chunk)
+                if total_size > MAX_PHOTO_SIZE:
+                    raise HTTPException(status_code=413, detail="Photo too large (max 5 MB)")
+                f.write(chunk)
+
+        # Compress photo: resize to max 400x500, JPEG quality 80
         from PIL import Image
-        with Image.open(file_path) as img:
+        with Image.open(tmp_path) as img:
+            img = img.convert("RGB")
             img.thumbnail((400, 500), Image.LANCZOS)
             img.save(file_path, "JPEG", quality=80, optimize=True)
-    except Exception:
-        pass
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.warning(f"[Photo] rejected unreadable upload for candidate {candidate.id}: {exc}")
+        raise HTTPException(status_code=400, detail="Photo could not be read. Please retake it.")
+    finally:
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
 
-    relative_path = f"/uploads/photos/{candidate.id}{ext}"
+    relative_path = f"/uploads/photos/{candidate.id}.jpg"
     candidate.image = relative_path
     db.commit()
 
@@ -2972,6 +2739,7 @@ async def capture_candidate_photo(
 
 @router.post(
     "/interview/sessions/{session_id}/screenshot",
+    dependencies=[Depends(require_session_token)],
     status_code=200,
     summary="Upload a periodic proctoring screenshot",
     description=(
@@ -2995,14 +2763,20 @@ async def upload_screenshot(
     session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
     if not session:
         return {"ok": False}
+    # Silent (this endpoint must never fail the interview), but a finished
+    # interview stops accepting new proctoring frames — see _reject_late_evidence.
+    try:
+        _reject_late_evidence(session)
+    except HTTPException:
+        return {"ok": False, "reason": "interview_ended"}
 
-    _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
-    _upload_root = "/tmp/uploads" if _is_serverless else "uploads"
-    screenshot_dir = f"{_upload_root}/screenshots/{session_id}"
+    screenshot_dir = f"{UPLOAD_ROOT}/screenshots/{session_id}"
     os.makedirs(screenshot_dir, exist_ok=True)
 
-    safe_ts = (timestamp or "").replace(":", "-").replace(".", "-")[:23]
-    filename = f"{safe_ts or 'snap'}.jpg"
+    # Server-generated name. The client timestamp used to land in the path, so a
+    # "/" in it raised FileNotFoundError (a 500), and any character outside
+    # [A-Za-z0-9_-] made the saved frame unservable through /media.
+    filename = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex[:8]}.jpg"
     raw_path = f"{screenshot_dir}/{filename}"
 
     total_size = 0
@@ -3084,36 +2858,6 @@ async def upload_screenshot(
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-_bg_logger = logging.getLogger("fit_score_bg")
-
-
-async def _compute_fit_score_bg(candidate_id: int, job_id: int) -> None:
-    """Background task: compute resume fit score using smart scoring (no AI cost)."""
-    db = SessionLocal()
-    try:
-        from app.services.smart_scoring_service import compute_fit_score_for_candidate
-
-        candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-        if not candidate:
-            _bg_logger.info(f"Fit score skip: candidate={candidate_id} not found")
-            return
-
-        result = compute_fit_score_for_candidate(db, candidate_id, job_id)
-        if not result:
-            _bg_logger.info(f"Fit score skip: no metadata for candidate={candidate_id}")
-            return
-
-        candidate.resume_fit_score = result.fit_level
-        candidate.fit_score_reasoning = json.dumps(result.to_dict())
-        db.commit()
-        _bg_logger.info(f"Fit score computed: candidate={candidate_id}, level={result.fit_level} ({result.fit_percentage}%%)")
-    except Exception as exc:
-        _bg_logger.exception(f"Fit score failed for candidate={candidate_id}: {exc}")
-        db.rollback()
-    finally:
-        db.close()
-
-
 def _format_evaluation(ev) -> EvaluationRead:
     strengths = []
     weaknesses = []
@@ -3152,6 +2896,7 @@ def _format_evaluation(ev) -> EvaluationRead:
 
 @router.post(
     "/interview/sessions/{session_id}/run-code",
+    dependencies=[Depends(require_session_token)],
     summary="Execute code against test cases during interview",
     description="Run candidate's code in a sandboxed environment. Returns test case results.",
 )
@@ -3205,165 +2950,8 @@ async def run_code(
 
 
 @router.post(
-    "/interview/sessions/{session_id}/submit-code",
-    summary="Submit final code solution for evaluation",
-    description="Submit the candidate's final code. Saves to transcript and returns test results.",
-)
-@limiter.limit("10/minute")
-async def submit_code(
-    request: Request,
-    session_id: int,
-    db: Session = Depends(get_db),
-):
-    """
-    Submit final code solution. Saves code + results to interview transcript.
-
-    Body:
-    {
-        "language": "python",
-        "code": "...",
-        "test_cases": [...],
-        "question_index": 3
-    }
-    """
-    body = await request.json()
-
-    session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    if session.status not in (SessionStatus.in_progress, SessionStatus.pending):
-        raise HTTPException(status_code=400, detail="Interview is not active")
-
-    language = body.get("language", "python")
-    code = body.get("code", "")
-    test_cases = body.get("test_cases", [])
-    question_index = body.get("question_index", session.current_question_index)
-    # Optional metadata sent by the editor so we can render the question
-    # on the recruiter side without having to re-derive it from chat history.
-    title = (body.get("title") or "").strip() or None
-    description = (body.get("description") or "").strip() or None
-    difficulty = (body.get("difficulty") or "").strip() or None
-
-    if not code.strip():
-        raise HTTPException(status_code=400, detail="Code cannot be empty")
-
-    from app.services.code_execution_service import run_test_cases
-
-    # Run against test cases (timed for the structured submission record)
-    exec_start = time.monotonic()
-    test_result = await run_test_cases(language, code, test_cases, timeout=10)
-    exec_ms = int((time.monotonic() - exec_start) * 1000)
-
-    # Save candidate's code submission as a message (kept for backwards
-    # compatibility — the AI evaluator and chat transcript still use this)
-    code_submission_text = (
-        f"[CODE SUBMISSION]\n"
-        f"Language: {language}\n"
-        f"Test Results: {test_result['passed']}/{test_result['total']} passed\n"
-        f"```{language}\n{code}\n```"
-    )
-
-    db.add(InterviewMessage(
-        session_id=session.id,
-        role="candidate",
-        content=code_submission_text,
-        question_index=question_index,
-    ))
-
-    # Structured row: lets recruiters filter by pass rate, see the code in a
-    # dedicated tab, and lets the evaluator score coding separately from
-    # verbal answers. Failure to write this MUST NOT block the interview —
-    # we wrap defensively so a schema drift never breaks the candidate UX.
-    # Pre-serialize the test_results so a non-JSON-friendly object (custom
-    # exception, set, etc.) doesn't crash the whole write at commit time.
-    try:
-        results_payload = test_result.get("results", [])
-        try:
-            test_results_json = json.dumps(results_payload, default=str)
-        except Exception as ser_exc:
-            logging.error(
-                "[submit_code] test_results JSON serialization failed for session "
-                "%s: %s — storing empty list to keep the row valid",
-                session_id, ser_exc,
-            )
-            test_results_json = "[]"
-
-        db.add(CodingSubmission(
-            session_id=session.id,
-            question_index=question_index,
-            title=title,
-            description=description,
-            difficulty=difficulty,
-            language=language,
-            code=code,
-            test_cases_total=int(test_result.get("total", 0)),
-            test_cases_passed=int(test_result.get("passed", 0)),
-            test_results=test_results_json,
-            execution_time_ms=exec_ms,
-        ))
-    except Exception as e:
-        logging.warning("[submit_code] failed to persist CodingSubmission: %s", e)
-
-    # Commit the candidate's submission + transcript message BEFORE we touch
-    # the AI. If the AI review call subsequently fails, the candidate's code
-    # is already saved — they don't lose their work over a Claude/Gemini
-    # outage.
-    try:
-        db.commit()
-    except Exception as commit_exc:
-        logging.error("[submit_code] commit failed for session %s: %s", session_id, commit_exc)
-        db.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail="Could not save submission. Please try again in a moment.",
-        )
-
-    # Now get AI's response about the code. This is best-effort: if it fails,
-    # the candidate still sees their test results and the interview can
-    # continue on the next /message call (which will see the saved
-    # CodingSubmission in history).
-    from app.services.avatar_interview_service import conduct_turn
-
-    ai_context = (
-        f"The candidate submitted code for the coding challenge.\n"
-        f"Language: {language}\n"
-        f"Test Results: {test_result['passed']}/{test_result['total']} test cases passed\n"
-        f"Code:\n```{language}\n{code}\n```\n"
-        f"Please review their solution, discuss their approach, and then continue the interview."
-    )
-
-    ai_response: Optional[dict] = None
-    try:
-        ai_response = await conduct_turn(session, ai_context, db)
-    except Exception as ai_exc:
-        logging.exception(
-            "[submit_code] AI review failed for session %s — code IS saved, "
-            "candidate can continue: %s", session_id, ai_exc,
-        )
-        # Don't abort the request — the candidate's submission is durable.
-        # The client should fall back to showing the test results and let the
-        # candidate continue with the next interview message.
-        ai_response = {
-            "session_id": session_id,
-            "message": (
-                "Thanks for submitting. I'm reviewing your code — "
-                "please continue to the next question."
-            ),
-            "question_index": session.current_question_index,
-            "is_complete": False,
-            "is_off_topic": False,
-            "role": "ai",
-            "ai_review_failed": True,
-        }
-
-    return {
-        "test_result": test_result,
-        "ai_response": ai_response,
-    }
-
-
-@router.post(
     "/interview/sessions/{session_id}/save-coding-submission",
+    dependencies=[Depends(require_session_token)],
     summary="Persist a structured coding submission record",
     description=(
         "Lightweight endpoint that ONLY stores a `coding_submissions` row. "
@@ -3432,10 +3020,14 @@ async def save_coding_submission(
 async def list_coding_submissions(
     session_id: int,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
-    session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    # Recruiter-facing (the evaluation page), not the candidate — so this one is
+    # authorized by the admin JWT plus the session's organization, not by the
+    # candidate session token. It used to have no auth at all and was exempt
+    # from the session-token middleware, so anyone could walk sequential ids and
+    # read every tenant's submitted code.
+    authorize_session(db, session_id, user)
 
     rows = (
         db.query(CodingSubmission)
@@ -3481,67 +3073,6 @@ async def get_languages():
     """Return list of supported languages for the code editor."""
     from app.services.code_execution_service import get_supported_languages
     return {"languages": get_supported_languages()}
-
-
-# ── Whisper STT Transcription ────────────────────────────────────────────────
-
-WHISPER_LANG_MAP = {
-    "en": "en",
-    "hi": "hi",
-    "ar": "ar",
-    "hinglish": "hi",
-}
-
-@router.post(
-    "/interview/transcribe",
-    summary="Transcribe audio using OpenAI Whisper",
-    tags=["Interview"],
-)
-async def transcribe_audio(
-    audio: UploadFile = File(...),
-    language: str = Form("en"),
-):
-    """
-    Accepts an audio file (webm/wav/mp3) and returns the transcript using OpenAI Whisper.
-    No auth required — used by candidates during interviews.
-    """
-    from app.config import settings
-    import httpx
-
-    if not settings.OPENAI_API_KEY:
-        raise HTTPException(status_code=503, detail="Whisper STT not configured")
-
-    whisper_lang = WHISPER_LANG_MAP.get(language, "en")
-
-    try:
-        audio_bytes = await audio.read()
-        if len(audio_bytes) < 100:
-            return {"text": "", "error": "Audio too short"}
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {settings.OPENAI_API_KEY}"},
-                data={
-                    "model": "whisper-1",
-                    "language": whisper_lang,
-                    "response_format": "json",
-                },
-                files={"file": (audio.filename or "audio.webm", audio_bytes, audio.content_type or "audio/webm")},
-            )
-
-        if response.status_code != 200:
-            logging.warning(f"[Whisper] API error {response.status_code}: {response.text[:200]}")
-            return {"text": "", "error": f"Whisper API error: {response.status_code}"}
-
-        result = response.json()
-        return {"text": result.get("text", "").strip()}
-
-    except httpx.TimeoutException:
-        return {"text": "", "error": "Whisper API timeout"}
-    except Exception as e:
-        logging.error(f"[Whisper] Transcription failed: {e}")
-        return {"text": "", "error": str(e)}
 
 
 @router.get(

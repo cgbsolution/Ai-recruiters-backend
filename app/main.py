@@ -1,7 +1,7 @@
-import asyncio
 import logging
 import os
 import traceback
+import uuid
 from pathlib import Path
 
 # Load .env into os.environ BEFORE any module-level reads (e.g.
@@ -16,7 +16,6 @@ except ImportError:
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -30,7 +29,19 @@ logging.basicConfig(
 )
 # Keep app-level loggers at INFO so our own messages still appear
 logging.getLogger("app").setLevel(logging.INFO)
+
+# Login JWTs (and signed media URLs / URL refs, unless MEDIA_SIGNING_KEY /
+# URL_REF_KEY are set) are keyed off SECRET_KEY. Warn loudly, but never refuse
+# to boot a live service over it.
+if settings.secret_key_is_weak:
+    logging.getLogger("app.security").critical(
+        "SECRET_KEY is a placeholder or shorter than 32 characters — anyone who knows "
+        "it can forge login tokens. Rotate it to a long random value (users will have "
+        "to sign in again; set URL_REF_KEY first if bookmarked page links must keep working)."
+    )
+
 from app.database import Base, engine
+from app import media
 from app.routers import ai, auth, calendar, candidates, client_events, credits, file_manager, interview, jobs, observer, organizations, questions, resume_database, secondary_cam, tts, uploads
 
 import app.models  # noqa: F401 — ensure all models are registered with Base
@@ -172,6 +183,9 @@ _raw_migrations = [
         "CREATE INDEX IF NOT EXISTS ix_client_events_session_id ON client_events(session_id)",
         "CREATE INDEX IF NOT EXISTS ix_client_events_event_type ON client_events(event_type)",
         "CREATE INDEX IF NOT EXISTS ix_client_events_created_at ON client_events(created_at)",
+        # personal interview invite links (app.invites)
+        "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS invite_token VARCHAR(64)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_candidates_invite_token ON candidates (invite_token)",
 ]
 if not _SKIP_STARTUP_MIGRATIONS:
     try:
@@ -235,7 +249,7 @@ A fully automated, candidate-facing interview flow triggered by a unique per-job
 
 **Flow:**
 ```
-Generate URL → Candidate Registers → Permission Flow → Device Test
+Schedule Interview (personal invite link) → Candidate Verifies Access → Permission Flow → Device Test
 → Instructions → Cheating Warning → Live AI Interview → Evaluation
 → Candidate Feedback → Optional Meeting Scheduling
 ```
@@ -246,7 +260,7 @@ Generate URL → Candidate Registers → Permission Flow → Device Test
 |---|---|---|
 | `POST` | `/jobs/{job_id}/interview-url` | Generate or retrieve secure interview URL for a job |
 | `GET` | `/interview/{token}` | Validate token and return job configuration |
-| `POST` | `/interview/{token}/register` | Register candidate (email-exists check, create session) |
+| `POST` | `/interview/{token}/verify-access` | Admit a candidate from their personal invite link; issues the session token |
 | `POST` | `/interview/sessions/{id}/start` | Start interview — returns AI opening question |
 | `POST` | `/interview/sessions/{id}/message` | Send candidate answer — returns next AI question |
 | `POST` | `/interview/sessions/{id}/violation` | Log cheating event (tab switch, face detection, etc.) |
@@ -270,13 +284,19 @@ Recommendations: `Strong Hire` (≥80) · `Hire` (≥65) · `Maybe` (≥50) · `
 ---
 
 ### Authentication
-Currently open (no auth). Add Bearer token middleware before production.
+- **Admin API**: `Authorization: Bearer <JWT>` from `POST /auth/login`. Jobs, candidates and
+  organizations are scoped to the caller's organization; anything outside it returns 404.
+- **Candidate interview**: a candidate is admitted through their personal invite link
+  (`POST /interview/{token}/verify-access`), which issues a per-session token. Candidate calls on
+  `/interview/sessions/{id}/*` and `/secondary-cam/{id}/*` must send it as the `X-Session-Token`
+  header (`?st=` is accepted only by the sendBeacon routes and the observer publish WebSockets).
+- **Live observer**: `/observe/{token}` links are private, revocable links minted by recruiters.
 
 ### File Uploads
-- JD files: `POST /uploads/jd` — PDF / DOC / DOCX ≤ 10 MB
 - Resume files: `POST /candidates/upload-resume` — multipart, multiple files, parallel parsing (3 concurrent)
 - Bulk resumes: `POST /resume-database/upload` — batch upload to central database
-- Static files served at `/uploads/...`
+- Uploaded media (recordings, photos, screenshots, resumes) is private: there is no public `/uploads`
+  path. Authorized API responses carry short-lived signed `/media/...` URLs.
 
 ### Models
 - Claude `claude-haiku-4-5` for resume parsing (fast, ~1-2s)
@@ -321,9 +341,10 @@ app = FastAPI(
         {
             "name": "Interview",
             "description": (
-                "**Public** candidate-facing AI Avatar Interview system. "
-                "No authentication required on these endpoints. "
-                "Covers: token validation, candidate registration, AI conversation turns, "
+                "Candidate-facing AI Avatar Interview system (no admin login). "
+                "Candidates are admitted through their personal invite link; candidate calls on "
+                "`/interview/sessions/{id}/*` require the `X-Session-Token` header issued at admission. "
+                "Covers: token validation, candidate access, AI conversation turns, "
                 "violation logging, session completion, AI evaluation generation, "
                 "candidate feedback, and meeting slot booking."
             ),
@@ -341,8 +362,11 @@ app = FastAPI(
             "description": "Global question bank — full CRUD for reusable interview questions.",
         },
         {
-            "name": "Uploads",
-            "description": "File upload endpoint for Job Description documents (PDF / DOC / DOCX ≤ 10 MB).",
+            "name": "Media",
+            "description": (
+                "Private uploads (recordings, photos, screenshots, resumes) served only through "
+                "short-lived signed `/media/...` URLs handed out by authorized API responses."
+            ),
         },
         {
             "name": "Resume Database",
@@ -368,81 +392,24 @@ app = FastAPI(
 )
 
 # ── Global exception handler — logs full traceback for every 500 ─────────────
+# The body stays generic: exception text can carry SQL, parameters and file
+# paths. error_id ties a user's report to the log entry. Only the path is
+# logged — query strings carry OAuth state/code and session tokens.
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
+    error_id = uuid.uuid4().hex
     logging.error(
-        f"UNHANDLED 500 | {request.method} {request.url}\n"
-        f"{traceback.format_exc()}"
+        f"UNHANDLED 500 [{error_id}] | {request.method} {request.url.path}\n"
+        + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     )
     return JSONResponse(
         status_code=500,
-        content={"detail": f"Internal server error: {type(exc).__name__}: {exc}"},
+        content={"detail": "Internal server error", "error_id": error_id},
     )
 
-# ── Session-token enforcement for candidate session endpoints ────────────────
-# /interview/sessions/{id}/* used to be completely unauthenticated with small
-# sequential integer IDs (IDOR): anyone could read transcripts/evaluations,
-# inject answers, or terminate sessions. A per-session token is minted at
-# register/verify/login (see interview._get_or_mint_session_access_token) and
-# must be echoed back as the X-Session-Token header (or ?st= for sendBeacon).
-# Sessions created before this feature have no stored token → grandfathered.
-# Registered BEFORE the CORS middlewares (i.e. innermost) so 403s get CORS headers.
-import json as _json
-import re as _re_sess
-from starlette.concurrency import run_in_threadpool
-
-_SESSION_PATH_RE = _re_sess.compile(r"^/interview/sessions/(\d+)/([a-z0-9\-]+)")
-# upload-recording: orphan-recovery re-uploads on a later app load with no
-#   token in hand; the endpoint has its own empty/smaller-file guard rails.
-# coding-submissions: read by the authenticated ADMIN evaluation page, which
-#   has no candidate session token.
-_SESSION_AUTH_EXEMPT = {"upload-recording", "coding-submissions"}
-
-
-def _load_session_access_token(sid: int):
-    from app.database import SessionLocal as _SL
-    from app.models.interview import InterviewSession as _IS
-    db = _SL()
-    try:
-        row = (
-            db.query(_IS.session_metadata)
-            .filter(_IS.id == sid)
-            .first()
-        )
-    finally:
-        db.close()
-    if row is None:
-        return None, False  # session doesn't exist — let the route 404
-    try:
-        meta = _json.loads(row[0] or "{}")
-    except Exception:
-        meta = {}
-    return meta.get("access_token"), True
-
-
-@app.middleware("http")
-async def enforce_session_token(request: Request, call_next):
-    if request.method != "OPTIONS":
-        m = _SESSION_PATH_RE.match(request.url.path)
-        if m and m.group(2) not in _SESSION_AUTH_EXEMPT:
-            try:
-                expected, _exists = await run_in_threadpool(
-                    _load_session_access_token, int(m.group(1))
-                )
-            except Exception as exc:
-                logging.error(f"[SessionAuth] token lookup failed: {exc}")
-                expected = None
-            if expected:
-                provided = (
-                    request.headers.get("x-session-token")
-                    or request.query_params.get("st")
-                )
-                if provided != expected:
-                    return JSONResponse(
-                        status_code=403,
-                        content={"detail": "Invalid or missing session token"},
-                    )
-    return await call_next(request)
+# Candidate session-token checks are a per-route FastAPI dependency
+# (app.session_auth.require_session_token) on every /interview/sessions/{id}/*
+# and /secondary-cam/{id}/* route — no longer a path-regex middleware here.
 
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
@@ -465,12 +432,16 @@ async def add_cors_on_error(request: Request, call_next):
     try:
         response = await call_next(request)
     except Exception as exc:
-        # Unhandled exception — return 500 WITH CORS headers
-        logging.error(f"UNHANDLED {request.method} {request.url}: {exc}", exc_info=True)
-        from starlette.responses import JSONResponse
+        # Unhandled exception — return 500 WITH CORS headers. Generic body and a
+        # path-only log line, same as unhandled_exception_handler above.
+        error_id = uuid.uuid4().hex
+        logging.error(
+            f"UNHANDLED 500 [{error_id}] | {request.method} {request.url.path}: {exc!r}",
+            exc_info=exc,
+        )
         response = JSONResponse(
             status_code=500,
-            content={"detail": "Internal server error"},
+            content={"detail": "Internal server error", "error_id": error_id},
         )
     if origin:
         if "*" in _cors_origins:
@@ -482,200 +453,19 @@ async def add_cors_on_error(request: Request, call_next):
         response.headers["Access-Control-Allow-Headers"] = "*"
     return response
 
-# ── Static file serving for uploads ──────────────────────────────────────────
-import os
+# ── Upload folders ───────────────────────────────────────────────────────────
+# Nothing under the upload root is publicly routable. The old
+# app.mount("/uploads", StaticFiles(...)) served every tenant's recordings,
+# photos and resumes to anyone; authorized API responses now carry short-lived
+# signed /media/... URLs, served by app.media.router — a normal route, so the
+# CORS middlewares above cover its responses (including 403/404).
+for _upload_sub in ("jd", "resumes", "recordings", "photos", "screenshots"):
+    os.makedirs(os.path.join(media.UPLOAD_ROOT, _upload_sub), exist_ok=True)
 
-IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
-UPLOAD_ROOT = "/tmp/uploads" if IS_SERVERLESS else "uploads"
-
-os.makedirs(f"{UPLOAD_ROOT}/jd", exist_ok=True)
-os.makedirs(f"{UPLOAD_ROOT}/resumes", exist_ok=True)
-os.makedirs(f"{UPLOAD_ROOT}/recordings", exist_ok=True)
-# Serve static uploads with CORS headers (screenshots, recordings, resumes)
-from starlette.middleware.base import BaseHTTPMiddleware
-
-class CORSStaticMiddleware(BaseHTTPMiddleware):
-    """Add CORS headers to /uploads/* responses (StaticFiles doesn't go through
-    CORSMiddleware). Only reflects ALLOWED origins — the previous version
-    reflected ANY Origin with Allow-Credentials=true, which lets any website a
-    user visits read uploaded recordings/resumes cross-origin."""
-    async def dispatch(self, request, call_next):
-        response = await call_next(request)
-        if request.url.path.startswith("/uploads/"):
-            origin = request.headers.get("origin", "")
-            if origin and origin in _cors_origins:
-                response.headers["Access-Control-Allow-Origin"] = origin
-                response.headers["Access-Control-Allow-Credentials"] = "true"
-            elif "*" in _cors_origins:
-                response.headers["Access-Control-Allow-Origin"] = "*"
-        return response
-
-app.add_middleware(CORSStaticMiddleware)
-
-# ── Recording download with optional WebM → MP4 conversion ──────────────────
-import shutil
-import subprocess
-import tempfile
-from fastapi.responses import FileResponse
-
-def _find_ffmpeg() -> str | None:
-    """Find an ffmpeg binary: system PATH first, then the bundled one from imageio-ffmpeg."""
-    path = shutil.which("ffmpeg")
-    if path:
-        return path
-    try:
-        import imageio_ffmpeg
-        path = imageio_ffmpeg.get_ffmpeg_exe()
-        if path and os.path.isfile(path):
-            return path
-    except Exception:
-        pass
-    return None
-
-_FFMPEG = _find_ffmpeg()
+# MP4 conversion now lives in app.media. interview.py still does
+# `from app.main import _FFMPEG` (upload remux / recording assembly), so keep it.
+_FFMPEG = media.find_ffmpeg()
 logging.info("ffmpeg binary: %s", _FFMPEG or "NOT FOUND — MP4 conversion disabled")
-
-# Cache converted MP4s so repeated downloads don't re-convert every time
-_MP4_CACHE_DIR = os.path.join(UPLOAD_ROOT, "recordings", ".mp4_cache")
-os.makedirs(_MP4_CACHE_DIR, exist_ok=True)
-
-@app.get("/recordings/{filename}/download", tags=["Recordings"])
-async def download_recording(filename: str, format: str = "original"):
-    """
-    Download a recording file.
-
-    - **format=original** (default): returns the raw .webm file with a
-      Content-Disposition header so the browser saves instead of plays.
-    - **format=mp4**: converts the .webm to .mp4 using ffmpeg (system or
-      bundled via imageio-ffmpeg). Converted files are cached so subsequent
-      downloads are instant.
-    """
-    safe_name = os.path.basename(filename)          # prevent path traversal
-    src = os.path.join(UPLOAD_ROOT, "recordings", safe_name)
-    if not os.path.isfile(src):
-        raise HTTPException(status_code=404, detail="Recording not found")
-
-    stem = os.path.splitext(safe_name)[0]
-
-    if format == "mp4":
-        if not _FFMPEG:
-            raise HTTPException(
-                status_code=501,
-                detail="MP4 conversion unavailable — ffmpeg is not installed on the server.",
-            )
-
-        # Check cache first
-        cached = os.path.join(_MP4_CACHE_DIR, f"{stem}.mp4")
-        if os.path.isfile(cached):
-            return FileResponse(
-                cached,
-                media_type="video/mp4",
-                filename=f"{stem}.mp4",
-            )
-
-        # Convert to MP4 (H.264 + AAC, fast preset). Runs in a thread so the
-        # event loop isn't blocked for minutes while ffmpeg works — other
-        # requests keep serving.
-        tmp_path = cached + ".tmp"
-        try:
-            proc = await asyncio.to_thread(
-                subprocess.run,
-                [
-                    _FFMPEG, "-y", "-i", src,
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart",
-                    tmp_path,
-                ],
-                capture_output=True, timeout=600,
-            )
-            if proc.returncode != 0:
-                stderr = proc.stderr.decode(errors="replace")[-500:]
-                logging.error("ffmpeg conversion failed: %s", stderr)
-                raise HTTPException(status_code=500, detail="MP4 conversion failed")
-            # Atomic rename into cache
-            os.replace(tmp_path, cached)
-        except subprocess.TimeoutExpired:
-            if os.path.isfile(tmp_path):
-                os.remove(tmp_path)
-            raise HTTPException(status_code=504, detail="Conversion timed out (video too long)")
-        except HTTPException:
-            raise
-        except Exception as exc:
-            if os.path.isfile(tmp_path):
-                os.remove(tmp_path)
-            logging.error("Unexpected conversion error: %s", exc)
-            raise HTTPException(status_code=500, detail="MP4 conversion failed")
-
-        return FileResponse(
-            cached,
-            media_type="video/mp4",
-            filename=f"{stem}.mp4",
-        )
-
-    # Default: serve the original .webm as a download
-    return FileResponse(
-        src,
-        media_type="video/webm",
-        filename=safe_name,
-    )
-
-@app.post("/recordings/fix-all", tags=["Recordings"])
-async def fix_all_recordings():
-    """
-    Remux all WebM recordings that are missing duration/seek metadata.
-    This fixes the seekbar in the video player for files recorded by
-    Chrome's MediaRecorder (which omits the WebM Cues element).
-    Run once after deploying the fix to repair existing recordings.
-    """
-    if not _FFMPEG:
-        raise HTTPException(status_code=501, detail="ffmpeg not available")
-
-    rec_dir = os.path.join(UPLOAD_ROOT, "recordings")
-    files = [f for f in os.listdir(rec_dir) if f.endswith(".webm") and not f.startswith(".")]
-    fixed = []
-    skipped = []
-    failed = []
-
-    for fname in files:
-        src = os.path.join(rec_dir, fname)
-        # Check if duration is already set
-        probe = await asyncio.to_thread(
-            subprocess.run,
-            [_FFMPEG, "-i", src],
-            capture_output=True, text=True, timeout=10,
-        )
-        if "Duration: N/A" not in probe.stderr:
-            skipped.append(fname)
-            continue
-
-        tmp = src + ".fixed.webm"
-        try:
-            proc = await asyncio.to_thread(
-                subprocess.run,
-                [_FFMPEG, "-y", "-i", src, "-c", "copy", tmp],
-                capture_output=True, timeout=120,
-            )
-            if proc.returncode == 0 and os.path.isfile(tmp):
-                os.replace(tmp, src)
-                fixed.append(fname)
-            else:
-                if os.path.isfile(tmp):
-                    os.remove(tmp)
-                failed.append(fname)
-        except Exception:
-            if os.path.isfile(tmp):
-                os.remove(tmp)
-            failed.append(fname)
-
-    return {
-        "total": len(files),
-        "fixed": fixed,
-        "skipped": skipped,
-        "failed": failed,
-    }
-
-app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
 
 # ── Routers ──────────────────────────────────────────────────────────────────
 app.include_router(jobs.router, prefix="/jobs", tags=["Jobs"])
@@ -684,6 +474,9 @@ app.include_router(questions.router, prefix="/questions", tags=["Questions"])
 app.include_router(candidates.router, prefix="/candidates", tags=["Candidates"])
 app.include_router(calendar.router, prefix="/calendar", tags=["Calendar"])
 app.include_router(ai.router, prefix="/ai", tags=["AI"])
+# POST /uploads/jd (authenticated; the job form uploads the JD file here). It was
+# shadowed by the old public /uploads static mount; files land in UPLOAD_ROOT/jd,
+# which app.services.jd_metadata_service.resolve_jd_file reads from.
 app.include_router(uploads.router, prefix="/uploads", tags=["Uploads"])
 app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
 app.include_router(interview.router, tags=["Interview"])
@@ -695,6 +488,7 @@ app.include_router(secondary_cam.router, tags=["Secondary Camera"])
 app.include_router(tts.router, tags=["Text-to-Speech"])
 app.include_router(observer.router, tags=["Live Observer"])
 app.include_router(client_events.router, tags=["Client Telemetry"])
+app.include_router(media.router)
 
 
 @app.on_event("startup")

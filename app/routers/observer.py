@@ -12,9 +12,12 @@ audio, video, chat, or any other data into the candidate's interview — the
 publisher RTCPeerConnection is configured browser-side with sendonly tracks
 and the observer side rejects all addTrack attempts.
 
-The candidate authenticates the publish WS by passing their public
-`InterviewToken.token` as a query string. We verify it matches the session's
-job before accepting.
+The candidate authenticates the publish WebSockets with two query parameters:
+`st`, their per-session access token (the one sent as X-Session-Token on REST
+calls), and `interview_token`, the job's interview link token, which must be
+active, unexpired and belong to the session's job. The shared job token used to
+be enough on its own, so anyone holding a job's link could take over another
+candidate's publisher socket in that job.
 """
 
 from __future__ import annotations
@@ -43,6 +46,7 @@ from app.models.interview import (
 from app.models.job import Job
 from app.models.observer import ObserverToken
 from app.services.observer_broker import broker
+from app.session_auth import session_token_matches
 
 logger = logging.getLogger(__name__)
 
@@ -393,27 +397,62 @@ async def observer_ws(websocket: WebSocket, token: str):
             pass
 
 
-# ── 4. Publisher (candidate) signal WS ───────────────────────────────────────
+# ── Helper: publisher (candidate) auth ──────────────────────────────────────
 
-@router.websocket("/publish/{session_id}")
-async def publisher_ws(websocket: WebSocket, session_id: int, interview_token: str = Query(...)):
-    """Candidate's WebRTC signalling socket. Authenticated by the public
-    interview token they're already holding."""
-    await websocket.accept()
-
+def _publisher_denial(session_id: int, interview_token: str, st: Optional[str]) -> Optional[tuple[int, str]]:
+    """None when the candidate may publish for this session, else (close code, reason)."""
     with SessionLocal() as db:
         sess = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
-        if sess is None:
-            await websocket.close(code=4404, reason="session not found")
-            return
+        # Same answer for an unknown session and a wrong token, so sequential
+        # session ids can't be probed for existence.
+        if sess is None or not session_token_matches(sess, st):
+            return 4403, "invalid session token"
         tok = (
             db.query(InterviewToken)
             .filter(InterviewToken.token == interview_token, InterviewToken.is_active == True)
             .first()
         )
         if tok is None or tok.job_id != sess.job_id:
-            await websocket.close(code=4401, reason="bad interview token")
-            return
+            return 4401, "bad interview token"
+        if tok.expires_at and tok.expires_at < datetime.utcnow():
+            return 4410, "interview link expired"
+    return None
+
+
+async def _ws_authorize_publisher(
+    websocket: WebSocket, session_id: int, interview_token: str, st: Optional[str]
+) -> bool:
+    """Close the (already accepted) socket and return False unless the caller
+    may publish for this session. Fails closed when the lookup errors."""
+    try:
+        denial = await asyncio.to_thread(_publisher_denial, session_id, interview_token, st)
+    except Exception:
+        logger.exception("publisher auth lookup failed for session %s", session_id)
+        denial = (1011, "could not verify session")
+    if denial is None:
+        return True
+    code, reason = denial
+    try:
+        await websocket.close(code=code, reason=reason)
+    except Exception:
+        pass
+    return False
+
+
+# ── 4. Publisher (candidate) signal WS ───────────────────────────────────────
+
+@router.websocket("/publish/{session_id}")
+async def publisher_ws(
+    websocket: WebSocket,
+    session_id: int,
+    interview_token: str = Query(...),
+    st: Optional[str] = Query(default=None),
+):
+    """Candidate's WebRTC signalling socket. Authenticated by the candidate's
+    session token (`st`) plus the interview link token they're already holding."""
+    await websocket.accept()
+    if not await _ws_authorize_publisher(websocket, session_id, interview_token, st):
+        return
 
     inbox = await broker.register_publisher(session_id)
     await websocket.send_json({"type": "ready", "ice_servers": _ice_servers()})
@@ -479,29 +518,23 @@ async def publisher_ws(websocket: WebSocket, session_id: int, interview_token: s
 # Trade-off: lower frame rate than WebRTC, no audio.
 
 
+# A webcam frame is a ~30 KB JPEG; anything past this is dropped so a publisher
+# can't pin large blobs in the broker's last-frame cache.
+_MAX_FRAME_BYTES = 1024 * 1024
+
+
 @router.websocket("/publish-frames/{session_id}")
 async def publish_frames_ws(
     websocket: WebSocket,
     session_id: int,
     interview_token: str = Query(...),
+    st: Optional[str] = Query(default=None),
 ):
     """Candidate frame publisher. Receives binary JPEG blobs and broadcasts
     them to all observers on this session."""
     await websocket.accept()
-
-    with SessionLocal() as db:
-        sess = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
-        if sess is None:
-            await websocket.close(code=4404, reason="session not found")
-            return
-        tok = (
-            db.query(InterviewToken)
-            .filter(InterviewToken.token == interview_token, InterviewToken.is_active == True)
-            .first()
-        )
-        if tok is None or tok.job_id != sess.job_id:
-            await websocket.close(code=4401, reason="bad interview token")
-            return
+    if not await _ws_authorize_publisher(websocket, session_id, interview_token, st):
+        return
 
     await broker.set_frame_publisher_present(session_id, True)
     try:
@@ -509,6 +542,9 @@ async def publish_frames_ws(
             msg = await websocket.receive()
             # Accept either binary frames (preferred) or a text "ping".
             if "bytes" in msg and msg["bytes"] is not None:
+                if len(msg["bytes"]) > _MAX_FRAME_BYTES:
+                    # Oversized — skip it (no fan-out, no cache) but keep the socket.
+                    continue
                 # Broker errors MUST NOT disconnect the candidate. The frame
                 # relay is best-effort eye-candy for observers; the
                 # candidate's own interview (audio/video recording, Q&A,

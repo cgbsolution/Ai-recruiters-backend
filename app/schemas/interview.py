@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, EmailStr, field_validator
+from pydantic import BaseModel, EmailStr, field_validator, model_validator
 
 
 # ── Token / Job Config ────────────────────────────────────────────────────────
@@ -41,37 +41,30 @@ class JobConfig(BaseModel):
     manager_email: Optional[str] = None
 
 
-# ── Registration ──────────────────────────────────────────────────────────────
-
-class CandidateRegisterRequest(BaseModel):
-    name: str
-    email: EmailStr
-    phone: Optional[str] = None
-    resume_path: str                    # required — candidate cannot register without a resume
-
-
-class CandidateRegisterResponse(BaseModel):
-    session_id: int
-    candidate_id: int
-    is_existing_user: bool
-    already_completed: bool = False
-    can_resume: bool = False
-    session_status: Optional[str] = None  # "pending" | "in_progress" when can_resume is True
-    message: str
-    # Per-session bearer credential. The client must echo it back as the
-    # X-Session-Token header (or ?st= query for sendBeacon) on every
-    # /interview/sessions/{id}/* call — closes the sequential-id IDOR hole.
-    session_token: Optional[str] = None
-
-
 # ── Verify Access (invitation-based) ──────────────────────────────────────────
 
 class VerifyAccessRequest(BaseModel):
-    email: EmailStr
+    # Legacy email verification (?candidate=<email> links sent before personal invites)
+    email: Optional[EmailStr] = None
+    # Personal invite secret from the candidate's link (?invite=<secret>); wins over email
+    invite: Optional[str] = None
+
+    @field_validator("email", "invite", mode="before")
+    @classmethod
+    def _blank_is_missing(cls, v):
+        if isinstance(v, str):
+            return v.strip() or None
+        return v
+
+    @model_validator(mode="after")
+    def _require_invite_or_email(self):
+        if not self.invite and not self.email:
+            raise ValueError("Provide an invite or an email")
+        return self
 
 
 class VerifyAccessResponse(BaseModel):
-    access: str  # "granted" | "apply" | "completed" | "terminated"
+    access: str  # "granted" | "apply" | "completed" | "terminated" | "invite_required" | "invalid_invite"
     candidate_name: Optional[str] = None
     session_id: Optional[int] = None
     candidate_id: Optional[int] = None
@@ -83,7 +76,9 @@ class VerifyAccessResponse(BaseModel):
     interview_timezone: Optional[str] = None
     joining_flexibility: Optional[str] = None  # "scheduled_time" | "anytime"
     allow_joining_early: Optional[bool] = None
-    # Per-session bearer credential (see CandidateRegisterResponse.session_token)
+    # Per-session bearer credential. The client echoes it back as the
+    # X-Session-Token header (or ?st= for sendBeacon) on every
+    # /interview/sessions/{id}/* call.
     session_token: Optional[str] = None
 
 

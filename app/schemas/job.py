@@ -1,7 +1,9 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StringConstraints, computed_field
+
+from app.refs import encode_ref
 
 
 # ── Nested Input Schemas ─────────────────────────────────────────────────────
@@ -70,6 +72,16 @@ class JobCreate(BaseModel):
 
 class JobUpdate(JobCreate):
     pass
+
+
+MAX_MATCHED_CANDIDATES_PER_REQUEST = 500
+
+
+class AddMatchedCandidatesRequest(BaseModel):
+    """Body of POST /jobs/{job_id}/add-matched-candidates (was an untyped dict)."""
+    candidate_emails: List[Annotated[str, StringConstraints(max_length=320)]] = Field(
+        default_factory=list, max_length=MAX_MATCHED_CANDIDATES_PER_REQUEST
+    )
 
 
 # ── Response Schemas ─────────────────────────────────────────────────────────
@@ -150,6 +162,12 @@ class JobRead(BaseModel):
     summary: Optional[str] = None
     model_config = {"from_attributes": True}
 
+    @computed_field
+    @property
+    def ref(self) -> str:
+        """Opaque id for page URLs (app.refs)."""
+        return encode_ref("job", self.id)
+
 
 class JobListItem(BaseModel):
     id: int
@@ -166,3 +184,9 @@ class JobListItem(BaseModel):
     deadline: Optional[str]
     interview_token: Optional[str] = None
     model_config = {"from_attributes": True}
+
+    @computed_field
+    @property
+    def ref(self) -> str:
+        """Opaque id for page URLs (app.refs)."""
+        return encode_ref("job", self.id)

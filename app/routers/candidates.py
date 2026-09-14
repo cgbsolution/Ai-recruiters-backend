@@ -16,27 +16,59 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from app.auth import get_current_user, get_org_id
+from app.authz import authorize_candidate, authorize_job, job_org_id
 from app.database import get_db, SessionLocal
+from app.invites import build_invite_url, ensure_invite_token, get_or_create_job_token, rotate_invite_token
+from app.media import (
+    UPLOAD_ROOT,
+    resolve_upload_file,
+    resume_file_in_use,
+    safe_unlink_upload,
+    safe_upload_name,
+    sign_media_url,
+    to_upload_relpath,
+)
 from app.models.candidate import Candidate
 from app.models.organization import Organization
 from app.models.resume_metadata import ResumeMetadata
 from app.models.user import User
+from app.refs import CandidateId, JobId, encode_ref
 
 limiter = Limiter(key_func=get_remote_address)
 
 
 def _get_candidate_with_org_check(db: Session, candidate_id: int, user: User) -> Candidate:
-    """Fetch a candidate and verify it belongs to the user's organization."""
-    from app.models.job import Job as JobModel
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    """Fetch a candidate the caller may access, or 404 (fails closed — see app.authz)."""
+    return authorize_candidate(db, candidate_id, user)
+
+
+def _scope_resume_metadata(query, org_id: Optional[int]):
+    """Restrict a ResumeMetadata query to one tenant — never global.
+
+    ResumeMetadata is per organization, and email lookups without this filter
+    matched (and overwrote) other tenants' parsed resumes. Rows with no
+    organization match only when the owning tenant itself is unknown (a global
+    super admin's job-less upload)."""
+    if org_id is None:
+        return query.filter(ResumeMetadata.organization_id.is_(None))
+    return query.filter(ResumeMetadata.organization_id == org_id)
+
+
+def _require_whatsapp_allowed(db: Session, user: User) -> None:
+    """403 unless WhatsApp notifications are enabled for the caller's organization.
+
+    get_org_id() returns None only for a global super admin (who isn't gated);
+    an admin/recruiter without an organization is refused by get_org_id itself
+    instead of silently skipping the check."""
     org_id = get_org_id(user)
-    if org_id is not None and candidate.job_id:
-        job = db.query(JobModel).filter(JobModel.id == candidate.job_id).first()
-        if not job or job.organization_id != org_id:
-            raise HTTPException(status_code=404, detail="Candidate not found")
-    return candidate
+    if org_id is None:
+        return
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org or not getattr(org, "allow_whatsapp", False):
+        raise HTTPException(
+            status_code=403,
+            detail="WhatsApp notifications are not enabled for your organization. Contact your super admin.",
+        )
 
 
 def _check_and_increment_candidate_quota(db: Session, job_id: int) -> None:
@@ -60,6 +92,7 @@ from app.schemas.candidate import (
     CandidateCreate,
     CandidateRead,
     CandidateUpdate,
+    HireCandidateRequest,
     PromoteStageRequest,
     ScheduleInterviewRequest,
     SendWhatsAppRequest,
@@ -69,8 +102,6 @@ from app.services import candidate_service
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
-IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
-UPLOAD_ROOT = "/tmp/uploads" if IS_SERVERLESS else "uploads"
 RESUME_UPLOAD_DIR = f"{UPLOAD_ROOT}/resumes"
 os.makedirs(RESUME_UPLOAD_DIR, exist_ok=True)
 
@@ -79,6 +110,22 @@ ALLOWED_RESUME_TYPES = {
     "application/msword",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
+_RESUME_EXT_FOR_TYPE = {
+    "application/pdf": ".pdf",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+}
+
+
+def _stored_resume_name(file: UploadFile) -> str:
+    """Server-chosen disk name for an uploaded resume: timestamp + sanitized stem +
+    an allowed extension (the client file name used to be joined in verbatim)."""
+    stem, ext = safe_upload_name(
+        file.filename,
+        _RESUME_EXT_FOR_TYPE.values(),
+        _RESUME_EXT_FOR_TYPE.get(file.content_type, ".pdf"),
+    )
+    return f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{stem}{ext}"
 
 # ── Concurrent background parse pool ─────────────────────────────────────────
 _parse_semaphore: asyncio.Semaphore | None = None
@@ -108,11 +155,14 @@ def _sync_extract_text(file_path: str) -> str:
     return text.replace("\x00", "")
 
 
-async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
+async def _parse_one(candidate_id: int, file_path: str, job_id: int | None, org_id: int | None = None):
     """
     Parse a single resume concurrently (guarded by semaphore).
     Uses Haiku (~1-2s) for parsing + smart scoring (~50ms) for fit score.
     Total: ~3-5s per resume vs ~30-40s with old Sonnet approach.
+
+    `org_id` is the uploader's organization (get_org_id), used for the resume
+    metadata when no job is given; with a job, the job's organization is used.
     """
     async with _get_parse_semaphore():
         db = SessionLocal()
@@ -126,8 +176,9 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
 
             from app.models.job import Job, JobSkill, JobResponsibility
 
-            # Determine organization_id from the job
-            _org_id = None
+            # Determine organization_id from the job (else the uploader's). Every
+            # ResumeMetadata lookup below is scoped to it — never across tenants.
+            _org_id = org_id
             if job_id:
                 _job = db.query(Job).filter(Job.id == job_id).first()
                 if _job:
@@ -210,12 +261,10 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
                     existing.candidate_stage = "Candidates"
 
                     # Update ResumeMetadata for existing candidate (org-scoped)
-                    ex_meta_q = db.query(ResumeMetadata).filter(
-                        ResumeMetadata.candidate_email == real_email
-                    )
-                    if _org_id is not None:
-                        ex_meta_q = ex_meta_q.filter(ResumeMetadata.organization_id == _org_id)
-                    ex_meta = ex_meta_q.first()
+                    ex_meta = _scope_resume_metadata(
+                        db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == real_email),
+                        _org_id,
+                    ).first()
                     if not ex_meta:
                         ex_meta = ResumeMetadata(candidate_email=real_email, organization_id=_org_id)
                         db.add(ex_meta)
@@ -265,12 +314,10 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None):
             # ── Upsert ResumeMetadata (org-scoped) ────────────────────────────
             meta = None
             if parsed_email and not parsed_email.endswith("@resume.local"):
-                meta_q = db.query(ResumeMetadata).filter(
-                    ResumeMetadata.candidate_email == parsed_email
-                )
-                if _org_id is not None:
-                    meta_q = meta_q.filter(ResumeMetadata.organization_id == _org_id)
-                meta = meta_q.first()
+                meta = _scope_resume_metadata(
+                    db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == parsed_email),
+                    _org_id,
+                ).first()
 
             if not meta:
                 # Prefer the real parsed email; otherwise use the (possibly rewritten)
@@ -418,7 +465,7 @@ async def _compute_fit_score_with_fallback(
 _background_tasks: list[asyncio.Task] = []  # prevent GC of fire-and-forget tasks
 
 
-def _launch_parse_task(candidate_id: int, file_path: str, job_id: int | None):
+def _launch_parse_task(candidate_id: int, file_path: str, job_id: int | None, org_id: int | None = None):
     """Fire-and-forget a concurrent parse task (guarded by semaphore)."""
     def _task_done(t: asyncio.Task):
         _background_tasks.discard(t) if hasattr(_background_tasks, 'discard') else None
@@ -437,7 +484,7 @@ def _launch_parse_task(candidate_id: int, file_path: str, job_id: int | None):
         logger.error("No running event loop for parse task (candidate %s)", candidate_id)
         return
 
-    task = loop.create_task(_parse_one(candidate_id, file_path, job_id))
+    task = loop.create_task(_parse_one(candidate_id, file_path, job_id, org_id))
     _background_tasks.append(task)  # prevent garbage collection
     task.add_done_callback(_task_done)
     logger.info("Parse task created for candidate %s: %s", candidate_id, task)
@@ -447,14 +494,13 @@ def _launch_parse_task(candidate_id: int, file_path: str, job_id: int | None):
 
 @router.get("/can-add")
 def can_add_candidate(
-    job_id: int,
+    job_id: JobId,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """Pre-check whether another candidate can be added for this job."""
-    from app.models.job import Job as JobModel
-    job = db.query(JobModel).filter(JobModel.id == job_id).first()
-    if not job or not job.organization_id:
+    job = authorize_job(db, job_id, user)
+    if not job.organization_id:
         return {"allowed": True}
     org = db.query(Organization).filter(Organization.id == job.organization_id).first()
     if not org or (org.max_candidates_per_job or 0) == 0:
@@ -467,6 +513,60 @@ def can_add_candidate(
             "limit": org.max_candidates_per_job,
         }
     return {"allowed": True}
+
+
+# ── Duplicate Check ──────────────────────────────────────────────────────────
+# Declared before GET /{candidate_id}, which would otherwise capture
+# "/check-duplicate" and answer 422.
+
+@router.get(
+    "/check-duplicate",
+    response_model=DuplicateCheckResponse,
+    summary="Check if a resume/candidate already exists by email",
+    description=(
+        "Checks the central resume_metadata table to see if a candidate with "
+        "this email already has a parsed resume. Also returns which job_ids "
+        "the candidate is already linked to."
+    ),
+)
+def check_duplicate(
+    email: str,
+    job_id: Optional[JobId] = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    from app.models.job import Job
+
+    org_id = get_org_id(user)  # None only for a global super admin
+    query = db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == email)
+    if org_id is not None:
+        query = query.filter(ResumeMetadata.organization_id == org_id)
+    meta = query.first()
+
+    if not meta:
+        return DuplicateCheckResponse(exists=False)
+
+    # Linked jobs within the caller's organization only (this used to list the
+    # email's job ids across every tenant).
+    linked_q = (
+        db.query(Candidate.job_id)
+        .join(Job, Candidate.job_id == Job.id)
+        .filter(Candidate.email == email)
+    )
+    if org_id is not None:
+        linked_q = linked_q.filter(Job.organization_id == org_id)
+    linked_jobs = [c.job_id for c in linked_q.all()]
+
+    return DuplicateCheckResponse(
+        exists=True,
+        candidate_email=meta.candidate_email,
+        candidate_name=meta.candidate_name,
+        current_designation=meta.current_designation,
+        resume_file_path=meta.resume_file_path,
+        resume_file_url=sign_media_url(meta.resume_file_path),
+        parsed_at=meta.parsed_at,
+        linked_job_ids=linked_jobs,
+    )
 
 
 # ── Standard CRUD ─────────────────────────────────────────────────────────────
@@ -484,7 +584,7 @@ def can_add_candidate(
 )
 def list_candidates(
     status: Optional[str] = None,
-    job_id: Optional[int] = None,
+    job_id: Optional[JobId] = None,
     stage: Optional[str] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -499,9 +599,19 @@ def list_candidates(
     summary="Create candidate manually",
 )
 def create_candidate(payload: CandidateCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    # Enforce org candidate quota using lifetime counter
-    if payload.job_id:
-        _check_and_increment_candidate_quota(db, payload.job_id)
+    if payload.job_id is not None:
+        # The body job must belong to the caller's organization (404 otherwise) —
+        # this used to insert into, or overwrite rows of, any tenant's job.
+        authorize_job(db, payload.job_id, user)
+        # Enforce org candidate quota using lifetime counter — only when a row
+        # is actually inserted (an existing email on this job is updated in place).
+        existing = (
+            candidate_service.find_candidate_for_job(db, payload.email, payload.job_id)
+            if payload.email
+            else None
+        )
+        if existing is None:
+            _check_and_increment_candidate_quota(db, payload.job_id)
     candidate = candidate_service.create_candidate(db, payload)
     candidate.added_by = user.email
     db.commit()
@@ -528,16 +638,21 @@ def create_candidate(payload: CandidateCreate, db: Session = Depends(get_db), us
     response_model=CandidateRead,
     summary="Get candidate by ID",
 )
-def get_candidate(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def get_candidate(candidate_id: CandidateId, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     candidate = _get_candidate_with_org_check(db, candidate_id, user)
     return candidate
 
 
 @router.put("/{candidate_id}", response_model=CandidateRead, summary="Update candidate")
 def update_candidate(
-    candidate_id: int, payload: CandidateUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+    candidate_id: CandidateId, payload: CandidateUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
-    _get_candidate_with_org_check(db, candidate_id, user)
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
+    # Moving the candidate to another job: the target job must be the caller's
+    # too (otherwise a candidate could be pushed into another tenant's job, and
+    # the duplicate-email 409 below became a cross-tenant membership oracle).
+    if payload.job_id is not None and payload.job_id != candidate.job_id:
+        authorize_job(db, payload.job_id, user)
     try:
         candidate = candidate_service.update_candidate(db, candidate_id, payload)
     except candidate_service.DuplicateCandidateEmailError as exc:
@@ -571,7 +686,7 @@ def update_candidate(
 
 
 @router.delete("/{candidate_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete candidate")
-def delete_candidate(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def delete_candidate(candidate_id: CandidateId, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _get_candidate_with_org_check(db, candidate_id, user)
     ok = candidate_service.delete_candidate(db, candidate_id)
     if not ok:
@@ -590,8 +705,8 @@ def delete_candidate(candidate_id: int, db: Session = Depends(get_db), user: Use
     ),
 )
 def hire_candidate(
-    candidate_id: int,
-    payload: dict = None,
+    candidate_id: CandidateId,
+    payload: Optional[HireCandidateRequest] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -599,22 +714,37 @@ def hire_candidate(
 
     candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
-    job_id = (payload or {}).get("job_id")
+    job_id = payload.job_id if payload is not None else None
+    # The job being hired into must belong to the caller's organization (404
+    # otherwise) — this used to accept any tenant's job and charge its quota.
+    target_job = authorize_job(db, job_id, user) if job_id is not None else None
 
-    # Find all job associations for this candidate (by email)
+    # Find all job associations for this candidate (by email) — within ONE
+    # tenant. Matching the email across every organization pushed other
+    # companies' rows to Offer-Made. A global super admin is scoped to the
+    # tenant of the job being hired into (or of the candidate's own job).
     email = candidate.email
-    all_entries = db.query(Candidate).filter(
-        Candidate.email == email,
-        Candidate.job_id.isnot(None),
-    ).all()
+    scope_org_id = get_org_id(user)
+    if scope_org_id is None:
+        scope_org_id = (
+            target_job.organization_id if target_job is not None else job_org_id(db, candidate.job_id)
+        )
+    entries_q = (
+        db.query(Candidate)
+        .join(Job, Candidate.job_id == Job.id)
+        .filter(Candidate.email == email)
+    )
+    if scope_org_id is not None:
+        entries_q = entries_q.filter(Job.organization_id == scope_org_id)
+    else:
+        entries_q = entries_q.filter(Job.organization_id.is_(None))
+    all_entries = entries_q.all()
 
     job_ids_linked = [c.job_id for c in all_entries]
 
     # If job_id provided and candidate not in that job, add them
-    if job_id and job_id not in job_ids_linked:
-        job = db.query(Job).filter(Job.id == job_id).first()
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
+    if target_job is not None and target_job.id not in job_ids_linked:
+        job = target_job
         _check_and_increment_candidate_quota(db, job_id)
         new_entry = Candidate(
             name=candidate.name,
@@ -669,17 +799,23 @@ def hire_candidate(
     "/{candidate_id}/job-associations",
     summary="Get all jobs this candidate is linked to",
 )
-def get_job_associations(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def get_job_associations(candidate_id: CandidateId, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     from app.models.job import Job
 
     candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
-    entries = (
+    # Same email within the caller's organization only — this used to return
+    # every tenant's job ids/titles/statuses for the email, and the UI then
+    # hired into the first one.
+    org_id = get_org_id(user)  # None only for a global super admin
+    entries_q = (
         db.query(Candidate.job_id, Candidate.status, Candidate.candidate_stage, Job.title)
-        .outerjoin(Job, Candidate.job_id == Job.id)
-        .filter(Candidate.email == candidate.email, Candidate.job_id.isnot(None))
-        .all()
+        .join(Job, Candidate.job_id == Job.id)
+        .filter(Candidate.email == candidate.email)
     )
+    if org_id is not None:
+        entries_q = entries_q.filter(Job.organization_id == org_id)
+    entries = entries_q.all()
 
     return {
         "candidate_id": candidate.id,
@@ -696,50 +832,6 @@ def get_job_associations(candidate_id: int, db: Session = Depends(get_db), user:
     }
 
 
-# ── Duplicate Check ──────────────────────────────────────────────────────────
-
-@router.get(
-    "/check-duplicate",
-    response_model=DuplicateCheckResponse,
-    summary="Check if a resume/candidate already exists by email",
-    description=(
-        "Checks the central resume_metadata table to see if a candidate with "
-        "this email already has a parsed resume. Also returns which job_ids "
-        "the candidate is already linked to."
-    ),
-)
-def check_duplicate(
-    email: str,
-    job_id: Optional[int] = None,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    org_id = get_org_id(user)
-    query = db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == email)
-    if org_id is not None:
-        query = query.filter(ResumeMetadata.organization_id == org_id)
-    meta = query.first()
-
-    if not meta:
-        return DuplicateCheckResponse(exists=False)
-
-    linked_jobs = [
-        c.job_id for c in db.query(Candidate.job_id).filter(
-            Candidate.email == email, Candidate.job_id.isnot(None)
-        ).all()
-    ]
-
-    return DuplicateCheckResponse(
-        exists=True,
-        candidate_email=meta.candidate_email,
-        candidate_name=meta.candidate_name,
-        current_designation=meta.current_designation,
-        resume_file_path=meta.resume_file_path,
-        parsed_at=meta.parsed_at,
-        linked_job_ids=linked_jobs,
-    )
-
-
 # ── Parsing Status ───────────────────────────────────────────────────────────
 
 @router.get(
@@ -752,7 +844,7 @@ def check_duplicate(
         "Once `parsing_status` is `completed`, the `resume_fit_score` field will contain the fit percentage."
     ),
 )
-def get_parsing_status(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def get_parsing_status(candidate_id: CandidateId, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     candidate = _get_candidate_with_org_check(db, candidate_id, user)
     return {
         "candidate_id": candidate.id,
@@ -789,7 +881,7 @@ def get_parsing_status(candidate_id: int, db: Session = Depends(get_db), user: U
 @limiter.limit("10/minute")
 async def upload_resumes(
     request: Request,
-    job_id: Optional[int] = Form(None),
+    job_id: Optional[JobId] = Form(None),
     replace_existing: Optional[bool] = Form(False),
     files: List[UploadFile] = File(...),
     db: Session = Depends(get_db),
@@ -800,24 +892,17 @@ async def upload_resumes(
     created with parsing_status='pending', and parsing launched concurrently
     in background (up to 3 at a time via semaphore).
     """
-    # Verify user owns the job
-    if job_id:
-        from app.models.job import Job as JobModel
-        org_id = get_org_id(user)
-        job = db.query(JobModel).filter(JobModel.id == job_id).first()
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        if org_id is not None and job.organization_id != org_id:
-            raise HTTPException(status_code=404, detail="Job not found")
+    # Verify user owns the job (fails closed — see app.authz)
+    _job = authorize_job(db, job_id, user) if job_id is not None else None
+    # Tenant for the parsed resume metadata: the job's, else the uploader's.
+    org_id = _job.organization_id if _job is not None else get_org_id(user)
 
     created_candidates = []
     parse_tasks = []
 
     # Pre-check quota availability (don't increment yet — only on successful parse)
-    if job_id:
-        from app.models.job import Job as _JobModel
-        _job = db.query(_JobModel).filter(_JobModel.id == job_id).first()
-        if _job and _job.organization_id:
+    if _job is not None:
+        if _job.organization_id:
             _org = db.query(Organization).filter(Organization.id == _job.organization_id).first()
             if _org and (_org.max_candidates_per_job or 0) > 0:
                 remaining = _org.max_candidates_per_job - (_org.total_candidates_used or 0)
@@ -836,7 +921,7 @@ async def upload_resumes(
             logger.warning("Skipped unsupported file: %s (type: %s)", file.filename, file.content_type)
             continue
 
-        safe_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{file.filename}"
+        safe_name = _stored_resume_name(file)
         file_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
         with open(file_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
@@ -877,7 +962,7 @@ async def upload_resumes(
     # Awaiting here ensures tasks complete reliably (no fire-and-forget issues)
     if parse_tasks:
         await asyncio.gather(
-            *[_parse_one(cid, fp, jid) for cid, fp, jid in parse_tasks],
+            *[_parse_one(cid, fp, jid, org_id) for cid, fp, jid in parse_tasks],
             return_exceptions=True,
         )
 
@@ -955,22 +1040,18 @@ async def _reparse_for_existing_candidate(candidate_id: int, file_path: str) -> 
             candidate.role = parsed.get("current_designation") or candidate.role
             candidate.resume_path = file_path
 
-            _org_id = None
-            if candidate.job_id:
-                from app.models.job import Job
-                _job = db.query(Job).filter(Job.id == candidate.job_id).first()
-                if _job:
-                    _org_id = _job.organization_id
+            # Tenant = the candidate's job's organization. The lookup below is
+            # always scoped to it: a job-less candidate (organization unknown)
+            # used to overwrite whichever tenant's metadata matched the email.
+            _org_id = job_org_id(db, candidate.job_id)
 
             # Upsert ResumeMetadata keyed by the candidate's existing email
             meta = None
             if candidate.email and not candidate.email.endswith("@resume.local"):
-                meta_q = db.query(ResumeMetadata).filter(
-                    ResumeMetadata.candidate_email == candidate.email
-                )
-                if _org_id is not None:
-                    meta_q = meta_q.filter(ResumeMetadata.organization_id == _org_id)
-                meta = meta_q.first()
+                meta = _scope_resume_metadata(
+                    db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == candidate.email),
+                    _org_id,
+                ).first()
             if not meta:
                 meta = ResumeMetadata(
                     candidate_email=candidate.email,
@@ -1033,7 +1114,7 @@ async def _reparse_for_existing_candidate(candidate_id: int, file_path: str) -> 
 @limiter.limit("20/minute")
 async def replace_resume(
     request: Request,
-    candidate_id: int,
+    candidate_id: CandidateId,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -1047,7 +1128,7 @@ async def replace_resume(
             detail=f"Unsupported file type ({ext}). Only PDF, DOC, and DOCX are accepted.",
         )
 
-    safe_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{file.filename}"
+    safe_name = _stored_resume_name(file)
     new_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
     with open(new_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
@@ -1057,12 +1138,12 @@ async def replace_resume(
     # Parse synchronously so the caller receives the updated candidate
     await _reparse_for_existing_candidate(candidate.id, new_path)
 
-    # Best-effort cleanup of the previous file
-    if old_path and old_path != new_path and os.path.isfile(old_path):
-        try:
-            os.remove(old_path)
-        except Exception as exc:
-            logger.warning("Failed to delete old resume %s: %s", old_path, exc)
+    # Best-effort cleanup of the previous file: only inside the resumes folder
+    # (resume_path used to be client-writable and reached os.remove as-is), and
+    # only when no row still points at it — this candidate after a failed
+    # re-parse, a hired copy, or a resume-database entry.
+    if old_path and old_path != new_path and not resume_file_in_use(db, old_path):
+        safe_unlink_upload(old_path, ["resumes"])
 
     db.expire_all()
     refreshed = db.query(Candidate).filter(Candidate.id == candidate_id).first()
@@ -1085,7 +1166,7 @@ async def replace_resume(
         "candidates when higher accuracy is needed."
     ),
 )
-async def compute_fit_score(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+async def compute_fit_score(candidate_id: CandidateId, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Re-compute fit score using AI semantic analysis (6-dimension model)."""
     candidate = _get_candidate_with_org_check(db, candidate_id, user)
     if not candidate.job_id:
@@ -1108,20 +1189,14 @@ async def compute_fit_score(candidate_id: int, db: Session = Depends(get_db), us
     ),
 )
 async def batch_recompute_scores(
-    job_id: int,
+    job_id: JobId,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """Batch recompute fit scores: instant smart scoring + background AI scoring."""
-    from app.models.job import Job
     from app.services.smart_scoring_service import compute_fit_score_for_candidate as smart_score
 
-    org_id = get_org_id(user)
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if org_id is not None and job.organization_id != org_id:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job = authorize_job(db, job_id, user)
 
     # Also rebuild job metadata with normalized skills (LLM-enhanced)
     try:
@@ -1180,30 +1255,33 @@ async def _ai_fit_score_for_candidate(candidate: Candidate, db: Session, resume_
     """
     from app.models.job import Job
     from app.services.resume_service import calculate_fit_score, extract_text
+    from app.services.smart_scoring_service import resume_metadata_for_candidate
     from app.schemas.ai import FitScoreRequest
+
+    # Get job data first: it decides which tenant's resume data may be used.
+    job = db.query(Job).filter(Job.id == candidate.job_id).first() if candidate.job_id else None
+    if not job:
+        return None
 
     # Get resume text if not provided
     if not resume_text:
-        meta = None
-        if candidate.email:
-            meta = db.query(ResumeMetadata).filter(
-                ResumeMetadata.candidate_email == candidate.email
-            ).first()
+        # Parsed resume from the job's own organization only — matching on email
+        # alone used to send another tenant's resume text to the LLM.
+        meta = resume_metadata_for_candidate(db, candidate, job.organization_id)
         if meta and meta.raw_text:
             resume_text = meta.raw_text
-        if not resume_text and candidate.resume_path and os.path.exists(candidate.resume_path):
-            try:
-                resume_text = extract_text(candidate.resume_path)
-            except Exception as e:
-                logger.warning("Failed to extract text from %s: %s", candidate.resume_path, e)
+        if not resume_text:
+            # Only a real file inside the resumes folder (resume_path used to be
+            # client-writable, so any .pdf/.docx on the server could be read).
+            resume_file = resolve_upload_file(candidate.resume_path, ["resumes"])
+            if resume_file:
+                try:
+                    resume_text = extract_text(resume_file)
+                except Exception as e:
+                    logger.warning("Failed to extract text from %s: %s", candidate.resume_path, e)
 
     if not resume_text:
         logger.warning("No resume text found for candidate %s (email=%s, resume_path=%s)", candidate.id, candidate.email, candidate.resume_path)
-        return None
-
-    # Get job data
-    job = db.query(Job).filter(Job.id == candidate.job_id).first()
-    if not job:
         return None
 
     # Build JD text from responsibilities
@@ -1218,9 +1296,15 @@ async def _ai_fit_score_for_candidate(candidate: Candidate, db: Session, resume_
 
     # Build full JD text from uploaded JD file or structured data
     jd_text = None
-    if job.upload_jd and os.path.exists(job.upload_jd):
+    if job.upload_jd:
         try:
-            jd_text = extract_text(job.upload_jd)
+            # upload_jd is a client-supplied string: read it only when it resolves
+            # to a file inside the JD upload folder.
+            from app.services.jd_metadata_service import resolve_jd_file
+
+            jd_file = resolve_jd_file(job.upload_jd)
+            if jd_file:
+                jd_text = extract_text(jd_file)
         except Exception:
             pass
 
@@ -1329,7 +1413,7 @@ async def _ai_fit_score_for_candidate(candidate: Candidate, db: Session, resume_
     ),
 )
 async def schedule_interview(
-    candidate_id: int,
+    candidate_id: CandidateId,
     payload: ScheduleInterviewRequest,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -1340,17 +1424,13 @@ async def schedule_interview(
 
     candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
+    # The interview link is per job; a candidate without one can't take an interview.
+    if not candidate.job_id:
+        raise HTTPException(status_code=400, detail="Candidate is not linked to a job opening.")
+
     # Validate WhatsApp permission
     if payload.send_whatsapp:
-        org_id = user.organization_id
-        if org_id is not None:
-            from app.models.organization import Organization as OrgModel
-            org = db.query(OrgModel).filter(OrgModel.id == org_id).first()
-            if org and not getattr(org, "allow_whatsapp", False):
-                raise HTTPException(
-                    status_code=403,
-                    detail="WhatsApp notifications are not enabled for your organization. Contact your super admin.",
-                )
+        _require_whatsapp_allowed(db, user)
 
     old_status = candidate.interview_status
     is_reschedule = old_status == "Scheduled"
@@ -1405,19 +1485,21 @@ async def schedule_interview(
     candidate.allow_joining_early = payload.allow_joining_early
     candidate.interview_status = "Scheduled"
 
-    # Save the frontend-provided interview URL for email links
-    if payload.interview_url:
-        candidate.interview_link = payload.interview_url
+    # Personal invite link (app.invites): the candidate's own secret on the job's
+    # interview link. The email, WhatsApp and calendar all use this stored link;
+    # it is committed below before anything is sent. The URL the recruiter's page
+    # sends is only an origin hint. A reschedule keeps the same secret, so an
+    # earlier email's link keeps working; cancel/retake rotate it.
+    job_token = get_or_create_job_token(db, candidate.job_id)
+    ensure_invite_token(candidate)
+    candidate.interview_link = build_invite_url(
+        job_token.token, candidate.invite_token, origin_hint=payload.interview_url
+    )
 
     # Update token expiry based on recruiter's choice.
     if candidate.job_id:
-        from app.models.interview import InterviewToken
         from datetime import timedelta
-        token_row = (
-            db.query(InterviewToken)
-            .filter(InterviewToken.job_id == candidate.job_id, InterviewToken.is_active == True)
-            .first()
-        )
+        token_row = job_token
         if token_row:
             if payload.link_expiry:
                 # Recruiter chose "Expires after X hours/days"
@@ -1426,8 +1508,9 @@ async def schedule_interview(
                 else:
                     new_expiry = datetime.utcnow() + timedelta(days=payload.link_expiry.value)
                 # Ensure token lives at least 24h past the scheduled interview
-                if payload.interview_date:
-                    min_expiry = payload.interview_date + timedelta(hours=24)
+                # (naive UTC, like new_expiry — the aware payload value raised TypeError)
+                if _sched_dt:
+                    min_expiry = _sched_dt + timedelta(hours=24)
                     if new_expiry < min_expiry:
                         new_expiry = min_expiry
                 token_row.expires_at = new_expiry
@@ -1579,7 +1662,7 @@ async def schedule_interview(
     ),
 )
 async def cancel_interview(
-    candidate_id: int,
+    candidate_id: CandidateId,
     payload: CancelInterviewRequest,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -1596,6 +1679,10 @@ async def cancel_interview(
             detail=f"Cannot cancel: current status is '{candidate.interview_status}', expected 'Scheduled'",
         )
 
+    # Same organization gate as schedule-interview (this branch used to skip it).
+    if payload.send_whatsapp:
+        _require_whatsapp_allowed(db, user)
+
     # Log status change
     log = InterviewStatusLog(
         candidate_id=candidate.id,
@@ -1608,6 +1695,9 @@ async def cancel_interview(
 
     candidate.interview_status = "Cancelled"
     candidate.interview_date = None
+    # The emailed personal link must stop working; scheduling again issues a new one.
+    rotate_invite_token(candidate)
+    candidate.interview_link = None
     db.commit()
     db.refresh(candidate)
 
@@ -1670,7 +1760,7 @@ def _completed_or_terminated_sessions(db: Session, candidate_id: int):
     ),
 )
 def download_interview_archive(
-    candidate_id: int,
+    candidate_id: CandidateId,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -1761,18 +1851,30 @@ def download_interview_archive(
     eval_json = _json.dumps(eval_obj, indent=2, default=str)
 
     # ── Recording file on disk ──────────────────────────────────────────────────
+    # Resolved through app.media, and the stored link is used only when it names
+    # one of THIS candidate's sessions (recordings are {session_id}.webm).
+    # recording_link used to be client-writable, and a basename lookup could pull
+    # another candidate's video into the ZIP.
+    from app.models.interview import InterviewSession
+
     rec_path = None
     rec_ext = ".webm"
-    if candidate.recording_link:
-        candidate_rec = os.path.join(_recordings_dir(), os.path.basename(candidate.recording_link))
-        if os.path.isfile(candidate_rec):
-            rec_path = candidate_rec
-            rec_ext = os.path.splitext(candidate_rec)[1] or ".webm"
+    rec_rel = to_upload_relpath(candidate.recording_link)
+    if rec_rel and rec_rel.startswith("recordings/"):
+        rec_stem = rec_rel.rsplit("/", 1)[-1].split(".", 1)[0]
+        own_session_ids = {
+            sid for (sid,) in
+            db.query(InterviewSession.id).filter(InterviewSession.candidate_id == candidate.id).all()
+        }
+        if rec_stem.isdigit() and int(rec_stem) in own_session_ids:
+            rec_path = resolve_upload_file(candidate.recording_link, ["recordings"])
+            if rec_path:
+                rec_ext = os.path.splitext(rec_path)[1] or ".webm"
     if not rec_path:
         # fall back to the conventional name {session_id}.webm
         for ext in (".webm", ".mp4"):
-            p = os.path.join(_recordings_dir(), f"{session.id}{ext}")
-            if os.path.isfile(p):
+            p = resolve_upload_file(f"uploads/recordings/{session.id}{ext}", ["recordings"])
+            if p:
                 rec_path, rec_ext = p, ext
                 break
 
@@ -1830,18 +1932,18 @@ def download_interview_archive(
     description=(
         "Permanently deletes the candidate's interview session(s) — transcript, "
         "evaluation, violations, screenshots, and the recording file — and resets "
-        "the interview-state fields so the candidate can re-enter the SAME interview "
-        "link and start fresh. The candidate row, resume, and resume fit score are "
+        "the interview-state fields so the candidate can be scheduled again and start "
+        "fresh. Their previous personal interview link stops working; scheduling "
+        "again sends a new one. The candidate row, resume, and resume fit score are "
         "KEPT. Intended to be called AFTER the recruiter has downloaded the archive."
     ),
 )
 def retake_interview(
-    candidate_id: int,
+    candidate_id: CandidateId,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    from datetime import timedelta
-    from app.models.interview import InterviewSession, InterviewStatusLog, InterviewToken
+    from app.models.interview import InterviewSession, InterviewStatusLog
 
     candidate = _get_candidate_with_org_check(db, candidate_id, user)
 
@@ -1896,6 +1998,11 @@ def retake_interview(
     candidate.interview_date = None
     candidate.interview_timezone = None
     candidate.interview_link = None
+    # Old personal links stop working; the candidate gets a new link when the
+    # interview is scheduled again (schedule-interview also sets the job link's
+    # expiry then). The job-wide link expiry is no longer pushed out here — that
+    # re-opened expired links for every candidate on the job.
+    rotate_invite_token(candidate)
     candidate.recording_link = None
     candidate.video_duration = None
     # Post-interview scores — clear all of them.
@@ -1908,23 +2015,6 @@ def retake_interview(
     candidate.enthusiasm_score = None
     candidate.conciseness_score = None
     candidate.ai_cheating_score = None
-
-    # Guarantee the candidate can actually re-enter via the SAME interview link:
-    # if the per-job token has a finite expiry that's already past (or about to
-    # lapse), refresh it. Without this, a candidate scheduled with a short link
-    # expiry would be reset to "New" but then hit "link expired" on re-entry.
-    # This only re-opens access for THIS reset candidate — others who completed
-    # are still blocked by their own completed-session check in verify-access.
-    if candidate.job_id:
-        min_valid = datetime.utcnow() + timedelta(days=7)
-        active_tokens = (
-            db.query(InterviewToken)
-            .filter(InterviewToken.job_id == candidate.job_id, InterviewToken.is_active.is_(True))
-            .all()
-        )
-        for tok in active_tokens:
-            if tok.expires_at is not None and tok.expires_at < min_valid:
-                tok.expires_at = min_valid
 
     db.commit()
     db.refresh(candidate)
@@ -1944,7 +2034,7 @@ def retake_interview(
     description="Move candidate between stages: `Candidates` → `AI Round` → `Panel Round` → `Offer-Made` / `Rejected`. Also updates `status` to Offered/Rejected when appropriate.",
 )
 def promote_candidate(
-    candidate_id: int,
+    candidate_id: CandidateId,
     payload: PromoteStageRequest,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -1975,25 +2065,40 @@ def promote_candidate(
     description="Send a custom free-form text message to the candidate via Meta WhatsApp Business Cloud API. Requires `WHATSAPP_TOKEN` and `WHATSAPP_PHONE_NUMBER_ID` in `.env`.",
 )
 async def send_whatsapp(
-    candidate_id: int,
+    candidate_id: CandidateId,
     payload: SendWhatsAppRequest,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """Send a custom WhatsApp message to a candidate."""
+    import re as _re
     from app.services.interview_service import send_whatsapp_message
 
     candidate = _get_candidate_with_org_check(db, candidate_id, user)
+    _require_whatsapp_allowed(db, user)
 
-    phone = payload.phone or candidate.phone
+    # Messages go only to the candidate's number on file: the platform's business
+    # number must not be usable to text arbitrary phones.
+    phone = candidate.phone
     if not phone:
         raise HTTPException(status_code=400, detail="No phone number available")
+    given = _re.sub(r"\D", "", payload.phone or "")
+    on_file = _re.sub(r"\D", "", phone)
+    if given and not (
+        given == on_file
+        or (min(len(given), len(on_file)) >= 7 and (given.endswith(on_file) or on_file.endswith(given)))
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Messages can only be sent to the candidate's phone number on file.",
+        )
 
     try:
         result = await send_whatsapp_message(phone, payload.message)
         return {"success": True, "detail": result}
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"WhatsApp send failed: {str(exc)}")
+        logger.warning("WhatsApp send failed for candidate %s: %s", candidate.id, exc)
+        raise HTTPException(status_code=500, detail="WhatsApp send failed")
 
 
 # ── Evaluation Report ─────────────────────────────────────────────────────────
@@ -2012,7 +2117,7 @@ async def send_whatsapp(
         "Score fields are `null` until the interview is completed."
     ),
 )
-def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def get_evaluation(candidate_id: CandidateId, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Return full evaluation data: resume analysis + scores + interview Q&A transcript."""
     from app.models.interview import InterviewSession, InterviewMessage, SessionStatus, Evaluation, Violation
     from app.models.job import Job
@@ -2033,7 +2138,9 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User 
             fit_details = candidate.fit_score_details
 
     resume_url = None
-    if candidate.resume_path and os.path.exists(candidate.resume_path):
+    # Existence is checked inside the resumes folder only (resume_path used to be
+    # client-writable, so os.path.exists answered for any server path).
+    if candidate.resume_path and resolve_upload_file(candidate.resume_path, ["resumes"]):
         resume_url = f"/{candidate.resume_path.replace(os.sep, '/')}"
 
     # ── Job details (experience range) ────────────────────────────────────────
@@ -2045,6 +2152,7 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User 
                 "title": job.title,
                 "experience_min": job.experience_min,
                 "experience_max": job.experience_max,
+                "ref": encode_ref("job", job.id),
             }
 
     # ── Q&A transcript from latest completed session ──────────────────────────
@@ -2229,6 +2337,7 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User 
                     fp = f"/{fp}"
                 screenshots_list.append({
                     "file_path": fp,
+                    "url": sign_media_url(ss.file_path),
                     "captured_at": (ss.captured_at.isoformat() + "Z") if ss.captured_at else None,
                     "face_count": getattr(ss, "face_count", None),
                 })
@@ -2289,11 +2398,17 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User 
             "interview_date": candidate.interview_date.isoformat() + "Z" if candidate.interview_date else None,
             "interview_timezone": candidate.interview_timezone,
             "image": candidate.image,
+            # Signed media URLs (app.media) — the caller was authorized for this
+            # candidate above.
+            "image_url": sign_media_url(candidate.image),
+            "ref": encode_ref("candidate", candidate.id),
         },
         "job": job_info,
         "resume": {
             "path": candidate.resume_path,
             "url": resume_url,
+            "signed_url": sign_media_url(candidate.resume_path),
+            "download_url": sign_media_url(candidate.resume_path, download=True),
         },
         "fit_score": {
             "level": candidate.resume_fit_score,
@@ -2314,6 +2429,9 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User 
         "recording": {
             "link": candidate.recording_link,
             "duration": candidate.video_duration,
+            "url": sign_media_url(candidate.recording_link),
+            "download_url": sign_media_url(candidate.recording_link, download=True),
+            "mp4_download_url": sign_media_url(candidate.recording_link, download=True, fmt="mp4"),
         },
         "transcript": transcript,
         "full_transcript": full_transcript,
@@ -2332,7 +2450,7 @@ def get_evaluation(candidate_id: int, db: Session = Depends(get_db), user: User 
     summary="Force-regenerate AI evaluation for a completed session",
 )
 def regenerate_evaluation(
-    candidate_id: int,
+    candidate_id: CandidateId,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -2408,13 +2526,11 @@ def _build_evaluation_pdf_bytes(db: Session, candidate) -> bytes:
     # Candidate Photo + Info (side by side)
     photo_rendered = False
     if candidate.image:
-        _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
-        _upload_root = "/tmp/uploads" if _is_serverless else "uploads"
-        # candidate.image is like "/uploads/photos/123.jpg"
-        photo_path = candidate.image.lstrip("/")
-        if _is_serverless:
-            photo_path = photo_path.replace("uploads/", f"{_upload_root}/", 1)
-        if os.path.isfile(photo_path):
+        # candidate.image is like "/uploads/photos/123.jpg" — resolved inside the
+        # photos folder only (the column used to be client-writable and was
+        # opened as any local path).
+        photo_path = resolve_upload_file(candidate.image, ["photos"])
+        if photo_path:
             try:
                 # Place photo on the right, text on the left
                 x_before = pdf.get_x()
@@ -2560,7 +2676,7 @@ def _build_evaluation_pdf_bytes(db: Session, candidate) -> bytes:
     "/{candidate_id}/evaluation/download-pdf",
     summary="Download evaluation report as PDF",
 )
-def download_evaluation_pdf(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def download_evaluation_pdf(candidate_id: CandidateId, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Generate and return a PDF evaluation report for the candidate."""
     from io import BytesIO
     from fastapi.responses import StreamingResponse
@@ -2582,7 +2698,7 @@ def download_evaluation_pdf(candidate_id: int, db: Session = Depends(get_db), us
     "/{candidate_id}/evaluation/download-docx",
     summary="Download evaluation report as DOCX",
 )
-def download_evaluation_docx(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def download_evaluation_docx(candidate_id: CandidateId, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Generate and return a DOCX evaluation report for the candidate."""
     from io import BytesIO
     from fastapi.responses import StreamingResponse
@@ -2748,7 +2864,7 @@ def download_evaluation_docx(candidate_id: int, db: Session = Depends(get_db), u
     "/{candidate_id}/evaluation/download-transcript",
     summary="Download interview transcript as text file",
 )
-def download_transcript(candidate_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def download_transcript(candidate_id: CandidateId, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Generate and return a plain text interview transcript."""
     from io import BytesIO
     from fastapi.responses import StreamingResponse
@@ -2827,11 +2943,14 @@ def _build_whatsapp_message(candidate: Candidate, job_title: str, org_name: str 
     summary="Get email contact history for a candidate",
     tags=["Candidates"],
 )
-def get_email_history(candidate_id: int, db: Session = Depends(get_db)):
+def get_email_history(
+    candidate_id: CandidateId,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     from app.models.candidate import EmailLog
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    # Org check — this used to load any tenant's candidate by id.
+    candidate = _get_candidate_with_org_check(db, candidate_id, user)
     logs = (
         db.query(EmailLog)
         .filter(EmailLog.candidate_id == candidate_id)
@@ -2861,7 +2980,7 @@ def get_email_history(candidate_id: int, db: Session = Depends(get_db)):
     summary="Get the live observer link for this candidate",
 )
 def get_observer_link(
-    candidate_id: int,
+    candidate_id: CandidateId,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -2895,7 +3014,7 @@ def get_observer_link(
     summary="Revoke the observer link for this candidate",
 )
 def revoke_observer_link(
-    candidate_id: int,
+    candidate_id: CandidateId,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -2923,7 +3042,7 @@ def revoke_observer_link(
     summary="Email the observer link to the current user",
 )
 async def resend_observer_link(
-    candidate_id: int,
+    candidate_id: CandidateId,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):

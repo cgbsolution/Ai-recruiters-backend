@@ -151,21 +151,42 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
                 if org:
                     org_name = org.name
 
+    # Recruiter-supplied strings are interpolated into the HTML body below and
+    # this mail is sent AS the platform, so escape them: unescaped, any
+    # recruiter could mail arbitrary markup from "Anytimehire". Newlines are
+    # stripped from the subject so it can't inject extra mail headers.
+    from html import escape as _html_escape
+
     action_word = "Rescheduled" if is_reschedule else "Schedule"
-    subject = template.get("subject") or f"Your Interview {action_word} for {job_title}"
-    intro_text = template.get("intro_text") or (
+    subject = str(template.get("subject") or "").replace("\r", " ").replace("\n", " ").strip()[:200]
+    subject = subject or f"Your Interview {action_word} for {job_title}"
+    intro_text = _html_escape(str(template.get("intro_text") or "")) or (
         f"You are shortlisted for an AI Interview round for the role of "
         f"{job_title} at {org_name}."
     )
     date_str = _format_interview_date(candidate)
 
-    # Build interview URL: prefer candidate.interview_link (set by frontend during scheduling),
-    # fall back to building from job token + last CORS origin (production URL)
+    # Build interview URL. candidate.interview_link is set at scheduling time;
+    # a personal link already carries the candidate's secret (?invite=...) and
+    # is used as-is — never append ?candidate=<email> to it. Email-only links
+    # are refused once a candidate has an invite, so such a candidate always
+    # gets their personal link. Legacy candidates (no invite) keep the
+    # ?candidate=<email> form.
     from urllib.parse import quote
     interview_url = ""
     base_link = candidate.interview_link or ""
+    invite_token = getattr(candidate, "invite_token", None)
 
-    if base_link:
+    if base_link and "invite=" in base_link:
+        interview_url = base_link
+    elif job and invite_token:
+        from app.invites import active_job_token, build_invite_url
+        token_row = active_job_token(db, job.id)
+        if token_row:
+            interview_url = build_invite_url(token_row.token, invite_token, origin_hint=base_link or None)
+        else:
+            interview_url = base_link
+    elif base_link:
         # Append candidate email param if not already present
         if "?candidate=" not in base_link and "&candidate=" not in base_link:
             sep = "&" if "?" in base_link else "?"
@@ -185,9 +206,17 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
             frontend_base = origins[-1] if origins else "http://localhost:3000"
             interview_url = f"{frontend_base}/interview/{token_row.token}?candidate={quote(candidate.email)}"
 
-    extra_heading = template.get("extra_heading") or ""
-    extra_body = template.get("extra_body") or ""
-    cc_emails = template.get("cc_emails") or []
+    extra_heading = _html_escape(str(template.get("extra_heading") or ""))
+    extra_body = _html_escape(str(template.get("extra_body") or ""))
+    # Bounded and shape-checked: this list went into the Cc header and the
+    # recipient list unvalidated, so it could address anyone, in any number.
+    import re as _re_cc
+
+    _CC_RE = _re_cc.compile(r"^[^@\s,;<>]+@[^@\s,;<>]+\.[A-Za-z]{2,}$")
+    cc_emails = [
+        e.strip() for e in (template.get("cc_emails") or [])
+        if isinstance(e, str) and _CC_RE.match(e.strip())
+    ][:10]
 
     scheduled_text = "rescheduled" if is_reschedule else "scheduled"
 

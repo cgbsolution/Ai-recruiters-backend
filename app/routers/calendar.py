@@ -5,8 +5,8 @@ Calendar view.
 The calendar's single source of truth is the `candidates` table: a candidate is
 "on the calendar" once it has an `interview_date`. Tenancy is enforced exactly
 like the rest of the admin API — by joining to the candidate's `Job` and
-filtering on `Job.organization_id` (see `app.auth.get_org_id`). Super-admins
-without an org get a global view.
+filtering on `Job.organization_id` (see `app.auth.get_org_id`). Only a global
+super admin (`app.auth.is_global_admin`) gets an unfiltered view.
 
 No new columns / migrations: this endpoint only READS existing data and derives
 a normalized status `category` the frontend uses for colors, badges, and the
@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.auth import get_current_user, get_org_id
+from app.auth import get_current_user, get_org_id, is_global_admin
 from app.database import get_db
 from app.models.candidate import Candidate, EmailLog
 from app.models.interview import InterviewSession, SessionStatus
@@ -108,7 +108,7 @@ def list_calendar_interviews(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    org_id = get_org_id(user)
+    org_id = get_org_id(user)  # 403 for a non-super-admin without an organization
 
     q = (
         db.query(Candidate, Job)
@@ -116,8 +116,12 @@ def list_calendar_interviews(
         .filter(Candidate.interview_date.isnot(None))
     )
 
-    # ── Tenancy: only this org's interviews (super-admin w/o org → global) ──
-    if org_id is not None:
+    # ── Tenancy: only this org's interviews (global super admin → all) ──
+    # Decided by the caller's role, not by org_id being None, so a missing org
+    # can never widen the result to every tenant.
+    if not is_global_admin(user):
+        if org_id is None:
+            return []
         q = q.filter(Job.organization_id == org_id)
 
     # Hide placeholder rows still awaiting resume parsing / permanently failed.

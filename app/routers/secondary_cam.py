@@ -3,49 +3,105 @@ Secondary Camera Verification API.
 
 Manages pairing between desktop interview and mobile secondary camera.
 Uses short-polling for real-time status sync (consistent with existing platform patterns).
+
+Auth: the desktop endpoints (init / status / complete) are keyed by the
+sequential interview session id, so they require the candidate's
+X-Session-Token (app.session_auth). The phone endpoints are authorized by the
+pairing code, which only an authenticated init hands out.
 """
 
 import json
 import logging
 import os
-import shutil
 import uuid
 from datetime import datetime, timedelta
+from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.media import UPLOAD_ROOT
 from app.models.secondary_cam import (
     SecondaryCamSession,
     SecondaryCamSnapshot,
 )
+from app.session_auth import require_session_token
 from app.utils.face_detection import detect_faces
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/secondary-cam")
 
-UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "./uploads")
-SECONDARY_CAM_DIR = os.path.join(UPLOAD_DIR, "secondary_cam")
+# Inside the private upload root, which is never publicly routed. This used to
+# follow the UPLOAD_DIR env var, which put snapshots under the public /uploads mount.
+SECONDARY_CAM_DIR = os.path.join(UPLOAD_ROOT, "secondary_cam")
 os.makedirs(SECONDARY_CAM_DIR, exist_ok=True)
 
 # Heartbeat is considered stale after this many seconds
 HEARTBEAT_STALE_SECONDS = 5
 
+# Phone snapshots are canvas JPEGs of a few hundred KB to a few MB; the cap only
+# stops a caller from filling the uploads volume shared with recordings/resumes.
+MAX_SNAPSHOT_BYTES = 10 * 1024 * 1024
+# device_info is a tiny {userAgent, screen} object sent by the phone page.
+MAX_DEVICE_INFO_CHARS = 4096
+
+
+def _save_snapshot(upload: UploadFile, filepath: str) -> None:
+    """Stream an uploaded snapshot to disk, refusing anything over the size cap."""
+    written = 0
+    try:
+        with open(filepath, "wb") as f:
+            while True:
+                chunk = upload.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_SNAPSHOT_BYTES:
+                    raise HTTPException(413, "Snapshot too large")
+                f.write(chunk)
+    except BaseException:
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
+        raise
+
+
+def _clean_device_info(raw: Optional[str]) -> Optional[str]:
+    """Store device_info only when it is a small JSON object."""
+    if not raw or len(raw) > MAX_DEVICE_INFO_CHARS:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    return json.dumps(parsed) if isinstance(parsed, dict) else None
+
+
+def _parse_device_info(raw: Optional[str]):
+    """Stored device_info as JSON, or None. Rows written before register
+    validated it can hold arbitrary text, which used to make /status 500."""
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+
 
 # ── Desktop Endpoints (called by interview page) ─────────────────────────────
 
-@router.post("/{session_id}/init", summary="Initialize secondary camera pairing")
+@router.post(
+    "/{session_id}/init",
+    summary="Initialize secondary camera pairing",
+    dependencies=[Depends(require_session_token)],
+)
 def init_pairing(session_id: int, db: Session = Depends(get_db)):
     """Create a pairing session and return the pairing code for QR generation."""
-    from app.models.interview import InterviewSession
-
-    session = db.query(InterviewSession).filter(
-        InterviewSession.id == session_id
-    ).first()
-    if not session:
-        raise HTTPException(404, "Interview session not found")
+    # require_session_token has already confirmed the interview session exists
+    # and that the caller holds its token (403 otherwise).
 
     # Check if pairing already exists — reset to pending so desktop starts fresh
     existing = db.query(SecondaryCamSession).filter(
@@ -79,7 +135,11 @@ def init_pairing(session_id: int, db: Session = Depends(get_db)):
     }
 
 
-@router.get("/{session_id}/status", summary="Get secondary camera status (polled by desktop)")
+@router.get(
+    "/{session_id}/status",
+    summary="Get secondary camera status (polled by desktop)",
+    dependencies=[Depends(require_session_token)],
+)
 def get_status(session_id: int, db: Session = Depends(get_db)):
     """Return the current status of the secondary camera connection."""
     cam_session = db.query(SecondaryCamSession).filter(
@@ -115,7 +175,7 @@ def get_status(session_id: int, db: Session = Depends(get_db)):
         "heartbeat_stale": heartbeat_stale,
         "seconds_since_heartbeat": seconds_since_heartbeat,
         "verified_at": cam_session.verified_at.isoformat() if cam_session.verified_at else None,
-        "device_info": json.loads(cam_session.device_info) if cam_session.device_info else None,
+        "device_info": _parse_device_info(cam_session.device_info),
     }
 
 
@@ -175,7 +235,7 @@ def register_device(
         raise HTTPException(404, "Invalid pairing code")
 
     cam_session.status = "connected"
-    cam_session.device_info = device_info
+    cam_session.device_info = _clean_device_info(device_info)
     cam_session.last_heartbeat = datetime.utcnow()
     db.commit()
 
@@ -200,8 +260,7 @@ async def confirm_position(
     # Save snapshot
     filename = f"{pairing_code}_position_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.jpg"
     filepath = os.path.join(SECONDARY_CAM_DIR, filename)
-    with open(filepath, "wb") as f:
-        shutil.copyfileobj(snapshot.file, f)
+    _save_snapshot(snapshot, filepath)
 
     cam_session.status = "verified"
     cam_session.positioning_snapshot = filepath
@@ -254,8 +313,7 @@ async def upload_snapshot(
 
     filename = f"{pairing_code}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.jpg"
     filepath = os.path.join(SECONDARY_CAM_DIR, filename)
-    with open(filepath, "wb") as f:
-        shutil.copyfileobj(snapshot.file, f)
+    _save_snapshot(snapshot, filepath)
 
     snap = SecondaryCamSnapshot(
         secondary_session_id=cam_session.id,
@@ -288,8 +346,10 @@ async def verify_frame(
 
     import numpy as np
 
-    # Read frame bytes
-    contents = await frame.read()
+    # Read frame bytes (bounded — never load an arbitrarily large body)
+    contents = await frame.read(MAX_SNAPSHOT_BYTES + 1)
+    if len(contents) > MAX_SNAPSHOT_BYTES:
+        raise HTTPException(413, "Frame too large")
     np_arr = np.frombuffer(contents, np.uint8)
 
     person_detected = False
@@ -359,7 +419,11 @@ async def verify_frame(
     }
 
 
-@router.post("/{session_id}/complete", summary="Mark secondary cam session as completed")
+@router.post(
+    "/{session_id}/complete",
+    summary="Mark secondary cam session as completed",
+    dependencies=[Depends(require_session_token)],
+)
 def complete_session(session_id: int, db: Session = Depends(get_db)):
     """Mark the secondary camera session as completed when interview ends."""
     cam_session = db.query(SecondaryCamSession).filter(

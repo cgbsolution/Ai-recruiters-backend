@@ -5,6 +5,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.media import UPLOAD_ROOT, resume_file_in_use, safe_unlink_upload, to_upload_relpath
 from app.models.candidate import Candidate, CandidateStatus, EmailLog
 from app.models.job import Job
 from app.schemas.candidate import CandidateCreate, CandidateUpdate
@@ -197,13 +198,19 @@ def get_candidate_by_id(db: Session, candidate_id: int) -> Optional[Candidate]:
     return db.query(Candidate).filter(Candidate.id == candidate_id).first()
 
 
+def find_candidate_for_job(db: Session, email: str, job_id: int) -> Optional[Candidate]:
+    """The existing row create_candidate() updates instead of inserting a new one."""
+    return db.query(Candidate).filter(
+        Candidate.email == email,
+        Candidate.job_id == job_id,
+    ).first()
+
+
 def create_candidate(db: Session, data: CandidateCreate) -> Candidate:
-    # Dedup check: if same email + job_id exists, update instead of creating
+    # Dedup check: if same email + job_id exists, update instead of creating.
+    # The caller has already authorized data.job_id for the requesting user.
     if data.email and data.job_id:
-        existing = db.query(Candidate).filter(
-            Candidate.email == data.email,
-            Candidate.job_id == data.job_id,
-        ).first()
+        existing = find_candidate_for_job(db, data.email, data.job_id)
         if existing:
             for field, value in data.model_dump(exclude_none=True).items():
                 setattr(existing, field, value)
@@ -218,9 +225,8 @@ def create_candidate(db: Session, data: CandidateCreate) -> Candidate:
         phone=data.phone,
         location=data.location,
         status=data.status,
-        image=data.image,
+        image="",
         job_id=data.job_id,
-        resume_path=data.resume_path,
         interview_status="New",
         candidate_stage="Candidates",
     )
@@ -258,7 +264,7 @@ def update_candidate(
 
     updates = data.model_dump(exclude_none=True)
 
-    for field in ("name", "role", "email", "phone", "location", "image", "resume_path"):
+    for field in ("name", "role", "email", "phone", "location"):
         if field in updates and isinstance(updates[field], str):
             updates[field] = updates[field].strip()
 
@@ -310,31 +316,53 @@ def update_candidate(
     return candidate
 
 
+def _recording_in_use(db: Session, candidate: Candidate) -> bool:
+    """True when the candidate's recording file belongs to, or is still linked
+    from, someone else. recording_link used to be client-writable, so a row can
+    point at another candidate's video."""
+    from app.models.interview import InterviewSession
+
+    rel = to_upload_relpath(candidate.recording_link)
+    if not rel:
+        return False
+    name = rel.rsplit("/", 1)[-1]
+    stem = name.split(".", 1)[0]
+    # Recordings are named by session id; one owned by another candidate is not ours.
+    if stem.isdigit() and len(stem) <= 9:
+        owner = (
+            db.query(InterviewSession.candidate_id)
+            .filter(InterviewSession.id == int(stem))
+            .first()
+        )
+        if owner is not None and owner[0] != candidate.id:
+            return True
+    others = db.query(Candidate.recording_link).filter(
+        Candidate.id != candidate.id,
+        Candidate.recording_link.endswith(name, autoescape=True),
+    ).all()
+    return any(to_upload_relpath(link) == rel for (link,) in others)
+
+
 def _cleanup_candidate_files(db: Session, candidate: Candidate) -> None:
-    """Delete all files associated with a candidate: recordings, screenshots, resume."""
+    """Delete all files associated with a candidate: recordings, screenshots, resume.
+
+    Stored paths are resolved through app.media, so only files inside the
+    matching upload folder can be removed (these columns used to be
+    client-writable and reached os.remove with '../' traversal), and files that
+    another row still references — a hired copy, a resume-database entry — are
+    kept."""
     import os
     import shutil
     import logging
 
-    from app.models.interview import InterviewSession, InterviewScreenshot
+    from app.models.interview import InterviewSession
 
     logger = logging.getLogger("candidate_cleanup")
-    _is_serverless = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
-    _upload_root = "/tmp/uploads" if _is_serverless else "uploads"
 
-    # 1. Delete recording file
-    if candidate.recording_link:
-        # recording_link is like "/uploads/recordings/123.webm"
-        rel = candidate.recording_link.lstrip("/")
-        if _is_serverless:
-            rel = rel.replace("uploads/", "tmp/uploads/", 1) if rel.startswith("uploads/") else rel
-        file_path = os.path.join(os.getcwd(), rel) if not _is_serverless else f"/{rel}"
-        try:
-            if os.path.isfile(file_path):
-                os.remove(file_path)
-                logger.info("Deleted recording: %s", file_path)
-        except Exception as e:
-            logger.warning("Failed to delete recording %s: %s", file_path, e)
+    # 1. Delete recording file (recording_link is like "/uploads/recordings/123.webm")
+    if candidate.recording_link and not _recording_in_use(db, candidate):
+        if safe_unlink_upload(candidate.recording_link, ["recordings"]):
+            logger.info("Deleted recording: %s", candidate.recording_link)
 
     # 2. Delete screenshot directories for all sessions of this candidate
     session_ids = [
@@ -342,7 +370,7 @@ def _cleanup_candidate_files(db: Session, candidate: Candidate) -> None:
         db.query(InterviewSession.id).filter(InterviewSession.candidate_id == candidate.id).all()
     ]
     for sid in session_ids:
-        screenshot_dir = f"{_upload_root}/screenshots/{sid}"
+        screenshot_dir = os.path.join(UPLOAD_ROOT, "screenshots", str(int(sid)))
         try:
             if os.path.isdir(screenshot_dir):
                 shutil.rmtree(screenshot_dir)
@@ -351,17 +379,11 @@ def _cleanup_candidate_files(db: Session, candidate: Candidate) -> None:
             logger.warning("Failed to delete screenshot dir %s: %s", screenshot_dir, e)
 
     # 3. Delete resume file
-    if candidate.resume_path:
-        rel = candidate.resume_path.lstrip("/")
-        if _is_serverless:
-            rel = rel.replace("uploads/", "tmp/uploads/", 1) if rel.startswith("uploads/") else rel
-        file_path = os.path.join(os.getcwd(), rel) if not _is_serverless else f"/{rel}"
-        try:
-            if os.path.isfile(file_path):
-                os.remove(file_path)
-                logger.info("Deleted resume: %s", file_path)
-        except Exception as e:
-            logger.warning("Failed to delete resume %s: %s", file_path, e)
+    if candidate.resume_path and not resume_file_in_use(
+        db, candidate.resume_path, exclude_candidate_id=candidate.id
+    ):
+        if safe_unlink_upload(candidate.resume_path, ["resumes"]):
+            logger.info("Deleted resume: %s", candidate.resume_path)
 
 
 def delete_candidate(db: Session, candidate_id: int) -> bool:

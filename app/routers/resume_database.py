@@ -19,13 +19,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from app.auth import get_current_user, get_org_id
+from app.auth import get_current_user, get_org_id, require_roles
+from app.authz import can_access_org
 from app.database import get_db, SessionLocal
+from app.media import UPLOAD_ROOT, resume_file_in_use, safe_unlink_upload, safe_upload_name, sign_media_url
 from app.models.organization import Organization
 from app.models.resume_metadata import ResumeMetadata
 from app.models.user import User, UserRole
@@ -46,16 +48,70 @@ def _check_resume_db_permission(user: User, db: Session) -> None:
     if not org or not org.allow_resume_database:
         raise HTTPException(status_code=403, detail="You do not have permission to perform this action. Please contact your admin.")
 
-IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
-UPLOAD_ROOT = "/tmp/uploads" if IS_SERVERLESS else "uploads"
+# Resume-database writes and destructive actions: admins and super admins only
+# (the page is admin-facing); destructive ones also call _check_resume_db_permission.
+_require_resume_admin = require_roles(UserRole.admin, UserRole.super_admin)
+
 RESUME_UPLOAD_DIR = f"{UPLOAD_ROOT}/resumes"
 os.makedirs(RESUME_UPLOAD_DIR, exist_ok=True)
 
+# Accepted upload content types -> extension used when the client file name
+# carries none of the allowed ones.
 ALLOWED_RESUME_TYPES = {
-    "application/pdf",
-    "application/msword",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/pdf": ".pdf",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
 }
+RESUME_EXTENSIONS = {".pdf", ".doc", ".docx"}
+
+# batch_id -> organization_id of the uploader (None for a global super admin)
+_bulk_owner: dict = {}
+
+
+def _stored_resume_name(filename: Optional[str], default_ext: Optional[str] = None) -> Optional[str]:
+    """Server-side name for an uploaded resume: timestamp + sanitized stem + an
+    allowlisted extension. None when the extension is not allowed."""
+    safe = safe_upload_name(filename, RESUME_EXTENSIONS, default_ext=default_ext)
+    if safe is None:
+        return None
+    stem, ext = safe
+    return f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{stem}{ext}"
+
+
+def _remove_resume_file_if_unused(db: Session, stored_path: Optional[str]) -> bool:
+    """Delete a resume file once no Candidate / ResumeMetadata row references it.
+    Only files inside the resumes upload folder are ever touched; never raises."""
+    if not stored_path:
+        return False
+    try:
+        if resume_file_in_use(db, stored_path):
+            return False
+    except Exception as exc:
+        logger.warning("Resume file reference check failed for %s: %s", stored_path, exc)
+        return False
+    return safe_unlink_upload(stored_path, ("resumes",))
+
+
+def _remove_unused_resume_files(paths: List[str]) -> None:
+    """Background task: remove the files of resume rows that were just deleted,
+    skipping any file another row still references."""
+    unique = {p for p in paths if p}
+    if not unique:
+        return
+    db = SessionLocal()
+    try:
+        for path in unique:
+            _remove_resume_file_if_unused(db, path)
+    finally:
+        db.close()
+
+
+def _parse_failure_message(exc: Exception) -> str:
+    """parsing_error shown to users. The text extractors raise readable
+    RuntimeError/ValueError messages; anything else is logged, not echoed."""
+    if isinstance(exc, (RuntimeError, ValueError)):
+        return str(exc)[:500]
+    return "Resume could not be parsed due to an internal error."
 
 # ── Background processing queue ──────────────────────────────────────────────
 _bulk_queue: asyncio.Queue = asyncio.Queue()
@@ -107,8 +163,10 @@ def _parse_single_resume(meta_id: int, file_path: str, batch_id: str):
         parsed = fast_parse_resume(raw_text)
         parsed_email = parsed.get("candidate_email")
 
-        # Deduplication (org-scoped)
+        # Deduplication (org-scoped: never merges across organizations; rows
+        # without an organization only dedupe against other org-less rows)
         target = meta
+        replaced_file = None
         if parsed_email and meta.candidate_email != parsed_email:
             dedup_query = db.query(ResumeMetadata).filter(
                 ResumeMetadata.candidate_email == parsed_email,
@@ -116,14 +174,13 @@ def _parse_single_resume(meta_id: int, file_path: str, batch_id: str):
             )
             if meta.organization_id is not None:
                 dedup_query = dedup_query.filter(ResumeMetadata.organization_id == meta.organization_id)
+            else:
+                dedup_query = dedup_query.filter(ResumeMetadata.organization_id.is_(None))
             existing = dedup_query.first()
             if existing:
                 target = existing
-                if existing.resume_file_path and os.path.exists(existing.resume_file_path) and existing.resume_file_path != file_path:
-                    try:
-                        os.remove(existing.resume_file_path)
-                    except Exception:
-                        pass
+                if existing.resume_file_path and existing.resume_file_path != file_path:
+                    replaced_file = existing.resume_file_path
                 db.delete(meta)
                 db.flush()
             else:
@@ -147,6 +204,11 @@ def _parse_single_resume(meta_id: int, file_path: str, batch_id: str):
         target.parsed_at = datetime.utcnow()
         db.commit()
 
+        # The merged record now points at the new upload: drop its old file
+        # unless another row (e.g. a hired candidate) still uses it.
+        if replaced_file:
+            _remove_resume_file_if_unused(db, replaced_file)
+
         _update_batch_progress(batch_id, "completed")
 
     except Exception as exc:
@@ -155,7 +217,7 @@ def _parse_single_resume(meta_id: int, file_path: str, batch_id: str):
             meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
             if meta:
                 meta.parsing_status = "failed"
-                meta.parsing_error = str(exc)[:500]
+                meta.parsing_error = _parse_failure_message(exc)
                 db.commit()
         except Exception:
             pass
@@ -198,8 +260,10 @@ async def _ai_parse_single_resume(meta_id: int, file_path: str, batch_id: str):
 
         parsed_email = data.get("email")
 
-        # Deduplication (org-scoped)
+        # Deduplication (org-scoped: never merges across organizations; rows
+        # without an organization only dedupe against other org-less rows)
         target = meta
+        replaced_file = None
         if parsed_email and meta.candidate_email != parsed_email:
             dedup_query = db.query(ResumeMetadata).filter(
                 ResumeMetadata.candidate_email == parsed_email,
@@ -207,14 +271,13 @@ async def _ai_parse_single_resume(meta_id: int, file_path: str, batch_id: str):
             )
             if meta.organization_id is not None:
                 dedup_query = dedup_query.filter(ResumeMetadata.organization_id == meta.organization_id)
+            else:
+                dedup_query = dedup_query.filter(ResumeMetadata.organization_id.is_(None))
             existing = dedup_query.first()
             if existing:
                 target = existing
-                if existing.resume_file_path and os.path.exists(existing.resume_file_path) and existing.resume_file_path != file_path:
-                    try:
-                        os.remove(existing.resume_file_path)
-                    except Exception:
-                        pass
+                if existing.resume_file_path and existing.resume_file_path != file_path:
+                    replaced_file = existing.resume_file_path
                 db.delete(meta)
                 db.flush()
             else:
@@ -238,6 +301,11 @@ async def _ai_parse_single_resume(meta_id: int, file_path: str, batch_id: str):
         target.parsed_at = datetime.utcnow()
         db.commit()
 
+        # The merged record now points at the new upload: drop its old file
+        # unless another row (e.g. a hired candidate) still uses it.
+        if replaced_file:
+            _remove_resume_file_if_unused(db, replaced_file)
+
         _update_batch_progress(batch_id, "completed")
 
         # Small delay between AI calls to respect rate limits
@@ -249,7 +317,7 @@ async def _ai_parse_single_resume(meta_id: int, file_path: str, batch_id: str):
             meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
             if meta:
                 meta.parsing_status = "failed"
-                meta.parsing_error = str(exc)[:500]
+                meta.parsing_error = _parse_failure_message(exc)
                 db.commit()
         except Exception:
             pass
@@ -305,7 +373,7 @@ def get_resume_db_permissions(
     """Check if the current user has resume database write access."""
     if user.role == UserRole.super_admin:
         return {"allowed": True}
-    if not user.organization_id:
+    if user.role != UserRole.admin or not user.organization_id:
         return {"allowed": False}
     org = db.query(Organization).filter(Organization.id == user.organization_id).first()
     return {"allowed": bool(org and org.allow_resume_database)}
@@ -327,7 +395,7 @@ async def upload_resumes(
     files: List[UploadFile] = File(...),
     parse_mode: str = Query("fast", description="'fast' (regex) or 'ai' (Claude AI)"),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(_require_resume_admin),
 ):
     _check_resume_db_permission(user, db)
     _ensure_bulk_worker()
@@ -350,6 +418,7 @@ async def upload_resumes(
         "status": "processing",
         "parse_mode": parse_mode,
     }
+    _bulk_owner[batch_id] = user.organization_id
 
     created_ids = []
 
@@ -359,8 +428,8 @@ async def upload_resumes(
             _bulk_progress[batch_id]["failed"] += 1
             continue
 
-        # Save file to disk
-        safe_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{file.filename}"
+        # Save file to disk under a sanitized, server-chosen name
+        safe_name = _stored_resume_name(file.filename, default_ext=ALLOWED_RESUME_TYPES[file.content_type])
         file_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
         with open(file_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
@@ -396,8 +465,9 @@ async def upload_resumes(
     "/batch/{batch_id}",
     summary="Check bulk upload batch progress",
 )
-def get_batch_progress(batch_id: str):
-    if batch_id not in _bulk_progress:
+def get_batch_progress(batch_id: str, user: User = Depends(get_current_user)):
+    # Only the uploader's organization (or a global super admin) may poll a batch
+    if batch_id not in _bulk_progress or not can_access_org(user, _bulk_owner.get(batch_id)):
         raise HTTPException(status_code=404, detail="Batch not found")
     return _bulk_progress[batch_id]
 
@@ -424,6 +494,7 @@ def list_failed_resumes(db: Session = Depends(get_db), user: User = Depends(get_
                 "candidate_name": m.candidate_name,
                 "candidate_email": m.candidate_email,
                 "resume_file_path": m.resume_file_path,
+                "resume_file_url": sign_media_url(m.resume_file_path),
                 "parsing_error": m.parsing_error,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
             }
@@ -626,7 +697,7 @@ def update_resume_metadata(
     meta_id: int,
     body: ResumeMetadataUpdate,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(_require_resume_admin),
 ):
     org_id = get_org_id(user)
     query = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id)
@@ -659,8 +730,12 @@ def update_resume_metadata(
     summary="Delete ALL resume metadata records and files",
     status_code=200,
 )
-def clear_all_resumes(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """Wipe the resume database for the current organization (or all for super admin)."""
+def clear_all_resumes(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(_require_resume_admin),
+):
+    """Wipe the resume database for the current organization (or all for a global super admin)."""
     _check_resume_db_permission(user, db)
     from app.models.candidate import Candidate
 
@@ -681,23 +756,17 @@ def clear_all_resumes(db: Session = Depends(get_db), user: User = Depends(get_cu
             {"resume_metadata_id": None}, synchronize_session="fetch"
         )
 
+    file_paths = [m.resume_file_path for m in all_resumes if m.resume_file_path]
     for meta in all_resumes:
-        if meta.resume_file_path and os.path.exists(meta.resume_file_path):
-            try:
-                os.remove(meta.resume_file_path)
-            except Exception:
-                pass
         db.delete(meta)
 
     db.commit()
 
-    # Clean up uploads folder only for super admin (global wipe)
-    if user.role == UserRole.super_admin and os.path.exists(RESUME_UPLOAD_DIR):
-        for f in os.listdir(RESUME_UPLOAD_DIR):
-            try:
-                os.remove(os.path.join(RESUME_UPLOAD_DIR, f))
-            except Exception:
-                pass
+    # Remove only the files of the rows deleted above, and only those no other
+    # row (e.g. a candidate) still references. The resumes folder also holds
+    # candidate uploads and other tenants' files, so it is never wiped wholesale.
+    # Runs after the response: the reference check is a query per file.
+    background_tasks.add_task(_remove_unused_resume_files, file_paths)
 
     return {"deleted": count, "message": f"Deleted all {count} resume records and files."}
 
@@ -709,9 +778,10 @@ def clear_all_resumes(db: Session = Depends(get_db), user: User = Depends(get_cu
     summary="Delete a resume metadata record",
     status_code=204,
 )
-def delete_resume(meta_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def delete_resume(meta_id: int, db: Session = Depends(get_db), user: User = Depends(_require_resume_admin)):
     from app.models.candidate import Candidate
 
+    _check_resume_db_permission(user, db)
     org_id = get_org_id(user)
     query = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id)
     if org_id is not None:
@@ -725,14 +795,12 @@ def delete_resume(meta_id: int, db: Session = Depends(get_db), user: User = Depe
         {"resume_metadata_id": None}, synchronize_session="fetch"
     )
 
-    # Delete file from disk
-    if meta.resume_file_path and os.path.exists(meta.resume_file_path):
-        try:
-            os.remove(meta.resume_file_path)
-        except Exception:
-            pass
+    file_path = meta.resume_file_path
     db.delete(meta)
     db.commit()
+
+    # Delete the file from disk unless another row still references it
+    _remove_resume_file_if_unused(db, file_path)
 
 
 # ── Cleanup Duplicates ──────────────────────────────────────────────────────
@@ -745,10 +813,15 @@ def delete_resume(meta_id: int, db: Session = Depends(get_db), user: User = Depe
         "Returns count of deleted records."
     ),
 )
-def cleanup_stale_records(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def cleanup_stale_records(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(_require_resume_admin),
+):
     """Remove placeholder records that were never parsed or failed."""
     from app.models.candidate import Candidate
 
+    _check_resume_db_permission(user, db)
     org_id = get_org_id(user)
 
     # Delete placeholder records that are still pending/failed (never parsed)
@@ -769,17 +842,14 @@ def cleanup_stale_records(db: Session = Depends(get_db), user: User = Depends(ge
             {"resume_metadata_id": None}, synchronize_session="fetch"
         )
 
+    file_paths = [m.resume_file_path for m in stale if m.resume_file_path]
     for meta in stale:
-        # Delete the file if it exists
-        if meta.resume_file_path and os.path.exists(meta.resume_file_path):
-            try:
-                os.remove(meta.resume_file_path)
-            except Exception:
-                pass
         db.delete(meta)
         deleted_count += 1
 
     db.commit()
+    # Delete their files (unless still referenced elsewhere) after the response
+    background_tasks.add_task(_remove_unused_resume_files, file_paths)
     return {"deleted": deleted_count, "message": f"Removed {deleted_count} stale placeholder record(s)."}
 
 
@@ -789,10 +859,11 @@ def cleanup_stale_records(db: Session = Depends(get_db), user: User = Depends(ge
     "/{meta_id}/reparse",
     summary="Re-parse a single resume with improved regex + LLM correction",
 )
-async def reparse_single_resume(meta_id: int, use_llm: bool = True, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+async def reparse_single_resume(meta_id: int, use_llm: bool = True, db: Session = Depends(get_db), user: User = Depends(_require_resume_admin)):
     from app.services.fast_resume_parser import fast_parse_resume
     from app.services.llm_resume_parser import llm_parse_resume, needs_llm_correction
 
+    _check_resume_db_permission(user, db)
     org_id = get_org_id(user)
     query = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id)
     if org_id is not None:
@@ -856,7 +927,8 @@ async def reparse_single_resume(meta_id: int, use_llm: bool = True, db: Session 
         serialized["llm_used"] = llm_used
         return serialized
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Re-parse failed: {str(e)}")
+        logger.error("Re-parse failed for %s: %s", meta_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Re-parse failed. Please try again.")
 
 
 # ── Bulk re-parse with LLM correction (for bad entries) ──────────────────────
@@ -865,11 +937,12 @@ async def reparse_single_resume(meta_id: int, use_llm: bool = True, db: Session 
     "/reparse-bad",
     summary="Re-parse resumes that have bad data (auto-detected) using regex + LLM",
 )
-async def reparse_bad_resumes(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+async def reparse_bad_resumes(db: Session = Depends(get_db), user: User = Depends(_require_resume_admin)):
     """Find resumes with garbage data and re-parse them with LLM correction."""
     from app.services.fast_resume_parser import fast_parse_resume
     from app.services.llm_resume_parser import llm_parse_resume, needs_llm_correction
 
+    _check_resume_db_permission(user, db)
     org_id = get_org_id(user)
     query = db.query(ResumeMetadata).filter(
         ResumeMetadata.parsing_status == "completed",
@@ -943,12 +1016,13 @@ async def reparse_bad_resumes(db: Session = Depends(get_db), user: User = Depend
         "Does NOT change candidate_email or parsing_status. Useful after parser improvements."
     ),
 )
-def reparse_all_resumes(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def reparse_all_resumes(db: Session = Depends(get_db), user: User = Depends(_require_resume_admin)):
     """Re-parse all completed resumes using the improved fast parser."""
     from app.services.fast_resume_parser import fast_parse_resume, _is_valid_name
     import json
     from datetime import datetime
 
+    _check_resume_db_permission(user, db)
     org_id = get_org_id(user)
     query = db.query(ResumeMetadata).filter(
         ResumeMetadata.parsing_status == "completed",
@@ -1026,27 +1100,32 @@ def reparse_all_resumes(db: Session = Depends(get_db), user: User = Depends(get_
 async def import_resumes(
     request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(_require_resume_admin),
 ):
-    body = await request.json()
+    _check_resume_db_permission(user, db)
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Expected a JSON array of resume records")
     if not isinstance(body, list):
         raise HTTPException(status_code=400, detail="Expected a JSON array of resume records")
 
+    org_id = get_org_id(user)
     imported = 0
     skipped = 0
     errors = 0
 
     for record in body:
+        if not isinstance(record, dict):
+            errors += 1
+            continue
         email = record.get("candidate_email")
-        if not email or "@pending.local" in email:
+        if not isinstance(email, str) or not email or "@pending.local" in email:
             skipped += 1
             continue
 
         # Skip if already exists in this org
-        dup_query = db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == email)
-        if user.organization_id:
-            dup_query = dup_query.filter(ResumeMetadata.organization_id == user.organization_id)
-        if dup_query.first():
+        if _resume_exists_in_org(db, email, org_id):
             skipped += 1
             continue
 
@@ -1066,7 +1145,7 @@ async def import_resumes(
                 keywords=record.get("keywords") if isinstance(record.get("keywords"), str) else json.dumps(record.get("keywords", [])),
                 summary=record.get("summary"),
                 raw_text=record.get("raw_text"),
-                parsing_status=record.get("parsing_status", "completed"),
+                parsing_status=_import_parsing_status(record),
                 parsed_at=datetime.fromisoformat(record["parsed_at"]) if record.get("parsed_at") else None,
                 organization_id=user.organization_id,
             )
@@ -1100,27 +1179,29 @@ async def import_with_file(
     metadata: str = Form(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(_require_resume_admin),
 ):
     """Import a single resume with its file from local to server."""
+    _check_resume_db_permission(user, db)
     try:
         record = json.loads(metadata)
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid metadata JSON")
+    if not isinstance(record, dict):
+        raise HTTPException(status_code=400, detail="Invalid metadata JSON")
 
     email = record.get("candidate_email")
-    if not email or "@pending.local" in email:
+    if not isinstance(email, str) or not email or "@pending.local" in email:
         return {"status": "skipped", "reason": "invalid email"}
 
     # Skip if already exists in this org
-    dup_query = db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == email)
-    if user.organization_id:
-        dup_query = dup_query.filter(ResumeMetadata.organization_id == user.organization_id)
-    if dup_query.first():
+    if _resume_exists_in_org(db, email, get_org_id(user)):
         return {"status": "skipped", "reason": "already exists"}
 
-    # Save file
-    safe_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{file.filename}"
+    # Save file under a sanitized, server-chosen name (PDF/DOC/DOCX only)
+    safe_name = _stored_resume_name(file.filename)
+    if safe_name is None:
+        return {"status": "skipped", "reason": "unsupported file type"}
     file_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
@@ -1142,19 +1223,38 @@ async def import_with_file(
             summary=record.get("summary"),
             raw_text=record.get("raw_text"),
             resume_file_path=file_path,
-            parsing_status=record.get("parsing_status", "completed"),
+            parsing_status=_import_parsing_status(record),
             parsed_at=datetime.fromisoformat(record["parsed_at"]) if record.get("parsed_at") else None,
             organization_id=user.organization_id,
         )
         db.add(meta)
         db.commit()
-        return {"status": "imported", "id": meta.id}
     except Exception as exc:
         logger.error("Import with file failed for %s: %s", email, exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        db.rollback()
+        # The row was not stored, so its file must not linger
+        safe_unlink_upload(file_path, ("resumes",))
+        raise HTTPException(status_code=500, detail="Import failed. Please try again.")
+    return {"status": "imported", "id": meta.id}
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _resume_exists_in_org(db: Session, email: str, org_id: Optional[int]) -> bool:
+    """Duplicate check within one organization (org-less rows only for a global
+    super admin, whose get_org_id is None) — never across tenants."""
+    q = db.query(ResumeMetadata.id).filter(ResumeMetadata.candidate_email == email)
+    if org_id is not None:
+        q = q.filter(ResumeMetadata.organization_id == org_id)
+    else:
+        q = q.filter(ResumeMetadata.organization_id.is_(None))
+    return q.first() is not None
+
+
+def _import_parsing_status(record: dict) -> str:
+    status = record.get("parsing_status")
+    return status if status in ("pending", "processing", "completed", "failed") else "completed"
+
 
 def _parse_json(val: Optional[str]) -> list | dict:
     if not val:
@@ -1181,6 +1281,7 @@ def _serialize_meta(meta: ResumeMetadata, include_text: bool = False) -> dict:
         "summary": meta.summary,
         "parsing_status": meta.parsing_status,
         "resume_file_path": meta.resume_file_path,
+        "resume_file_url": sign_media_url(meta.resume_file_path),
         "parsed_at": meta.parsed_at.isoformat() if meta.parsed_at else None,
         "created_at": meta.created_at.isoformat() if meta.created_at else None,
     }

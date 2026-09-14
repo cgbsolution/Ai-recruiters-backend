@@ -18,6 +18,7 @@ Design rules:
 
 import json
 import logging
+import re
 
 from fastapi import APIRouter, Depends, Request, Response
 from slowapi import Limiter
@@ -43,7 +44,23 @@ _PROBLEM_EVENTS = {
     "recording_missing",
     "recording_upload_failed",
     "recording_upload_attempt_failed",
+    # Device Test mic check: a candidate blocked at the gate, or our speech
+    # service failing, both need to be visible without filtering INFO.
+    "mic_check_failed",
+    "mic_check_stt_unavailable",
 }
+
+# Control characters (CR/LF included) and Unicode line separators. The payload
+# is anonymous, so a raw newline in it could forge extra backend log lines.
+_LOG_UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_LOG_MESSAGE_MAX_CHARS = 2000
+
+
+def _log_safe(value, limit: int) -> str:
+    """Single-line, length-capped text for the log line only (the DB row keeps
+    the original value, which is length-capped separately)."""
+    text = _LOG_UNSAFE_CHARS.sub(" ", str(value))
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
 def _coerce_int(value):
@@ -83,7 +100,10 @@ async def ingest_client_event(request: Request, db: Session = Depends(get_db)):
         session_id = _coerce_int(context.get("sessionId"))
 
     # Log first (cheap, always visible in Dokploy), persist second.
-    log_line = f"[ClientEvent] {event_type} session={session_id or '-'} :: {message or ''}"
+    log_line = (
+        f"[ClientEvent] {_log_safe(event_type, 60)} session={session_id or '-'} :: "
+        f"{_log_safe(message or '', _LOG_MESSAGE_MAX_CHARS)}"
+    )
     if event_type in _PROBLEM_EVENTS:
         logger.warning(log_line)
     else:

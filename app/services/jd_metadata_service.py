@@ -9,14 +9,49 @@ Two modes:
 
 import json
 import logging
+import os
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from app import media
 from app.models.job import Job, JobSkill, JobResponsibility
 from app.models.job_metadata import JobMetadata
 
 logger = logging.getLogger(__name__)
+
+JD_FILE_EXTENSIONS = {".pdf", ".doc", ".docx"}
+_JD_STORED_PREFIXES = ("/tmp/uploads/jd/", "tmp/uploads/jd/", "./uploads/jd/", "/uploads/jd/", "uploads/jd/", "jd/")
+
+
+def resolve_jd_file(upload_jd: Optional[str]) -> Optional[str]:
+    """Absolute path of an uploaded JD file, or None.
+
+    Job.upload_jd is client-supplied (JobCreate/JobUpdate), so it must never be
+    opened as-is — it used to reach extract_text() with any path on the host.
+    Only an existing .pdf/.doc/.docx file DIRECTLY inside <UPLOAD_ROOT>/jd is
+    accepted, given as a bare file name or as "/uploads/jd/<name>"."""
+    if not upload_jd or not isinstance(upload_jd, str):
+        return None
+    name = upload_jd.strip().replace("\\", "/")
+    if "\x00" in name or "?" in name or "#" in name or ":" in name:  # ":" — drive-relative paths on Windows
+        return None
+    for prefix in _JD_STORED_PREFIXES:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    if not name or "/" in name or name.startswith("."):
+        return None
+    if os.path.splitext(name)[1].lower() not in JD_FILE_EXTENSIONS:
+        return None
+    root = os.path.realpath(os.path.join(media.UPLOAD_ROOT, "jd"))
+    full = os.path.realpath(os.path.join(root, name))
+    try:
+        if os.path.commonpath([root, full]) != root or os.path.dirname(full) != root:
+            return None
+    except ValueError:  # different drives on Windows
+        return None
+    return full if os.path.isfile(full) else None
 
 
 def build_job_metadata_fast(db: Session, job_id: int) -> Optional[JobMetadata]:
@@ -140,15 +175,16 @@ async def build_job_metadata(db: Session, job_id: int) -> Optional[JobMetadata]:
         skills = [s.skill for s in db.query(JobSkill).filter(JobSkill.job_id == job_id).all() if s.skill]
         responsibilities = [r.description for r in db.query(JobResponsibility).filter(JobResponsibility.job_id == job_id).all()]
 
-        # Try to extract text from uploaded JD file
+        # Try to extract text from uploaded JD file (only from the JD upload folder)
         raw_jd_text = None
-        if job.upload_jd:
+        jd_path = resolve_jd_file(job.upload_jd)
+        if jd_path:
             try:
                 from app.services.resume_service import extract_text
-                raw_jd_text = extract_text(job.upload_jd)
+                raw_jd_text = extract_text(jd_path)
                 meta.raw_jd_text = raw_jd_text
             except Exception:
-                logger.warning("Could not extract text from JD file %s", job.upload_jd)
+                logger.warning("Could not extract text from the JD file of job %s", job_id)
 
         data = await _extract_jd_metadata_llm(
             job_title=job.title,

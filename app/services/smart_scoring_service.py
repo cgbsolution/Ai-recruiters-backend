@@ -223,6 +223,33 @@ def compute_fit_score(resume: ResumeData, job: JobData) -> ScoringResult:
     return _score(extract_features(resume, job), resume, job)
 
 
+def resume_metadata_for_candidate(
+    db: Session, candidate: Candidate, organization_id: Optional[int],
+) -> Optional[ResumeMetadata]:
+    """The candidate's parsed resume, restricted to the tenant that owns the job.
+
+    ResumeMetadata is per organization (unique on email + organization_id), and
+    matching on email alone used to pull ANOTHER tenant's parsed resume into
+    this candidate's score and fit reasoning. The linked row is used only when
+    it belongs to the same organization, and the email fallback is always
+    filtered by it — a job with no organization only matches rows with none.
+    """
+    if candidate.resume_metadata_id:
+        meta = db.query(ResumeMetadata).filter(
+            ResumeMetadata.id == candidate.resume_metadata_id
+        ).first()
+        if meta is not None and meta.organization_id == organization_id:
+            return meta
+    if not candidate.email:
+        return None
+    q = db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == candidate.email)
+    if organization_id is None:
+        q = q.filter(ResumeMetadata.organization_id.is_(None))
+    else:
+        q = q.filter(ResumeMetadata.organization_id == organization_id)
+    return q.first()
+
+
 def compute_fit_score_for_candidate(
     db: Session, candidate_id: int, job_id: int,
 ) -> Optional[ScoringResult]:
@@ -232,12 +259,8 @@ def compute_fit_score_for_candidate(
     if not candidate or not job:
         return None
 
-    # Find resume metadata
-    meta = None
-    if candidate.resume_metadata_id:
-        meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == candidate.resume_metadata_id).first()
-    if not meta and candidate.email:
-        meta = db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == candidate.email).first()
+    # Find resume metadata (same tenant as the job only)
+    meta = resume_metadata_for_candidate(db, candidate, job.organization_id)
     if not meta:
         return None
 
@@ -343,14 +366,7 @@ def feature_score_for_candidate(
     """
     meta = None
     try:
-        if candidate.resume_metadata_id:
-            meta = db.query(ResumeMetadata).filter(
-                ResumeMetadata.id == candidate.resume_metadata_id
-            ).first()
-        if not meta and candidate.email:
-            meta = db.query(ResumeMetadata).filter(
-                ResumeMetadata.candidate_email == candidate.email
-            ).first()
+        meta = resume_metadata_for_candidate(db, candidate, job.organization_id)
     except Exception:
         logger.exception("feature_score_for_candidate: metadata lookup failed")
 

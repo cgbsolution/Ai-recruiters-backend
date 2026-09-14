@@ -48,6 +48,9 @@ class Candidate(Base):
     interview_date = Column(DateTime, nullable=True)
     interview_timezone = Column(String(100), nullable=True)
     interview_link = Column(String(500), nullable=True)
+    # Secret for the candidate's personal interview link (?invite=…). NULL for
+    # candidates scheduled before personal links existed — see app.invites.
+    invite_token = Column(String(64), nullable=True, unique=True, index=True)
     allow_candidate_reschedule = Column(Boolean, nullable=True, default=False)
     allow_joining_early = Column(Boolean, nullable=True, default=False)
     # "scheduled_time" | "anytime"

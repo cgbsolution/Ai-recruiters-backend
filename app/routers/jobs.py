@@ -5,13 +5,14 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
-from sqlalchemy import func, extract, cast, Date
+from sqlalchemy import func, extract, cast, Date, or_
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db, SessionLocal
 from app.models.interview import InterviewSession, InterviewToken, MeetingSlot
 from app.auth import get_current_user, get_org_id
+from app.authz import authorize_job
 from app.models.organization import Organization
 from app.models.user import User, UserRole
 from app.models.candidate import Candidate, CandidateStatus
@@ -24,24 +25,21 @@ from app.schemas.interview import (
     MeetingSlotCreate,
     MeetingSlotRead,
 )
-from app.schemas.job import JobCreate, JobListItem, JobRead, JobUpdate
+from app.refs import JobId
+from app.schemas.job import AddMatchedCandidatesRequest, JobCreate, JobListItem, JobRead, JobUpdate
 from app.services import job_service
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
-# Separate router for public endpoints (no auth required)
+# Separate router for public endpoints (no auth required). Intentionally empty:
+# GET /{job_id}/download-jd used to live here, letting anyone enumerate every
+# tenant's JDs; it is now on `router`. Kept because app.main includes it.
 public_router = APIRouter()
 
 
 def _get_job_with_org_check(db: Session, job_id: int, user: User) -> JobModel:
-    """Fetch a job and verify it belongs to the user's organization."""
-    job = db.query(JobModel).filter(JobModel.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    org_id = get_org_id(user)
-    if org_id is not None and job.organization_id != org_id:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    """Fetch a job the caller may access, or 404 (fails closed — see app.authz)."""
+    return authorize_job(db, job_id, user)
 
 
 def _check_code_editor_permission(db: Session, user: User, code_editor_enabled: bool):
@@ -354,22 +352,32 @@ def create_job(payload: JobCreate, background_tasks: BackgroundTasks, db: Sessio
     ce = getattr(payload, "interview_settings", None)
     if ce and getattr(ce, "code_editor_required", False):
         _check_code_editor_permission(db, user, True)
-    # Enforce org job quota using lifetime counter
+    # Enforce org job quota using lifetime counter. Check and increment in ONE
+    # conditional UPDATE (max_jobs 0 = unlimited): its row lock serializes
+    # concurrent creates, which could all pass a stale read before. It is not
+    # committed here — job_service.create_job commits it together with the job,
+    # so a failed create never consumes quota.
     if org_id is not None:
-        org = db.query(Organization).filter(Organization.id == org_id).first()
-        if org and (org.max_jobs or 0) > 0:
-            if (org.total_jobs_used or 0) >= org.max_jobs:
-                raise HTTPException(
-                    status_code=403,
-                    detail="You have exceeded the job limit. Please upgrade your plan.",
-                )
+        claimed = (
+            db.query(Organization)
+            .filter(
+                Organization.id == org_id,
+                or_(
+                    func.coalesce(Organization.max_jobs, 0) <= 0,
+                    func.coalesce(Organization.total_jobs_used, 0) < Organization.max_jobs,
+                ),
+            )
+            .update(
+                {Organization.total_jobs_used: func.coalesce(Organization.total_jobs_used, 0) + 1},
+                synchronize_session=False,
+            )
+        )
+        if not claimed:
+            raise HTTPException(
+                status_code=403,
+                detail="You have exceeded the job limit. Please upgrade your plan.",
+            )
     job = job_service.create_job(db, payload, org_id=org_id)
-    # Increment lifetime job counter
-    if org_id is not None:
-        org = db.query(Organization).filter(Organization.id == org_id).first()
-        if org:
-            org.total_jobs_used = (org.total_jobs_used or 0) + 1
-            db.commit()
     # Auto-generate a unique interview token for this job
     token_str = _create_token(db, job.id)
     # Extract JD metadata in background
@@ -379,7 +387,7 @@ def create_job(payload: JobCreate, background_tasks: BackgroundTasks, db: Sessio
 
 
 @router.get("/{job_id}", response_model=JobRead)
-def get_job(job_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def get_job(job_id: JobId, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     from app.models.job_metadata import JobMetadata
     job = _get_job_with_org_check(db, job_id, user)
     result = JobRead.model_validate(job)
@@ -393,7 +401,7 @@ def get_job(job_id: int, db: Session = Depends(get_db), user: User = Depends(get
 
 
 @router.put("/{job_id}", response_model=JobRead)
-def update_job(job_id: int, payload: JobUpdate, background_tasks: BackgroundTasks, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def update_job(job_id: JobId, payload: JobUpdate, background_tasks: BackgroundTasks, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _get_job_with_org_check(db, job_id, user)
     # Validate code editor permission on update
     ce = getattr(payload, "interview_settings", None)
@@ -415,7 +423,7 @@ def update_job(job_id: int, payload: JobUpdate, background_tasks: BackgroundTask
     tags=["Jobs"],
 )
 def change_job_status(
-    job_id: int,
+    job_id: JobId,
     new_status: str,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -457,7 +465,7 @@ def change_job_status(
         404: {"description": "Job not found"},
     },
 )
-def delete_job(job_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def delete_job(job_id: JobId, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _get_job_with_org_check(db, job_id, user)
     ok = job_service.delete_job(db, job_id)
     if not ok:
@@ -482,7 +490,7 @@ def delete_job(job_id: int, db: Session = Depends(get_db), user: User = Depends(
     ),
     tags=["Jobs"],
 )
-def generate_interview_url(job_id: int, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def generate_interview_url(job_id: JobId, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     job = _get_job_with_org_check(db, job_id, user)
 
     # Return existing active token if present
@@ -532,7 +540,7 @@ def generate_interview_url(job_id: int, request: Request, db: Session = Depends(
     ),
     tags=["Jobs"],
 )
-def list_interview_sessions(job_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def list_interview_sessions(job_id: JobId, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _get_job_with_org_check(db, job_id, user)
 
     sessions = (
@@ -575,7 +583,7 @@ def list_interview_sessions(job_id: int, db: Session = Depends(get_db), user: Us
     ),
     tags=["Jobs"],
 )
-def add_meeting_slot(job_id: int, payload: MeetingSlotCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def add_meeting_slot(job_id: JobId, payload: MeetingSlotCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     job = _get_job_with_org_check(db, job_id, user)
 
     slot = MeetingSlot(
@@ -592,23 +600,23 @@ def add_meeting_slot(job_id: int, payload: MeetingSlotCreate, db: Session = Depe
 
 # ── Download JD as Word Document ─────────────────────────────────────────────
 
-@public_router.get(
+@router.get(
     "/{job_id}/download-jd",
     summary="Download a generated Word document JD for a job",
     tags=["Jobs"],
 )
-def download_jd(job_id: int, db: Session = Depends(get_db)):
+def download_jd(job_id: JobId, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     import io
     import os
     from docx import Document
     from docx.shared import Pt, Inches, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from fastapi.responses import StreamingResponse
-    from app.models.job import Job, JobSkill, JobResponsibility
+    from app.models.job import JobSkill, JobResponsibility
 
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    # Requires the Bearer token and access to the job (was public and unscoped:
+    # every tenant's JDs, drafts and hiring-manager contacts by sequential id).
+    job = _get_job_with_org_check(db, job_id, user)
 
     from app.models.job_metadata import JobMetadata
 
@@ -714,16 +722,16 @@ def download_jd(job_id: int, db: Session = Depends(get_db)):
     tags=["Jobs"],
 )
 def match_candidates(
-    job_id: int,
+    job_id: JobId,
     threshold: int = 30,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     from app.services.matching_service import start_match_task
 
-    _get_job_with_org_check(db, job_id, user)
+    job = _get_job_with_org_check(db, job_id, user)
 
-    task_id = start_match_task(job_id, threshold=threshold)
+    task_id = start_match_task(job.id, threshold=threshold, organization_id=job.organization_id)
 
     return {
         "task_id": task_id,
@@ -743,20 +751,25 @@ def match_candidates(
     tags=["Jobs"],
 )
 def match_status(
-    job_id: int,
+    job_id: JobId,
     task_id: str,
     page: int = 1,
     page_size: int = 50,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     from app.services.matching_service import get_task
 
-    task = get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found or expired")
-    if task.job_id != job_id:
-        raise HTTPException(status_code=404, detail="Task not found for this job")
+    job = _get_job_with_org_check(db, job_id, user)
 
-    page_size = min(page_size, 200)
+    # A task is readable only through the (authorized) job it was started for,
+    # and only within the organization it was started in. One 404 for all cases.
+    task = get_task(task_id)
+    if not task or task.job_id != job.id or task.organization_id != job.organization_id:
+        raise HTTPException(status_code=404, detail="Task not found or expired")
+
+    page = max(page, 1)
+    page_size = max(1, min(page_size, 200))
     denom = task.filtered_count if task.filtered_count else task.total_resumes
     progress_pct = int((task.processed / max(denom, 1)) * 100) if denom else 0
 
@@ -803,8 +816,8 @@ def match_status(
     tags=["Jobs"],
 )
 async def add_matched_candidates(
-    job_id: int,
-    payload: dict,
+    job_id: JobId,
+    payload: AddMatchedCandidatesRequest,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -812,8 +825,9 @@ async def add_matched_candidates(
     from app.models.resume_metadata import ResumeMetadata
 
     job = _get_job_with_org_check(db, job_id, user)
+    job_id = job.id
 
-    candidate_emails = payload.get("candidate_emails", [])
+    candidate_emails = payload.candidate_emails
     if not candidate_emails:
         raise HTTPException(status_code=400, detail="No candidate emails provided")
 
@@ -833,10 +847,17 @@ async def add_matched_candidates(
             details.append({"email": email, "status": "skipped", "reason": "already exists"})
             continue
 
-        # Get metadata
-        meta = db.query(ResumeMetadata).filter(
-            ResumeMetadata.candidate_email == email
-        ).first()
+        # Get metadata — strictly from the job's own organization. It used to be
+        # looked up by email alone, copying another tenant's resume and PII into
+        # this job. A job without an organization has no resume database, so
+        # nothing is added. Unknown and foreign emails get the same "skipped"
+        # result, so this can't probe other organizations.
+        meta = None
+        if job.organization_id is not None:
+            meta = db.query(ResumeMetadata).filter(
+                ResumeMetadata.candidate_email == email,
+                ResumeMetadata.organization_id == job.organization_id,
+            ).first()
 
         if not meta:
             skipped += 1

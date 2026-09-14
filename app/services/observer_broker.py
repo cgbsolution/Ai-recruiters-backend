@@ -43,7 +43,7 @@ class _SessionChannels:
         "signal_publisher_inbox",
         "signal_observer_inboxes",
         "frame_subscribers",
-        "frame_publisher_present",
+        "frame_publishers",
         "last_frame",
     )
 
@@ -58,11 +58,24 @@ class _SessionChannels:
         # from the candidate. Each subscriber gets its own bounded queue so
         # a slow observer doesn't back up the candidate.
         self.frame_subscribers: List[asyncio.Queue] = []
-        self.frame_publisher_present: bool = False
+        # Open frame-publisher sockets. A count, not a flag: when the
+        # candidate's socket reconnects, the stale socket's cleanup must not
+        # mark the live one absent or wipe its cached frame.
+        self.frame_publishers: int = 0
         # Cache the most recent frame so a freshly-connected observer sees
         # something immediately instead of a black tile until the next
         # candidate frame arrives.
         self.last_frame: Optional[bytes] = None
+
+    def is_idle(self) -> bool:
+        """Nothing is attached to this session any more."""
+        return not (
+            self.event_subscribers
+            or self.signal_publisher_inbox is not None
+            or self.signal_observer_inboxes
+            or self.frame_subscribers
+            or self.frame_publishers
+        )
 
 
 class ObserverBroker:
@@ -78,6 +91,13 @@ class ObserverBroker:
 
     def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
+
+    def _prune_locked(self, session_id: int) -> None:
+        """Forget a session once nothing is attached, so the map doesn't keep an
+        entry for every interview ever observed. Caller must hold _lock."""
+        ch = self._sessions.get(session_id)
+        if ch is not None and ch.is_idle():
+            del self._sessions[session_id]
 
     def _put_nowait_threadsafe(self, q: asyncio.Queue, item: dict) -> None:
         """Schedule put_nowait on the broker's event loop if we're called from
@@ -115,6 +135,7 @@ class ObserverBroker:
             ch = self._sessions.get(session_id)
             if ch and q in ch.event_subscribers:
                 ch.event_subscribers.remove(q)
+            self._prune_locked(session_id)
 
     def publish_event(self, session_id: int, event: dict) -> None:
         """Synchronous fan-out. Safe to call from anywhere — including a
@@ -164,6 +185,7 @@ class ObserverBroker:
                         inbox.put_nowait({"type": "publisher_gone"})
                     except Exception:
                         pass
+            self._prune_locked(session_id)
 
     async def register_observer(self, session_id: int, observer_id: str) -> asyncio.Queue:
         async with self._lock:
@@ -195,6 +217,7 @@ class ObserverBroker:
                     })
                 except Exception:
                     pass
+            self._prune_locked(session_id)
 
     def publisher_present(self, session_id: int) -> bool:
         ch = self._sessions.get(session_id)
@@ -249,17 +272,24 @@ class ObserverBroker:
             ch = self._sessions.get(session_id)
             if ch and q in ch.frame_subscribers:
                 ch.frame_subscribers.remove(q)
+            self._prune_locked(session_id)
 
     async def set_frame_publisher_present(self, session_id: int, present: bool) -> None:
+        """Call with True when a frame-publisher socket opens and False when it
+        closes (always paired)."""
         async with self._lock:
             ch = self._sessions[session_id]
-            ch.frame_publisher_present = present
-            if not present:
+            if present:
+                ch.frame_publishers += 1
+                return
+            ch.frame_publishers = max(0, ch.frame_publishers - 1)
+            if ch.frame_publishers == 0:
                 ch.last_frame = None
+            self._prune_locked(session_id)
 
     def frame_publisher_present(self, session_id: int) -> bool:
         ch = self._sessions.get(session_id)
-        return bool(ch and ch.frame_publisher_present)
+        return bool(ch and ch.frame_publishers > 0)
 
     def broadcast_frame(self, session_id: int, frame: bytes) -> None:
         """Fan a JPEG (or other binary) frame out to all observers on this

@@ -9,6 +9,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, require_roles
@@ -18,6 +19,7 @@ from app.models.user import User, UserRole
 from app.models.job import Job
 from app.models.candidate import Candidate
 from app.models.ai_credit_usage import AiCreditUsage
+from app.refs import OrgId, encode_ref
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +108,7 @@ def list_organizations(
     return [
         {
             "id": o.id,
+            "ref": encode_ref("org", o.id),
             "name": o.name,
             "domain": o.domain,
             "is_active": o.is_active,
@@ -129,7 +132,7 @@ def list_organizations(
 # ── Get Single Organization ─────────────────────────────────────────────────
 
 @router.get("/{org_id}")
-def get_organization(org_id: int, db: Session = Depends(get_db)):
+def get_organization(org_id: OrgId, db: Session = Depends(get_db)):
     """Get organization details with stats."""
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
@@ -167,6 +170,7 @@ def get_organization(org_id: int, db: Session = Depends(get_db)):
 
     return {
         "id": org.id,
+        "ref": encode_ref("org", org.id),
         "name": org.name,
         "domain": org.domain,
         "is_active": org.is_active,
@@ -193,6 +197,7 @@ def get_organization(org_id: int, db: Session = Depends(get_db)):
         "jobs": [
             {
                 "id": j.id,
+                "ref": encode_ref("job", j.id),
                 "title": j.title,
                 "department": j.department,
                 "location": j.location,
@@ -236,6 +241,7 @@ def create_organization(body: OrgCreateRequest, db: Session = Depends(get_db)):
     logger.info("Organization created: %s (%s)", org.name, org.domain)
     return {
         "id": org.id,
+        "ref": encode_ref("org", org.id),
         "name": org.name,
         "domain": org.domain,
         "is_active": org.is_active,
@@ -254,7 +260,7 @@ def create_organization(body: OrgCreateRequest, db: Session = Depends(get_db)):
 
 @router.patch("/{org_id}")
 def update_organization(
-    org_id: int,
+    org_id: OrgId,
     body: OrgUpdateRequest,
     db: Session = Depends(get_db),
 ):
@@ -298,6 +304,7 @@ def update_organization(
     logger.info("Organization updated: %s (id=%d)", org.name, org.id)
     return {
         "id": org.id,
+        "ref": encode_ref("org", org.id),
         "name": org.name,
         "domain": org.domain,
         "is_active": org.is_active,
@@ -311,28 +318,48 @@ def update_organization(
 # ── Delete Organization ─────────────────────────────────────────────────────
 
 @router.delete("/{org_id}")
-def delete_organization(org_id: int, db: Session = Depends(get_db)):
-    """Delete an organization. Users in that org will lose their org assignment."""
+def delete_organization(org_id: OrgId, db: Session = Depends(get_db)):
+    """Delete an EMPTY organization (no users, no jobs). An organization that is
+    in use must be deactivated instead (PATCH is_active=false)."""
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
+    org_name = org.name
 
-    # Unlink users from this org
-    db.query(User).filter(User.organization_id == org_id).update(
-        {"organization_id": None}, synchronize_session="fetch"
-    )
+    # Deleting used to unlink the org's users (organization_id=NULL) while they
+    # stayed active, and a NULL organization was treated as global access.
+    user_count = db.query(func.count(User.id)).filter(User.organization_id == org_id).scalar() or 0
+    job_count = db.query(func.count(Job.id)).filter(Job.organization_id == org_id).scalar() or 0
+    if user_count or job_count:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Organization '{org_name}' still has {user_count} user(s) and {job_count} job(s), "
+                "so it cannot be deleted. Deactivate the organization instead."
+            ),
+        )
 
-    db.delete(org)
-    db.commit()
+    try:
+        db.delete(org)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Organization '{org_name}' still has data (such as resumes or questions), "
+                "so it cannot be deleted. Deactivate the organization instead."
+            ),
+        )
 
-    logger.info("Organization deleted: %s (id=%d)", org.name, org_id)
-    return {"message": f"Organization '{org.name}' deleted successfully"}
+    logger.info("Organization deleted: %s (id=%d)", org_name, org_id)
+    return {"message": f"Organization '{org_name}' deleted successfully"}
 
 
 # ── Per-Org AI Credit Breakdown ──────────────────────────────────────────────
 
 @router.get("/{org_id}/credits")
-def org_credits(org_id: int, db: Session = Depends(get_db)):
+def org_credits(org_id: OrgId, db: Session = Depends(get_db)):
     """Per-feature token/cost breakdown for one organization."""
     from sqlalchemy import extract
     from datetime import datetime as dt
@@ -402,7 +429,7 @@ def org_credits(org_id: int, db: Session = Depends(get_db)):
 # ── Reset Lifetime Usage Counters ────────────────────────────────────────────
 
 @router.post("/{org_id}/reset-usage")
-def reset_usage_counters(org_id: int, db: Session = Depends(get_db)):
+def reset_usage_counters(org_id: OrgId, db: Session = Depends(get_db)):
     """Reset lifetime usage counters (e.g. after plan upgrade)."""
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:

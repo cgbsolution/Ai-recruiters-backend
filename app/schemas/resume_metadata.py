@@ -44,6 +44,9 @@ class DuplicateCheckResponse(BaseModel):
     candidate_name: Optional[str] = None
     current_designation: Optional[str] = None
     resume_file_path: Optional[str] = None
+    # Signed, expiring URL for the file above (app.media) — uploads are no
+    # longer publicly served, so this is what a client can actually open.
+    resume_file_url: Optional[str] = None
     parsed_at: Optional[datetime] = None
     # Which jobs this candidate is already linked to
     linked_job_ids: List[int] = []

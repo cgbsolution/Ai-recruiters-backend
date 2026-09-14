@@ -195,6 +195,8 @@ REQUIRED_COLUMNS = REQUIRED_COLUMNS + [
     ("questions", "organization_id", "INTEGER", None),
     ("resume_metadata", "organization_id", "INTEGER", None),
     ("ai_credit_usage", "organization_id", "INTEGER", None),
+    # Migration: k5l6m7n8o9p0_add_candidate_invite_token
+    ("candidates", "invite_token", "VARCHAR(64)", None),
 ]
 
 # Indexes to create (safe with IF NOT EXISTS)
@@ -214,6 +216,7 @@ REQUIRED_INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_questions_organization_id ON questions (organization_id)",
     "CREATE INDEX IF NOT EXISTS ix_resume_metadata_organization_id ON resume_metadata (organization_id)",
     "CREATE INDEX IF NOT EXISTS ix_ai_credit_usage_organization_id ON ai_credit_usage (organization_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_candidates_invite_token ON candidates (invite_token)",
 ]
 
 

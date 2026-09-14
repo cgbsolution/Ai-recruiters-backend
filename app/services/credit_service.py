@@ -11,7 +11,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
-from sqlalchemy import func, extract, cast, Date
+from sqlalchemy import func, extract, cast, Date, false
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
@@ -63,14 +63,18 @@ async def log_usage_async(
     await asyncio.to_thread(log_usage, result, feature, job_id, candidate_id, session_id)
 
 
-def _apply_org_filter(q, org_id: Optional[int]):
-    """Apply organization_id filter if not None (super_admin sees all)."""
-    if org_id is not None:
-        q = q.filter(AiCreditUsage.organization_id == org_id)
-    return q
+def _apply_org_filter(q, org_id: Optional[int], all_orgs: bool = False):
+    """Scope usage rows to one organization. Only `all_orgs=True` (a global super
+    admin) skips the filter; org_id=None without it matches nothing — it used to
+    mean "every tenant" for any caller that happened to have no org."""
+    if all_orgs:
+        return q
+    if org_id is None:
+        return q.filter(false())
+    return q.filter(AiCreditUsage.organization_id == org_id)
 
 
-def get_monthly_usage(db: Session, year: Optional[int] = None, org_id: Optional[int] = None):
+def get_monthly_usage(db: Session, year: Optional[int] = None, org_id: Optional[int] = None, all_orgs: bool = False):
     """
     Return per-feature monthly totals for a given year.
     Returns list of dicts: [{month, feature, total_tokens, estimated_cost, call_count}, ...]
@@ -88,7 +92,7 @@ def get_monthly_usage(db: Session, year: Optional[int] = None, org_id: Optional[
         )
         .filter(extract("year", AiCreditUsage.created_at) == year)
     )
-    q = _apply_org_filter(q, org_id)
+    q = _apply_org_filter(q, org_id, all_orgs)
     rows = (
         q.group_by(
             extract("month", AiCreditUsage.created_at),
@@ -110,7 +114,7 @@ def get_monthly_usage(db: Session, year: Optional[int] = None, org_id: Optional[
     ]
 
 
-def get_weekly_usage(db: Session, org_id: Optional[int] = None):
+def get_weekly_usage(db: Session, org_id: Optional[int] = None, all_orgs: bool = False):
     """
     Return per-feature daily totals for the CURRENT week (Mon–Fri).
     Each row has a `day_of_week` (0=Mon … 4=Fri) and a `date` label.
@@ -134,7 +138,7 @@ def get_weekly_usage(db: Session, org_id: Optional[int] = None):
             AiCreditUsage.created_at < sunday_end,
         )
     )
-    q = _apply_org_filter(q, org_id)
+    q = _apply_org_filter(q, org_id, all_orgs)
     rows = q.group_by(day_col, AiCreditUsage.feature).order_by(day_col).all()
 
     return [
@@ -150,7 +154,7 @@ def get_weekly_usage(db: Session, org_id: Optional[int] = None):
     ]
 
 
-def get_daily_usage(db: Session, org_id: Optional[int] = None):
+def get_daily_usage(db: Session, org_id: Optional[int] = None, all_orgs: bool = False):
     """
     Return per-feature hourly totals for TODAY (0–23 hours).
     Each row has an `hour` field (0–23).
@@ -174,7 +178,7 @@ def get_daily_usage(db: Session, org_id: Optional[int] = None):
             AiCreditUsage.created_at < tomorrow_start,
         )
     )
-    q = _apply_org_filter(q, org_id)
+    q = _apply_org_filter(q, org_id, all_orgs)
     rows = q.group_by(hour_col, AiCreditUsage.feature).order_by(hour_col).all()
 
     return [
@@ -218,7 +222,7 @@ def _calc_change(current: float, previous: float) -> float:
     return round(((current - previous) / previous) * 100, 1)
 
 
-def _aggregate_totals(db: Session, start, end=None, org_id: Optional[int] = None):
+def _aggregate_totals(db: Session, start, end=None, org_id: Optional[int] = None, all_orgs: bool = False):
     """Sum tokens/cost in a time range."""
     q = db.query(
         func.coalesce(func.sum(AiCreditUsage.input_tokens), 0).label("input_tokens"),
@@ -229,7 +233,7 @@ def _aggregate_totals(db: Session, start, end=None, org_id: Optional[int] = None
     ).filter(AiCreditUsage.created_at >= start)
     if end:
         q = q.filter(AiCreditUsage.created_at < end)
-    q = _apply_org_filter(q, org_id)
+    q = _apply_org_filter(q, org_id, all_orgs)
     r = q.one()
     return {
         "input_tokens": int(r.input_tokens),
@@ -240,7 +244,8 @@ def _aggregate_totals(db: Session, start, end=None, org_id: Optional[int] = None
     }
 
 
-def _get_mini_chart_data(db: Session, period: str, now: datetime, org_id: Optional[int] = None):
+def _get_mini_chart_data(db: Session, period: str, now: datetime, org_id: Optional[int] = None,
+                         all_orgs: bool = False):
     """
     Return last 5 data points for the mini bar charts.
     Each point has {name, input_tokens, output_tokens, estimated_cost}.
@@ -255,7 +260,7 @@ def _get_mini_chart_data(db: Session, period: str, now: datetime, org_id: Option
                 continue
             start = now.replace(hour=h, minute=0, second=0, microsecond=0)
             end = start + timedelta(hours=1)
-            t = _aggregate_totals(db, start, end, org_id=org_id)
+            t = _aggregate_totals(db, start, end, org_id=org_id, all_orgs=all_orgs)
             points.append({"name": f"{h:02d}:00", **{k: t[k] for k in ["input_tokens", "output_tokens", "estimated_cost"]}})
     elif period == "weekly":
         # Last 5 days (Mon-Fri of current week)
@@ -264,7 +269,7 @@ def _get_mini_chart_data(db: Session, period: str, now: datetime, org_id: Option
         for i in range(5):
             start = monday + timedelta(days=i)
             end = start + timedelta(days=1)
-            t = _aggregate_totals(db, start, end, org_id=org_id)
+            t = _aggregate_totals(db, start, end, org_id=org_id, all_orgs=all_orgs)
             points.append({"name": day_names[i], **{k: t[k] for k in ["input_tokens", "output_tokens", "estimated_cost"]}})
     else:
         # Last 5 months
@@ -281,12 +286,13 @@ def _get_mini_chart_data(db: Session, period: str, now: datetime, org_id: Option
                 end = datetime(year, month + 1, 1)
             MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-            t = _aggregate_totals(db, start, end, org_id=org_id)
+            t = _aggregate_totals(db, start, end, org_id=org_id, all_orgs=all_orgs)
             points.append({"name": MONTHS[month - 1], **{k: t[k] for k in ["input_tokens", "output_tokens", "estimated_cost"]}})
     return points
 
 
-def get_usage_summary(db: Session, period: str = "all", year: Optional[int] = None, org_id: Optional[int] = None):
+def get_usage_summary(db: Session, period: str = "all", year: Optional[int] = None, org_id: Optional[int] = None,
+                      all_orgs: bool = False):
     """
     Aggregated totals — per-feature AND grand totals.
     period: "all" | "monthly" | "weekly" | "daily"
@@ -316,7 +322,7 @@ def get_usage_summary(db: Session, period: str = "all", year: Optional[int] = No
         else:
             q = q.filter(extract("year", AiCreditUsage.created_at) == now.year)
 
-    q = _apply_org_filter(q, org_id)
+    q = _apply_org_filter(q, org_id, all_orgs)
     rows = q.group_by(AiCreditUsage.feature).all()
 
     features = [
@@ -343,18 +349,18 @@ def get_usage_summary(db: Session, period: str = "all", year: Optional[int] = No
     trends = {"input_tokens": 0.0, "output_tokens": 0.0, "estimated_cost": 0.0}
     current_start, prev_start, prev_end = _get_period_bounds(period, now, year)
     if current_start is not None:
-        prev_totals = _aggregate_totals(db, prev_start, prev_end, org_id=org_id)
+        prev_totals = _aggregate_totals(db, prev_start, prev_end, org_id=org_id, all_orgs=all_orgs)
         trends["input_tokens"] = _calc_change(totals["input_tokens"], prev_totals["input_tokens"])
         trends["output_tokens"] = _calc_change(totals["output_tokens"], prev_totals["output_tokens"])
         trends["estimated_cost"] = _calc_change(totals["estimated_cost"], prev_totals["estimated_cost"])
 
     # Mini chart data for summary cards
-    chart_data = _get_mini_chart_data(db, period, now, org_id=org_id)
+    chart_data = _get_mini_chart_data(db, period, now, org_id=org_id, all_orgs=all_orgs)
 
     return {"totals": totals, "features": features, "trends": trends, "chart_data": chart_data}
 
 
-def get_cost_monthly(db: Session, org_id: Optional[int] = None):
+def get_cost_monthly(db: Session, org_id: Optional[int] = None, all_orgs: bool = False):
     """
     Per-feature daily cost for the current month (1st to last day).
     Returns [{date, date_label, day, feature, estimated_cost}, ...]
@@ -382,7 +388,7 @@ def get_cost_monthly(db: Session, org_id: Optional[int] = None):
             AiCreditUsage.created_at < month_end,
         )
     )
-    q = _apply_org_filter(q, org_id)
+    q = _apply_org_filter(q, org_id, all_orgs)
     rows = q.group_by(day_col, AiCreditUsage.feature).order_by(day_col).all()
 
     return [
@@ -397,7 +403,7 @@ def get_cost_monthly(db: Session, org_id: Optional[int] = None):
     ]
 
 
-def get_cost_weekly(db: Session, org_id: Optional[int] = None):
+def get_cost_weekly(db: Session, org_id: Optional[int] = None, all_orgs: bool = False):
     """
     Per-feature daily cost for the current week (Mon–Fri).
     Returns [{date, day_label, feature, estimated_cost}, ...]
@@ -420,7 +426,7 @@ def get_cost_weekly(db: Session, org_id: Optional[int] = None):
             AiCreditUsage.created_at < friday_end,
         )
     )
-    q = _apply_org_filter(q, org_id)
+    q = _apply_org_filter(q, org_id, all_orgs)
     rows = q.group_by(day_col, AiCreditUsage.feature).order_by(day_col).all()
 
     return [
@@ -435,7 +441,7 @@ def get_cost_weekly(db: Session, org_id: Optional[int] = None):
     ]
 
 
-def get_cost_daily(db: Session, org_id: Optional[int] = None):
+def get_cost_daily(db: Session, org_id: Optional[int] = None, all_orgs: bool = False):
     """
     Per-feature hourly cost for today (0–23h).
     Returns [{hour, feature, estimated_cost}, ...]
@@ -457,7 +463,7 @@ def get_cost_daily(db: Session, org_id: Optional[int] = None):
             AiCreditUsage.created_at < tomorrow_start,
         )
     )
-    q = _apply_org_filter(q, org_id)
+    q = _apply_org_filter(q, org_id, all_orgs)
     rows = q.group_by(hour_col, AiCreditUsage.feature).order_by(hour_col).all()
 
     return [
