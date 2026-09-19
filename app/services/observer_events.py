@@ -35,6 +35,7 @@ def _on_message_insert(mapper, connection, target: InterviewMessage):
                 "id": target.id,
                 "role": target.role,
                 "content": target.content,
+                "feedback": target.feedback,
                 "question_index": target.question_index,
                 "created_at": target.created_at.isoformat() if target.created_at else None,
             },

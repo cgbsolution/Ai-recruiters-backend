@@ -197,6 +197,8 @@ REQUIRED_COLUMNS = REQUIRED_COLUMNS + [
     ("ai_credit_usage", "organization_id", "INTEGER", None),
     # Migration: k5l6m7n8o9p0_add_candidate_invite_token
     ("candidates", "invite_token", "VARCHAR(64)", None),
+    # Migration: l6m7n8o9p0q1_add_interview_message_feedback
+    ("interview_messages", "feedback", "TEXT", None),
 ]
 
 # Indexes to create (safe with IF NOT EXISTS)

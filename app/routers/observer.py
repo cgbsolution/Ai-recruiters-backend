@@ -105,6 +105,7 @@ def _serialize_message(m: InterviewMessage) -> dict:
         "id": m.id,
         "role": m.role,
         "content": m.content,
+        "feedback": m.feedback,
         "question_index": m.question_index,
         "created_at": m.created_at.isoformat() if m.created_at else None,
     }

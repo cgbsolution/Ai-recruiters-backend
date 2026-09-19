@@ -186,6 +186,8 @@ _raw_migrations = [
         # personal interview invite links (app.invites)
         "ALTER TABLE candidates ADD COLUMN IF NOT EXISTS invite_token VARCHAR(64)",
         "CREATE UNIQUE INDEX IF NOT EXISTS ix_candidates_invite_token ON candidates (invite_token)",
+        # Nira's feedback, stored apart from the next question (interview_text)
+        "ALTER TABLE interview_messages ADD COLUMN IF NOT EXISTS feedback TEXT",
 ]
 if not _SKIP_STARTUP_MIGRATIONS:
     try:

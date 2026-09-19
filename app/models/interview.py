@@ -126,6 +126,11 @@ class InterviewMessage(Base):
     session_id = Column(Integer, ForeignKey("interview_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
     role = Column(String(20), nullable=False)  # "ai" | "candidate"
     content = Column(Text, nullable=False)
+    # AI turns only: Nira's reaction to the previous answer, spoken before a
+    # short pause and then `content` (the next question alone). Null for
+    # candidate messages, turns without feedback, and rows saved before the
+    # split — see app.services.interview_text.
+    feedback = Column(Text, nullable=True)
     question_index = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 

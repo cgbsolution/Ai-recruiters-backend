@@ -126,6 +126,9 @@ class InterviewMessageRequest(BaseModel):
 
 class InterviewMessageResponse(BaseModel):
     session_id: int
+    # Nira's reaction to the previous answer. The client speaks it first,
+    # pauses, then speaks `message` as a separate utterance.
+    feedback: Optional[str] = None
     message: str                        # AI's next question or closing
     question_index: int
     is_complete: bool

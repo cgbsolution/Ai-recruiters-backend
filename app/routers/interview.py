@@ -1034,7 +1034,7 @@ def resume_session(session_id: int, db: Session = Depends(get_db)):
         current_question_index=session.current_question_index or 0,
         violation_count=session.violation_count or 0,
         messages=[
-            {"role": m.role, "content": m.content, "question_index": m.question_index}
+            {"role": m.role, "content": m.content, "feedback": m.feedback, "question_index": m.question_index}
             for m in messages
         ],
     )

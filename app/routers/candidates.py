@@ -99,6 +99,7 @@ from app.schemas.candidate import (
 )
 from app.schemas.resume_metadata import DuplicateCheckResponse
 from app.services import candidate_service
+from app.services.interview_text import feedback_and_question, question_text
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
@@ -1805,6 +1806,8 @@ def download_interview_archive(
     ]
     for m in msgs:
         speaker = "AI Interviewer" if m.role == "ai" else (candidate.name or "Candidate")
+        if m.feedback:
+            lines.append(f"{speaker}:\n{m.feedback}\n")
         lines.append(f"{speaker}:\n{m.content}\n")
     transcript_txt = "\n".join(lines)
 
@@ -2202,13 +2205,26 @@ def get_evaluation(candidate_id: CandidateId, db: Session = Depends(get_db), use
             .all()
         )
 
-        # Full transcript for chat-style view
+        # Full transcript for chat-style view. Nira's feedback on the previous
+        # answer is its own bubble, ahead of the next question — the same way
+        # the candidate heard it (feedback, pause, question).
         for msg in messages:
+            timestamp = (msg.created_at.isoformat() + "Z") if msg.created_at else None
+            content = msg.content
+            if msg.role == "ai":
+                feedback, content = feedback_and_question(msg)
+                if feedback:
+                    full_transcript.append({
+                        "role": msg.role,
+                        "content": feedback,
+                        "question_index": None,
+                        "timestamp": timestamp,
+                    })
             full_transcript.append({
                 "role": msg.role,
-                "content": msg.content,
+                "content": content,
                 "question_index": msg.question_index,
-                "timestamp": (msg.created_at.isoformat() + "Z") if msg.created_at else None,
+                "timestamp": timestamp,
             })
 
         # Build Q&A pairs from CHRONOLOGICAL message order.
@@ -2216,25 +2232,6 @@ def get_evaluation(candidate_id: CandidateId, db: Session = Depends(get_db), use
         # returns the same index for multiple different questions, collapsing
         # them into one entry. Instead, pair each AI message (after the
         # intro) with the next candidate message in sequence.
-
-        def _extract_question(text: str) -> str:
-            """Strip conversational preamble to isolate the actual question."""
-            import re as _re
-            separators = [
-                r"(?:So |Now )?[Ll]et(?:'s| us) (?:get started|begin|move on|dive in)[.!]?\s*",
-                r"(?:Great|Good|Thanks|Thank you|Interesting|That's (?:great|good|fair|interesting))[^.?!]*[.!]\s*",
-                r"Moving on[,.]?\s*",
-                r"Next question[.:\s—–-]+",
-                r"Let me ask you[.:\s—–-]+",
-                r"Here's (?:the next|another|my next) question[.:\s—–-]+",
-            ]
-            best = text
-            for sep in separators:
-                parts = _re.split(sep, text, maxsplit=1)
-                if len(parts) > 1 and len(parts[-1].strip()) > 20:
-                    best = parts[-1].strip()
-                    text = best
-            return best
 
         def _is_closing_message(text: str) -> bool:
             """Detect AI closing messages that are not real questions."""
@@ -2269,7 +2266,9 @@ def get_evaluation(candidate_id: CandidateId, db: Session = Depends(get_db), use
                 # save it as unanswered
                 if current_ai_msg is not None:
                     pairs.append({"question": current_ai_msg, "answer": None})
-                current_ai_msg = _extract_question(msg.content)
+                # Question only — Nira's feedback on the previous answer is
+                # stored apart (or split off, for older interviews).
+                current_ai_msg = question_text(msg)
             elif msg.role == "candidate":
                 if is_first_candidate:
                     is_first_candidate = False
@@ -2295,7 +2294,7 @@ def get_evaluation(candidate_id: CandidateId, db: Session = Depends(get_db), use
                 if qi not in qa_map:
                     qa_map[qi] = {"question": None, "answer": None}
                 if msg.role == "ai" and qa_map[qi]["question"] is None:
-                    qa_map[qi]["question"] = _extract_question(msg.content)
+                    qa_map[qi]["question"] = question_text(msg)
                 elif msg.role == "candidate" and qa_map[qi]["answer"] is None:
                     qa_map[qi]["answer"] = msg.content
             pairs = [v for _, v in sorted(qa_map.items()) if v["question"]]
@@ -2643,7 +2642,7 @@ def _build_evaluation_pdf_bytes(db: Session, candidate) -> bytes:
                     continue
                 if current_q is not None:
                     pdf_pairs.append({"question": current_q, "answer": None})
-                current_q = msg.content
+                current_q = question_text(msg)
             elif msg.role == "candidate":
                 if is_first_candidate:
                     is_first_candidate = False
@@ -2827,7 +2826,7 @@ def download_evaluation_docx(candidate_id: CandidateId, db: Session = Depends(ge
                     continue
                 if current_q is not None:
                     docx_pairs.append({"question": current_q, "answer": None})
-                current_q = msg.content
+                current_q = question_text(msg)
             elif msg.role == "candidate":
                 if is_first_candidate:
                     is_first_candidate = False
@@ -2903,6 +2902,10 @@ def download_transcript(candidate_id: CandidateId, db: Session = Depends(get_db)
     for msg in messages:
         role_label = "AI Interviewer" if msg.role == "ai" else "Candidate"
         timestamp = msg.created_at.strftime("%H:%M:%S") if msg.created_at else ""
+        if msg.feedback:
+            lines.append(f"[{timestamp}] {role_label}:")
+            lines.append(msg.feedback)
+            lines.append("")
         lines.append(f"[{timestamp}] {role_label}:")
         lines.append(msg.content)
         lines.append("")

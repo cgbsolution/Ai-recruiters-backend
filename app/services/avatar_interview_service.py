@@ -28,6 +28,7 @@ from app.services.ai_service import (
     _parse_json,
 )
 from app.services.credit_service import log_usage
+from app.services.interview_text import asks_question, question_text, split_feedback_and_question
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,19 @@ LIVE_LLM_ATTEMPT_1_TIMEOUT_SECONDS = 18
 LIVE_LLM_ATTEMPT_2_TIMEOUT_SECONDS = 12
 LIVE_LLM_REPAIR_TIMEOUT_SECONDS = 10
 LIVE_LLM_RETRIES = 1
+
+
+def _join_spoken(*parts: Optional[str]) -> str:
+    return " ".join(p.strip() for p in parts if p and p.strip())
+
+
+def _clean_feedback(text) -> str:
+    """Feedback is spoken aloud, so drop it entirely if the model leaked JSON
+    or code into it — losing one acknowledgment beats reading braces aloud."""
+    t = str(text or "")
+    if "{" in t or "```" in t:
+        return ""
+    return re.sub(r"\s{2,}", " ", t).strip()
 
 
 def _mark_candidate_interview_completed(
@@ -413,6 +427,7 @@ def _build_coding_section(
         f"- Ask EXACTLY {coding_count} coding question{s_or_empty} — not more, not fewer.\n\n"
         f"When emitting a coding question, the JSON response MUST be:\n"
         f"- \"message\" EXACTLY: \"Please click on the top-left button to start the coding test.\"\n"
+        f"- \"feedback\": at most one short sentence reacting to the previous answer — never describe the problem.\n"
         f"- \"coding_question\": fully-populated object (see shape below).\n"
         f"- Do NOT read the problem description aloud. The candidate reads it in the editor.\n"
     )
@@ -540,8 +555,8 @@ PREDEFINED QUESTIONS (ask in this EXACT order):
 
 FLOW:
 1. Opening: Give intro + ask candidate to introduce themselves (question_index=0)
-2. After self-intro: Acknowledge briefly, then ask Q1 as written (question_index=1)
-3. For each subsequent question: Ask it as written, wait for answer, then ask next
+2. After self-intro: brief acknowledgment in "feedback", Q1 exactly as written in "message" (question_index=1)
+3. For each subsequent question: react to the answer in "feedback", put the next question exactly as written in "message", wait for answer, then ask next
 4. After the candidate answers Q{max_q_verbal}, proceed to the coding round if enabled, otherwise set is_complete to true
 """
     elif q_mode == "MIX":
@@ -567,7 +582,7 @@ Generate {ai_count} dynamic verbal questions based on:
 
 FLOW:
 1. Opening: Give intro + ask candidate to introduce themselves (question_index=0)
-2. After self-intro: Acknowledge briefly, then ask Q1 — the first PREDEFINED question (question_index=1)
+2. After self-intro: brief acknowledgment in "feedback", then Q1 — the first PREDEFINED question — in "message" (question_index=1)
 3. Questions Q1–Q{len(predefined)}: Ask predefined questions exactly as written
 4. Questions Q{len(predefined) + 1}–Q{max_q_verbal}: Generate and ask {ai_count} new verbal questions
 5. After Q{max_q_verbal} is answered: Proceed to the coding round if enabled, otherwise set is_complete to true
@@ -577,7 +592,7 @@ FLOW:
 - Finishing the {len(predefined)} predefined question(s) is NOT the end of the interview.
   After Q{len(predefined)} is answered, your VERY NEXT message MUST ask Q{len(predefined) + 1}
   (the first AI-generated question). Do NOT thank the candidate, do NOT say goodbye,
-  do NOT set is_complete=true. Acknowledge in one sentence and ask Q{len(predefined) + 1} immediately.
+  do NOT set is_complete=true. Put a one-sentence acknowledgment in "feedback" and Q{len(predefined) + 1} in "message" immediately.
 - is_complete MUST remain false for questions Q1 through Q{max_q_verbal - 1}.
 - is_complete MAY become true ONLY after the candidate has answered Q{max_q_verbal}
   (or candidate explicitly asks to end).
@@ -596,7 +611,7 @@ Generate ALL {max_q_verbal} VERBAL questions dynamically. No predefined question
 
 FLOW:
 1. Opening: Give intro + ask candidate to introduce themselves (question_index=0)
-2. After self-intro: Acknowledge briefly, then generate and ask Q1 (question_index=1)
+2. After self-intro: brief acknowledgment in "feedback", then generate Q1 and put it in "message" (question_index=1)
 3. For each subsequent question: Based on candidate's answer, generate and ask Q2, Q3, ..., Q{max_q_verbal}
 4. After Q{max_q_verbal} is answered: Proceed to the coding round if enabled, otherwise set is_complete to true
 
@@ -635,13 +650,13 @@ STEP 1 — First turn (no candidate message / "Please begin the interview"):
 Format: "Hi {candidate.name if candidate else 'there'}! I'm Nira, your AI interviewer for the {job.title} position. Before we begin, could you take a moment to introduce yourself? Click on the Start Speaking button below."
 
 STEP 2 — Second turn (after candidate's self-introduction):
-1. Briefly acknowledge what they said (1 sentence max — e.g., "Great, thanks for sharing that!")
-2. Immediately begin Q1 from your question plan (the actual first interview question)
+1. "feedback": briefly acknowledge what they said (1 sentence max — e.g., "Great, thanks for sharing that!")
+2. "message": Q1 from your question plan (the actual first interview question) — the question only
 3. Set question_index to 1
 
 CRITICAL RULES FOR OPENING:
 - STEP 1: Do NOT ask any interview question. ONLY give intro + ask for self-introduction.
-- STEP 2: Acknowledge self-intro in ONE short sentence, then ask Q1. No long transition.
+- STEP 2: Acknowledge self-intro in ONE short sentence in "feedback", then Q1 in "message". No long transition.
 - The greeting must be SHORT — max 2 sentences total
 - Never explain the interview process or how many questions there will be in the opening
 
@@ -655,11 +670,11 @@ B. NEVER repeat the same question. If you already asked for clarification, move 
 
 C. ANTI-REPETITION RULE: Review conversation history. If your last message asked the candidate to repeat or was a clarification request, your NEXT message MUST be a new question. Never say "I didn't catch that" twice in a row.
 
-D. If the candidate's speech is unclear — ask for clarification ONCE only. If still unclear, say "No worries, let's move on" and ask the next question. Increment question_index.
+D. If the candidate's speech is unclear — ask for clarification ONCE only (the clarification request goes in "message"). If still unclear, put "No worries, let's move on." in "feedback" and the next question in "message". Increment question_index.
 
-E. ACTIVE LISTENING: Before your next question, briefly reference what the candidate said (1 sentence). Then ask the next question.
+E. ACTIVE LISTENING: Briefly reference what the candidate said (1 sentence) in "feedback". The next question goes in "message" on its own.
 
-F. If candidate gives a weak/incorrect answer — provide brief feedback and move to next question. Do NOT repeatedly ask them to repeat.
+F. If candidate gives a weak/incorrect answer — provide brief feedback in "feedback" and put the next question in "message". Do NOT repeatedly ask them to repeat.
 
 G. CANDIDATE WANTS TO END: If the candidate says ANYTHING like "end interview", "close interview", "stop interview", "close this interview", "close this call", "please close", "I need to end", "I want to stop", "please end", "terminate", "finish the interview", or similar intent to stop — IMMEDIATELY set is_complete to true and say a brief thank you (1 line max). Do NOT ask another question. Prioritize this rule over all others.
 
@@ -675,14 +690,14 @@ H. QUESTION COUNTING (CRITICAL FOR ALL MODES):
 
    FLOW EXAMPLE (for max_q=7):
    - Turn 1 (Opening): question_index=0, give intro + ask for self-introduction
-   - Turn 2 (After self-intro): question_index=1, acknowledge + ask Q1
+   - Turn 2 (After self-intro): question_index=1, acknowledgment in "feedback" + Q1 in "message"
    - Turn 3: question_index=2, ask Q2
    - Turn 4: question_index=3, ask Q3
    - ...
-   - Turn 8: question_index=7, ask Q7 — ANNOUNCE: "This is your last question."
+   - Turn 8: question_index=7, ask Q7 — ANNOUNCE at the end of "feedback": "Alright, this is your last question."
    - Turn 9: question_index=7 (no change), set is_complete=true with closing message
 
-I. LAST QUESTION ANNOUNCEMENT: When asking the FINAL question (question_index={max_q}), START with "Alright, this is your last question." or "One final question for you." BEFORE asking the question. This gives the candidate a heads-up.
+I. LAST QUESTION ANNOUNCEMENT: When asking the FINAL question (question_index={max_q}), END your "feedback" with "Alright, this is your last question." — the question itself stays alone in "message". This gives the candidate a heads-up.
 
 J. If candidate asks "how many questions left" — tell them exactly: "You have {max_q} - [current_index] + 1 questions remaining."
 
@@ -706,10 +721,14 @@ RESPONSE FORMAT — STRICT RULES
 ⚠️ CRITICAL: Return ONLY a single raw JSON object. NO markdown, NO code fences, NO explanation text before or after.
 
 Correct format (return EXACTLY like this):
-{{"message": "Your spoken words here", "is_complete": false, "question_index": 1, "is_off_topic": false, "coding_question": null}}
+{{"feedback": "Your short reaction to the candidate's last answer", "message": "Your next question here", "is_complete": false, "question_index": 1, "is_off_topic": false, "coding_question": null}}
 
-⚠️ The "message" field MUST contain ONLY the spoken words — natural language only.
-NEVER put JSON, code blocks, brackets, or curly braces inside the "message" field.
+⚠️ "feedback" and "message" are spoken SEPARATELY, with a pause between them, and "message" is shown in the report as the question. Keep them apart:
+- "feedback": ONE short sentence reacting to the candidate's previous answer (acknowledgment, brief feedback, or "No worries, let's move on."), plus the last-question heads-up from rule I when it applies. Empty string "" on the opening turn and whenever there is nothing to react to. NEVER put a question in "feedback".
+- "message": ONLY the question for this turn (or the clarification request / closing line). Do NOT start it with praise, thanks, a recap of their answer, or a filler lead-in like "Now," / "So let me start with our first question:" — all of that belongs in "feedback".
+
+⚠️ Both fields MUST contain ONLY spoken words — natural language only.
+NEVER put JSON, code blocks, brackets, or curly braces inside "feedback" or "message".
 NEVER wrap your response in ```json ``` code fences.
 NEVER add text before or after the JSON object.
 
@@ -750,7 +769,7 @@ def _count_recent_fallbacks(db: Session, session_id: int, limit: int = 5) -> int
     ]
     count = 0
     for m in recent:
-        lower = m.content.lower()
+        lower = _join_spoken(m.feedback, m.content).lower()
         if any(p in lower for p in fallback_phrases):
             count += 1
     return count
@@ -965,16 +984,19 @@ async def conduct_turn(
                 }
                 fallback_msg = _backstops.get(_lang, _backstops["en"])
 
+            fallback_feedback, fallback_msg = split_feedback_and_question(fallback_msg)
             db.add(InterviewMessage(
                 session_id=session.id,
                 role="ai",
                 content=fallback_msg,
+                feedback=fallback_feedback or None,
                 question_index=next_qi,
             ))
             session.current_question_index = next_qi
             _safe_commit(db, f"conduct_turn emergency fallback session={session.id}")
             return {
                 "session_id": session.id,
+                "feedback": fallback_feedback or None,
                 "message": fallback_msg,
                 "question_index": next_qi,
                 "is_complete": False,
@@ -1132,7 +1154,9 @@ async def _conduct_turn_impl(
     for msg in past_messages:
         claude_messages.append({
             "role": "user" if msg.role == "candidate" else "assistant",
-            "content": msg.content,
+            # The model should see everything Nira actually said, feedback
+            # included, so it doesn't repeat the same acknowledgment each turn.
+            "content": _join_spoken(msg.feedback, msg.content),
         })
 
     if candidate_message is None:
@@ -1211,6 +1235,7 @@ async def _conduct_turn_impl(
                 parsed = json.loads(json_match.group(0))
                 if isinstance(parsed, dict) and "message" in parsed:
                     result = {
+                        "feedback": parsed.get("feedback", ""),
                         "message": parsed.get("message", ""),
                         "is_complete": parsed.get("is_complete", False),
                         "question_index": parsed.get("question_index", session.current_question_index),
@@ -1229,7 +1254,7 @@ async def _conduct_turn_impl(
         if result is None:
             try:
                 msg_match = re.search(
-                    r'"message"\s*:\s*"(.*?)"\s*(?:,\s*"(?:is_complete|is_off_topic|question_index|coding_question)"\s*:|}\s*$)',
+                    r'"message"\s*:\s*"(.*?)"\s*(?:,\s*"(?:feedback|is_complete|is_off_topic|question_index|coding_question)"\s*:|}\s*$)',
                     clean_text,
                     flags=re.DOTALL,
                 )
@@ -1238,8 +1263,18 @@ async def _conduct_turn_impl(
                     msg_match = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', clean_text)
                 if msg_match:
                     extracted = msg_match.group(1).replace('\\"', '"').replace('\\n', ' ').strip()
+                    fb_match = re.search(
+                        r'"feedback"\s*:\s*"(.*?)"\s*,\s*"(?:message|is_complete|is_off_topic|question_index|coding_question)"\s*:',
+                        clean_text,
+                        flags=re.DOTALL,
+                    )
+                    salvaged_feedback = (
+                        fb_match.group(1).replace('\\"', '"').replace('\\n', ' ').strip()
+                        if fb_match else ""
+                    )
                     if len(extracted) > 5:
                         result = {
+                            "feedback": salvaged_feedback,
                             "message": extracted,
                             "is_complete": False,
                             "question_index": session.current_question_index,
@@ -1271,15 +1306,18 @@ async def _conduct_turn_impl(
             q_index = (session.current_question_index or 0) + 1
             session.current_question_index = q_index
 
+        fallback_feedback, fallback_msg = split_feedback_and_question(fallback_msg)
         db.add(InterviewMessage(
             session_id=session.id,
             role="ai",
             content=fallback_msg,
+            feedback=fallback_feedback or None,
             question_index=q_index,
         ))
         _safe_commit(db, f"conduct_turn fallback session={session.id}")
         return {
             "session_id": session.id,
+            "feedback": fallback_feedback or None,
             "message": fallback_msg,
             "question_index": q_index,
             "is_complete": False,
@@ -1288,6 +1326,7 @@ async def _conduct_turn_impl(
         }
 
     message_text = result.get("message", "Thank you for your time.")
+    feedback_text = result.get("feedback") or ""
     is_complete = result.get("is_complete", False)
     is_off_topic = result.get("is_off_topic", False)
     raw_question_index = result.get("question_index", session.current_question_index + 1)
@@ -1330,6 +1369,7 @@ async def _conduct_turn_impl(
             {
                 "role": "assistant",
                 "content": json.dumps({
+                    "feedback": feedback_text or "",
                     "message": message_text or "",
                     "is_complete": True,
                     "question_index": question_index,
@@ -1356,6 +1396,7 @@ async def _conduct_turn_impl(
             repaired = _parse_json(repair_result.text)
             if isinstance(repaired, dict) and repaired.get("message"):
                 message_text = str(repaired.get("message"))
+                feedback_text = str(repaired.get("feedback") or "")
                 is_complete = bool(repaired.get("is_complete", False))
                 question_index = int(repaired.get("question_index", next_qi))
                 coding_question = repaired.get("coding_question") or coding_question
@@ -1423,14 +1464,35 @@ async def _conduct_turn_impl(
 
     # 4. Strip inline JSON fragments with interview-specific keys (simple non-nested)
     message_text = re.sub(
-        r'\{[^{}]*"(?:is_complete|question_index|coding_question|is_off_topic)"[^{}]*\}',
+        r'\{[^{}]*"(?:feedback|is_complete|question_index|coding_question|is_off_topic)"[^{}]*\}',
         '', message_text, flags=re.DOTALL
     ).strip()
 
     # 5. Collapse extra whitespace
     message_text = re.sub(r'\s{2,}', ' ', message_text).strip()
+
+    # 6. Feedback vs. question. The model returns them as separate fields; the
+    # splitter is the backstop for a turn that still glued its reaction onto
+    # the question. The client speaks them apart with a pause, and only
+    # `message` is shown as the question in the report.
+    feedback_text = _clean_feedback(feedback_text)
+    if feedback_text and (not message_text or asks_question(feedback_text)):
+        # The report reads the question from `message` ONLY, so a question
+        # must never be left sitting in `feedback` — the question card would
+        # then show a placeholder or the wrong text. Recombine and let the
+        # splitter below separate reaction from question again.
+        message_text = _join_spoken(feedback_text, message_text)
+        feedback_text = ""
     if not message_text:
         message_text = "Thank you. Let's continue."
+    if is_complete:
+        # The closing line isn't a question and a pause would only delay the
+        # goodbye (and race the client's completion timer) — keep it one line.
+        message_text = _join_spoken(feedback_text, message_text)
+        feedback_text = ""
+    else:
+        extra_feedback, message_text = split_feedback_and_question(message_text)
+        feedback_text = _join_spoken(feedback_text, extra_feedback)
 
     # ── Coding-question handling (computed BEFORE commit so the candidate
     # message, AI message, session updates, and any coding override all
@@ -1560,6 +1622,7 @@ async def _conduct_turn_impl(
         session_id=session.id,
         role="ai",
         content=message_text,
+        feedback=feedback_text or None,
         question_index=None if is_complete else question_index,
     ))
     session.current_question_index = question_index
@@ -1574,6 +1637,7 @@ async def _conduct_turn_impl(
 
     response = {
         "session_id": session.id,
+        "feedback": feedback_text or None,
         "message": message_text,
         "question_index": question_index,
         "is_complete": is_complete,
@@ -1735,7 +1799,10 @@ async def generate_evaluation(session: InterviewSession, db: Session) -> Evaluat
         if qi not in qa_groups:
             qa_groups[qi] = {"questions": [], "answers": []}
         if m.role == "ai":
-            qa_groups[qi]["questions"].append(m.content)
+            # Question only — Nira's reaction to the previous answer ("Excellent,
+            # strong experience…") is not part of the question and would bias
+            # the evaluator's scoring of the next one.
+            qa_groups[qi]["questions"].append(question_text(m))
         else:
             qa_groups[qi]["answers"].append(m.content)
 
