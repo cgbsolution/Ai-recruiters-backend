@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import traceback
@@ -5,9 +6,12 @@ import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from slowapi import Limiter
-from slowapi.util import get_remote_address
 
-limiter = Limiter(key_func=get_remote_address)
+from app.ratelimit import user_or_ip_key
+
+# Keyed on the signed-in user: an IP key could be reset per request by
+# spoofing X-Forwarded-For, leaving the paid LLM calls effectively unlimited.
+limiter = Limiter(key_func=user_or_ip_key)
 
 from app.schemas.ai import (
     EvaluateCandidateRequest,
@@ -71,8 +75,11 @@ async def parse_jd_file(request: Request, file: UploadFile = File(...)):
     if ext not in ALLOWED_JD_EXTENSIONS:
         raise HTTPException(status_code=400, detail="Only PDF, DOC, and DOCX files are accepted")
 
-    content = await file.read()
     max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    # Check the spooled size before pulling the whole upload into memory.
+    if file.size is not None and file.size > max_bytes:
+        raise HTTPException(status_code=400, detail=f"File exceeds {settings.MAX_UPLOAD_SIZE_MB}MB limit")
+    content = await file.read()
     if len(content) > max_bytes:
         raise HTTPException(status_code=400, detail=f"File exceeds {settings.MAX_UPLOAD_SIZE_MB}MB limit")
 
@@ -87,7 +94,9 @@ async def parse_jd_file(request: Request, file: UploadFile = File(...)):
             f.write(content)
 
         try:
-            jd_text = extract_text(path)
+            # In a worker thread: parsing a large PDF synchronously here froze
+            # the event loop, and with it every other request.
+            jd_text = await asyncio.to_thread(extract_text, path)
         except RuntimeError as e:
             # extract_text's RuntimeErrors describe the uploaded file itself
             # (e.g. a scanned, image-only PDF) and are meant for the user.

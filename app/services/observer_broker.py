@@ -124,6 +124,19 @@ class ObserverBroker:
 
     # ── Event (SSE transcript) channel ──────────────────────────────────────
 
+    def viewer_count(self, session_id: int) -> int:
+        """Largest number of open observer channels of any one kind for a
+        session (SSE streams, signalling sockets, frame sockets) — used to cap
+        how many viewers a single (possibly leaked) link can attach."""
+        ch = self._sessions.get(session_id)
+        if ch is None:
+            return 0
+        return max(
+            len(ch.event_subscribers),
+            len(ch.signal_observer_inboxes),
+            len(ch.frame_subscribers),
+        )
+
     async def subscribe_events(self, session_id: int) -> asyncio.Queue:
         async with self._lock:
             q: asyncio.Queue = asyncio.Queue(maxsize=256)

@@ -71,11 +71,19 @@ def _reconcile_stale_completed_candidates(
                 c.candidate_stage = "AI Round"
             dirty = True
     if dirty:
+        # Don't expire the loaded rows on this commit: get_candidates builds its
+        # response from candidate.__dict__, and an expired instance's __dict__
+        # is empty — the list came back as bare {"job_title": ...} rows and
+        # failed response validation (a 500) whenever something was repaired.
+        previous = db.expire_on_commit
+        db.expire_on_commit = False
         try:
             db.commit()
         except Exception as exc:
             logger.warning("[reconcile] commit failed: %s", exc)
             db.rollback()
+        finally:
+            db.expire_on_commit = previous
 
 
 def get_candidates(

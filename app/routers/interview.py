@@ -83,6 +83,7 @@ def _check_and_increment_candidate_quota(db, job_id: int) -> None:
 from app.schemas.interview import (
     ApplyForJobRequest,
     ApplyForJobResponse,
+    CandidateEvaluationRead,
     EvaluationRead,
     FeedbackRequest,
     FeedbackResponse,
@@ -239,6 +240,25 @@ def _session_rate_key(request: Request) -> str:
     return _client_ip(request)
 
 
+# How long after an interview ends its token may still fetch TTS, so the
+# avatar's closing lines are still spoken once /complete has landed.
+_TTS_AFTER_END_GRACE_SECONDS = 15 * 60
+
+
+def _require_speaking_session(session_id: int, request: Request, db: Session) -> InterviewSession:
+    """The caller must hold the X-Session-Token of a live (or just-ended)
+    session. Same answer for a missing session and a wrong token."""
+    session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first() if session_id else None
+    if not session or not session_token_matches(session, request.headers.get("x-session-token")):
+        raise HTTPException(status_code=403, detail="Invalid or missing session token")
+    if session.status in (SessionStatus.pending, SessionStatus.in_progress):
+        return session
+    ended = session.completed_at
+    if ended is not None and (datetime.utcnow() - ended).total_seconds() <= _TTS_AFTER_END_GRACE_SECONDS:
+        return session
+    raise HTTPException(status_code=403, detail="No active interview session")
+
+
 # Deepgram token — MUST be before /interview/{token} to avoid wildcard match
 @router.get(
     "/interview/deepgram-token",
@@ -313,7 +333,15 @@ async def get_deepgram_token(
 
     # Session-gated master key. Still protected: this endpoint requires an
     # active session (+ its X-Session-Token), so the key is never handed to an
-    # anonymous caller the way it was before.
+    # anonymous caller the way it was before — but an admitted candidate can
+    # still copy a key that never expires. See DEEPGRAM_ALLOW_MASTER_KEY_FALLBACK.
+    if not settings.DEEPGRAM_ALLOW_MASTER_KEY_FALLBACK:
+        logging.error("[Deepgram] no grant token available and master-key fallback is disabled")
+        raise HTTPException(status_code=503, detail="Speech recognition is temporarily unavailable")
+    logging.warning(
+        "[Deepgram] handing the master API key to session %s — mint-capable key recommended "
+        "(set DEEPGRAM_ALLOW_MASTER_KEY_FALLBACK=false once it is)", session_id,
+    )
     return {"key": settings.DEEPGRAM_API_KEY, "scheme": "token"}
 
 
@@ -359,13 +387,20 @@ async def _synthesize_edge_tts(text: str, language: str) -> str:
     summary="Generate speech audio from text using Google Cloud TTS",
     tags=["Interview"],
 )
-# Unauthenticated by necessity: the avatar speaks before the client has anything
-# to prove but the job link, and its caller (useGoogleTTS) sends no session
-# token. The ceiling is an anti-abuse bound, not a fairness limit: a 429 leaves
-# the avatar silent mid-interview (the client has no voice fallback), and whole
-# offices share one public IP, so it must sit far above real usage.
-@limiter.limit("300/minute")
-async def generate_tts(payload: dict, request: Request):
+# The avatar only speaks inside the interview room, after admission, so the
+# caller (useGoogleTTS) holds a session token. This used to be open to anyone:
+# a script could burn paid Google WaveNet characters (5,000 per call, 300
+# calls a minute per spoofable IP) with no job link at all. The ceiling is an
+# anti-abuse bound, not a fairness limit — a 429 leaves the avatar silent
+# mid-interview — and it is per session, so candidates sharing an office IP
+# don't share it.
+@limiter.limit("300/minute", key_func=_session_rate_key)
+async def generate_tts(
+    payload: dict,
+    request: Request,
+    session_id: int = 0,
+    db: Session = Depends(get_db),
+):
     """
     Convert text to speech using Google Cloud Text-to-Speech, falling back to
     edge-tts (Microsoft Neural, same Indian female profile) whenever Google is
@@ -377,6 +412,8 @@ async def generate_tts(payload: dict, request: Request):
     global _google_tts_blocked_until
     from app.config import settings
     import httpx
+
+    _require_speaking_session(session_id, request, db)
 
     text = (payload.get("text") or "").strip()
     if not text:
@@ -411,7 +448,10 @@ async def generate_tts(payload: dict, request: Request):
         google_skipped_reason = "circuit breaker open (auth/billing failure)"
 
     if google_skipped_reason is None:
-        url = f"https://texttospeech.googleapis.com/v1/text:synthesize?key={settings.GOOGLE_TTS_API_KEY}"
+        # The key goes in a header, not the query string: httpx logs request
+        # URLs at INFO, which printed the key into the backend logs.
+        url = "https://texttospeech.googleapis.com/v1/text:synthesize"
+        google_headers = {"X-Goog-Api-Key": settings.GOOGLE_TTS_API_KEY}
         body = {
             "input": {"text": text},
             "voice": voice,
@@ -424,7 +464,7 @@ async def generate_tts(payload: dict, request: Request):
         }
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.post(url, json=body)
+                response = await client.post(url, json=body, headers=google_headers)
 
             if response.status_code == 200:
                 audio = (response.json() or {}).get("audioContent", "")
@@ -592,6 +632,14 @@ def verify_access(
                 access="invite_required",
                 message="Please open the personal interview link sent to your email to continue.",
             )
+
+    # Serialize admissions per candidate. Without this lock two simultaneous
+    # verify-access calls both saw "no active session" and each created one,
+    # handing the candidate two sessions: a free retake, and a clean second
+    # session whose completion overwrote a cheating termination in the first.
+    # Held until this request's transaction ends (commit, or the rollback when
+    # get_db closes the session on an early return).
+    db.query(Candidate.id).filter(Candidate.id == candidate.id).with_for_update().first()
 
     # 2. Check for completed session
     completed_session = (
@@ -812,6 +860,17 @@ async def upload_resume_for_apply(
             detail=f"Resume is too large (max {settings.MAX_UPLOAD_SIZE_MB} MB).",
         )
 
+    # The declared content type is the client's word; check the real leading
+    # bytes (PDF, DOCX zip, legacy DOC) before a parser ever opens the file.
+    with open(file_path, "rb") as fh:
+        head = fh.read(8)
+    if not head.startswith((b"%PDF", b"PK\x03\x04", b"\xd0\xcf\x11\xe0")):
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail="Only PDF, DOC, or DOCX files are accepted.")
+
     return {"resume_path": file_path}
 
 
@@ -852,11 +911,29 @@ def apply_for_job(
     if not resume_path:
         raise HTTPException(status_code=400, detail="Resume upload not found. Please upload your resume again.")
 
+    # One upload, one application. Otherwise a single uploaded file could be
+    # replayed with random emails, each application consuming the
+    # organization's candidate quota (or attaching someone else's file).
+    used_by_other = (
+        db.query(Candidate.id)
+        .filter(Candidate.resume_path == resume_path, func.lower(Candidate.email) != email_str)
+        .first()
+        or db.query(ResumeMetadata.id)
+        .filter(
+            ResumeMetadata.resume_file_path == resume_path,
+            func.lower(ResumeMetadata.candidate_email) != email_str,
+        )
+        .first()
+    )
+    if used_by_other:
+        raise HTTPException(status_code=400, detail="Resume upload not found. Please upload your resume again.")
+
     # Resume-database rows belong to an organization: look them up and create
     # them only inside the job's organization. This lookup used to match the
     # email across ALL tenants and overwrote another company's record. A job
     # without an organization gets no resume-database row at all.
     meta_id: Optional[int] = None
+    parse_meta = False
     if job.organization_id is not None:
         meta = db.query(ResumeMetadata).filter(
             func.lower(ResumeMetadata.candidate_email) == email_str,
@@ -865,11 +942,17 @@ def apply_for_job(
         if meta is None:
             meta = ResumeMetadata(candidate_email=email_str, organization_id=job.organization_id)
             db.add(meta)
-        # Fill the new record, or update this organization's record, with the new resume
-        meta.candidate_name = payload.name
-        meta.phone = payload.phone
-        meta.resume_file_path = resume_path
-        meta.parsing_status = "pending"
+        # Fill a new (or still empty) record. An existing record with a resume
+        # is left alone: this form is anonymous, and anyone who knew a person's
+        # email could otherwise replace the name, phone and resume the
+        # organization holds for them. The job's candidate row below still
+        # gets the newly uploaded resume.
+        if not meta.resume_file_path:
+            meta.candidate_name = payload.name
+            meta.phone = payload.phone
+            meta.resume_file_path = resume_path
+            meta.parsing_status = "pending"
+            parse_meta = True
         try:
             db.commit()
         except IntegrityError:
@@ -909,7 +992,7 @@ def apply_for_job(
             db.rollback()
 
     # Queue background parsing
-    if meta_id is not None:
+    if meta_id is not None and parse_meta:
         background_tasks.add_task(_parse_resume_metadata_bg, meta_id)
 
     return ApplyForJobResponse(
@@ -1188,7 +1271,14 @@ def log_violation(
     db.add(violation)
 
     session.violation_count = (session.violation_count or 0) + 1
-    should_terminate = session.violation_count >= VIOLATION_TERMINATE_THRESHOLD
+    # Only a live session can be auto-terminated. The session token stays
+    # valid after the interview ends, so late (or deliberately posted)
+    # violations could otherwise flip a COMPLETED interview to "Terminated –
+    # Cheating Detected". Late events are still recorded as evidence.
+    should_terminate = (
+        session.violation_count >= VIOLATION_TERMINATE_THRESHOLD
+        and session.status in (SessionStatus.pending, SessionStatus.in_progress)
+    )
 
     if should_terminate:
         session.status = SessionStatus.terminated
@@ -1297,7 +1387,28 @@ def _set_eval_state(session_id: int, state: str, error: Optional[str] = None) ->
         db.close()
 
 
+# Sessions whose evaluation is running in this process. /complete (repeatable
+# on a finished session that has no evaluation yet) and the recruiter's
+# "regenerate" both queue an evaluation; without this guard every call started
+# another full Opus run for the same session.
+_EVALUATIONS_IN_FLIGHT: set = set()
+
+
 async def _run_evaluation_background(session_id: int):
+    """Single-flight wrapper around _evaluate_session_with_retries."""
+    if session_id in _EVALUATIONS_IN_FLIGHT:
+        logging.getLogger("app.interview").info(
+            f"[Evaluation] session {session_id}: already running — duplicate request ignored"
+        )
+        return
+    _EVALUATIONS_IN_FLIGHT.add(session_id)
+    try:
+        await _evaluate_session_with_retries(session_id)
+    finally:
+        _EVALUATIONS_IN_FLIGHT.discard(session_id)
+
+
+async def _evaluate_session_with_retries(session_id: int):
     """Background task: generate evaluation with automatic retry + exponential
     backoff. Wrapped in asyncio.wait_for so a hung LLM can't block forever.
 
@@ -1606,12 +1717,12 @@ async def recording_finalize_beacon(
 @router.get(
     "/interview/sessions/{session_id}/evaluation",
     dependencies=[Depends(require_session_token)],
-    response_model=EvaluationRead,
-    summary="Get evaluation result",
+    response_model=CandidateEvaluationRead,
+    summary="Get evaluation result (candidate view)",
     description=(
-        "Retrieves the stored evaluation for a completed session.\n\n"
-        "Returns all four dimension scores, overall score, recommendation, "
-        "summary, strengths, weaknesses, and detailed feedback.\n\n"
+        "Candidate-facing: whether the stored evaluation for a completed session "
+        "meets the job's threshold. Scores, recommendation and reviewer feedback "
+        "are recruiter-only (`GET /candidates/{id}/evaluation`).\n\n"
         "**Errors:** `404` if the evaluation has not been generated yet "
         "(call `POST /complete` first)."
     ),
@@ -1621,7 +1732,14 @@ def get_evaluation(session_id: int, db: Session = Depends(get_db)):
     session = _get_session_or_404(session_id, db)
     if not session.evaluation:
         raise HTTPException(status_code=404, detail="Evaluation not yet generated")
-    return _format_evaluation(session.evaluation)
+    full = _format_evaluation(session.evaluation)
+    return CandidateEvaluationRead(
+        id=full.id,
+        session_id=full.session_id,
+        candidate_id=full.candidate_id,
+        meets_threshold=full.meets_threshold,
+        created_at=full.created_at,
+    )
 
 
 @router.get(
@@ -1646,7 +1764,9 @@ def get_evaluation_status(session_id: int, db: Session = Depends(get_db)):
     except Exception:
         meta = {}
     state = meta.get("evaluation_state", "idle")
-    error = meta.get("evaluation_error") if state == "failed" else None
+    # The stored error is raw exception text (LLM provider / SQL details) — it
+    # stays server-side for the recruiter view; the candidate gets a fixed line.
+    error = "Evaluation could not be generated yet." if state == "failed" else None
     return {"state": state, "error": error}
 
 
@@ -1747,12 +1867,15 @@ def schedule_meeting(
     # The slot must belong to THIS session's job: filtering on id alone let a
     # candidate book (and so block) any tenant's slot by trying slot ids, and
     # read its times back in the response.
+    # FOR UPDATE: two candidates racing for the same slot both passed the
+    # is_booked check and double-booked it. The loser now waits, re-checks
+    # is_booked after the winner commits, and gets the 404.
     slot = db.query(MeetingSlot).filter(
         MeetingSlot.id == payload.slot_id,
         MeetingSlot.job_id == session.job_id,
         MeetingSlot.is_booked == False,
         MeetingSlot.start_time > datetime.utcnow(),
-    ).first()
+    ).with_for_update().first()
     if not slot:
         raise HTTPException(status_code=404, detail="Slot not available")
 
@@ -1851,7 +1974,8 @@ async def upload_recording(
                 os.remove(tmp_path)
         except OSError:
             pass
-        raise HTTPException(status_code=500, detail=f"Failed to save recording: {str(e)}")
+        # The exception text (server file paths) stays in the log above.
+        raise HTTPException(status_code=500, detail="Failed to save recording. Please retry.")
 
     # Guard rail: never accept a zero-byte upload. This has been a silent
     # loss mode in the past — the client hit the endpoint but no bytes
@@ -1890,7 +2014,7 @@ async def upload_recording(
         os.replace(tmp_path, final_path)
     except OSError as e:
         logging.error(f"[Recording] FAILED to promote tmp file: {e} ({tag})")
-        raise HTTPException(status_code=500, detail=f"Failed to finalise recording: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to finalise recording. Please retry.")
 
     file_path = final_path
     recording_link = f"/uploads/recordings/{session_id}{ext}"
@@ -2022,7 +2146,7 @@ _proctor_logger = logging.getLogger("app.proctor")
 # and the secondary-camera router share one cached classifier — and one
 # warning when the installed OpenCV cannot provide one, instead of a failure
 # logged per screenshot.
-from app.utils.face_detection import count_faces_in_image  # noqa: E402
+from app.utils.face_detection import count_faces_in_image, image_size_is_safe  # noqa: E402
 
 
 def _candidate_label(db: Session, session: InterviewSession) -> str:
@@ -2364,6 +2488,14 @@ async def upload_recording_part(
     pd = f"{_parts_dir(upload_root, session_id)}/{_sanitize_recid(recording_id)}"
     os.makedirs(pd, exist_ok=True)
 
+    if start_index < 0:
+        raise HTTPException(status_code=422, detail="start_index must be >= 0")
+    # Disk-fill guard: parts had no size, count or total limit, so one session
+    # token could fill the volume every tenant's recordings are written to.
+    used = _session_part_bytes(upload_root, session_id)
+    if used >= MAX_SESSION_PART_BYTES:
+        raise HTTPException(status_code=413, detail="Recording storage limit reached for this session")
+
     part_path = f"{pd}/{start_index:012d}.bin"
     tmp = f"{part_path}.incoming-{int(time.time() * 1000)}"
     total = 0
@@ -2371,11 +2503,14 @@ async def upload_recording_part(
         with open(tmp, "wb") as f:
             while chunk := await file.read(65536):
                 total += len(chunk)
+                if total > MAX_RECORDING_PART_BYTES:
+                    raise HTTPException(status_code=413, detail="Recording part too large")
                 f.write(chunk)
         if total == 0:
             os.remove(tmp)
             return {"ok": True, "skipped": "empty", "start_index": start_index}
         os.replace(tmp, part_path)
+        _PART_BYTES_BY_SESSION[session_id] = used + total
         _rec_logger.info(
             f"[Recording] live chunk saved — session {session_id} "
             f"start_index={start_index} ({total / 1024:.0f} KB)"
@@ -2386,9 +2521,35 @@ async def upload_recording_part(
                 os.remove(tmp)
         except OSError:
             pass
+        if isinstance(e, HTTPException):
+            raise
         logging.error(f"[Recording] part {start_index} save failed session={session_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"part save failed: {e}")
+        raise HTTPException(status_code=500, detail="part save failed")
     return {"ok": True, "bytes": total, "start_index": start_index}
+
+
+# A live part is a few seconds of video (~1-3 MB); a whole 45-minute interview
+# is ~750 MB at the highest quality. Both ceilings sit far above real use.
+MAX_RECORDING_PART_BYTES = 64 * 1024 * 1024
+MAX_SESSION_PART_BYTES = 4 * 1024 * 1024 * 1024
+# Bytes of live parts on disk per session, counted once from disk (after a
+# restart) and then kept up to date as parts arrive.
+_PART_BYTES_BY_SESSION: Dict[int, int] = {}
+
+
+def _session_part_bytes(upload_root: str, session_id: int) -> int:
+    cached = _PART_BYTES_BY_SESSION.get(session_id)
+    if cached is not None:
+        return cached
+    total = 0
+    for dirpath, _dirs, files in os.walk(_parts_dir(upload_root, session_id)):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                pass
+    _PART_BYTES_BY_SESSION[session_id] = total
+    return total
 
 
 @router.post(
@@ -2714,6 +2875,8 @@ async def capture_candidate_photo(
 
         # Compress photo: resize to max 400x500, JPEG quality 80
         from PIL import Image
+        if not image_size_is_safe(tmp_path):
+            raise ValueError("image dimensions too large or unreadable")
         with Image.open(tmp_path) as img:
             img = img.convert("RGB")
             img.thumbnail((400, 500), Image.LANCZOS)
@@ -2788,6 +2951,15 @@ async def upload_screenshot(
                 os.remove(raw_path)
                 return {"ok": False, "reason": "too_large"}
             f.write(chunk)
+
+    # Refuse images whose declared size would decode to gigabytes (checked from
+    # the header, before PIL or OpenCV decode a single pixel).
+    if not image_size_is_safe(raw_path):
+        try:
+            os.remove(raw_path)
+        except OSError:
+            pass
+        return {"ok": False, "reason": "invalid_image"}
 
     # Compress screenshot: resize to max 800x600, JPEG quality 70
     try:
@@ -2972,13 +3144,30 @@ async def save_coding_submission(
     session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    # Submissions belong to the live interview. Afterwards the session token
+    # still works, and a submission added then was folded into any later
+    # "regenerate evaluation".
+    if session.status not in (SessionStatus.pending, SessionStatus.in_progress):
+        raise HTTPException(status_code=409, detail="This interview has ended")
 
     code = (body.get("code") or "").strip()
     language = body.get("language", "python")
     if not code:
         raise HTTPException(status_code=400, detail="Code cannot be empty")
+    if len(code) > 100_000:
+        raise HTTPException(status_code=413, detail="Code is too long")
 
     test_result = body.get("test_result") or {}
+    if not isinstance(test_result, dict):
+        test_result = {}
+    # The pass counts are still client-reported (see the security notes); at
+    # least keep them self-consistent and bounded.
+    try:
+        _total = max(0, min(int(test_result.get("total", 0)), 100))
+        _passed = max(0, min(int(test_result.get("passed", 0)), _total))
+    except (TypeError, ValueError):
+        _total, _passed = 0, 0
+    test_result = dict(test_result, total=_total, passed=_passed)
     title = (body.get("title") or "").strip() or None
     description = (body.get("description") or "").strip() or None
     difficulty = (body.get("difficulty") or "").strip() or None

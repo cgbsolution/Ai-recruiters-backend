@@ -1,6 +1,13 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 .env
 .git/
 *.md
+# Never bake candidate data or local databases into an image layer
+uploads/
+*.db
+.pytest_cache/
+tests/
+tests_security/

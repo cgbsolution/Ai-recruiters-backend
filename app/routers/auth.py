@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta
+from html import escape as html_escape
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -17,10 +18,12 @@ from sqlalchemy.orm import Session
 
 from app.auth import (
     ALGORITHM,
+    burn_password_check,
     create_access_token,
     get_current_user,
     get_org_id,
     hash_password,
+    password_problem,
     require_roles,
     verify_password,
 )
@@ -28,6 +31,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.organization import Organization
 from app.models.user import User, UserRole
+from app.ratelimit import failed_logins, password_reset_requests
 from app.refs import OrgId
 
 logger = logging.getLogger(__name__)
@@ -115,8 +119,9 @@ def signup(request: Request, body: SignUpRequest, db: Session = Depends(get_db))
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
 
-    if len(body.password) < 6:
-        raise HTTPException(status_code=422, detail="Password must be at least 6 characters")
+    problem = password_problem(body.password)
+    if problem:
+        raise HTTPException(status_code=422, detail=problem)
 
     # First user → super_admin
     user_count = db.query(User).count()
@@ -170,7 +175,9 @@ def signup(request: Request, body: SignUpRequest, db: Session = Depends(get_db))
 
     # First user gets auto-logged in; others must wait for admin approval
     if is_first_user:
-        token = create_access_token(user.id, user.role.value, org_id=organization_id)
+        token = create_access_token(
+            user.id, user.role.value, org_id=organization_id, password_hash=user.password_hash
+        )
         return TokenResponse(
             access_token=token,
             expires_in=settings.SESSION_TIMEOUT_MINUTES * 60,
@@ -202,9 +209,23 @@ def signup(request: Request, body: SignUpRequest, db: Session = Depends(get_db))
 @limiter.limit("10/minute", error_message="Too many login attempts. Please wait a minute and try again.")
 def login(request: Request, body: SignInRequest, db: Session = Depends(get_db)):
     """Authenticate and return a JWT token."""
-    user = db.query(User).filter(User.email == body.email.lower()).first()
+    email = body.email.lower()
+    # Per-account throttle: the per-IP limit above can be sidestepped by
+    # rotating X-Forwarded-For, this one can't (see app.ratelimit).
+    wait = failed_logins.blocked_for(email)
+    if wait:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed sign-in attempts for this account. Try again in {max(1, wait // 60)} minute(s).",
+            headers={"Retry-After": str(wait)},
+        )
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        burn_password_check(body.password)
     if not user or not verify_password(body.password, user.password_hash):
+        failed_logins.hit(email)
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    failed_logins.reset(email)
 
     if not user.is_active:
         raise HTTPException(
@@ -236,7 +257,9 @@ def login(request: Request, body: SignInRequest, db: Session = Depends(get_db)):
                 detail="Your organization's account is suspended. Contact support.",
             )
 
-    token = create_access_token(user.id, user.role.value, org_id=user.organization_id)
+    token = create_access_token(
+        user.id, user.role.value, org_id=user.organization_id, password_hash=user.password_hash
+    )
     logger.info("User logged in: %s", user.email)
 
     org_name = org.name if org else None
@@ -343,14 +366,27 @@ def change_password(
     if not verify_password(body.current_password, user.password_hash):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
 
-    if len(body.new_password) < 6:
-        raise HTTPException(status_code=422, detail="New password must be at least 6 characters")
+    problem = password_problem(body.new_password)
+    if problem:
+        raise HTTPException(status_code=422, detail=f"New {problem[0].lower()}{problem[1:]}")
 
     user.password_hash = hash_password(body.new_password)
+    # A pending reset link would otherwise still set a password afterwards.
+    user.password_reset_token = None
+    user.password_reset_expires = None
     user.updated_at = datetime.utcnow()
     db.commit()
 
-    return {"message": "Password updated successfully"}
+    # Every token issued before this change is now refused (see
+    # app.auth.password_fingerprint) — including the one that made this call —
+    # so hand this browser a fresh one to stay signed in with.
+    return {
+        "message": "Password updated successfully",
+        "access_token": create_access_token(
+            user.id, user.role.value, org_id=user.organization_id, password_hash=user.password_hash
+        ),
+        "expires_in": settings.SESSION_TIMEOUT_MINUTES * 60,
+    }
 
 
 # ── Forgot / Reset Password ─────────────────────────────────────────────────
@@ -393,7 +429,7 @@ def _send_password_reset_email(user: User, token: str) -> bool:
     msg.attach(MIMEText(
         f"""
         <div style="font-family:Arial,sans-serif;font-size:15px;color:#1f2937">
-          <p>Hi {user.name},</p>
+          <p>Hi {html_escape(user.name or "")},</p>
           <p>We received a request to reset your password.</p>
           <p style="margin:24px 0">
             <a href="{link}" style="background:#465fff;color:#fff;padding:12px 24px;
@@ -420,6 +456,13 @@ def forgot_password(request: Request, body: ForgotPasswordRequest, db: Session =
     would turn this into an account-enumeration oracle.
     """
     email = body.email.strip().lower()
+    # Per-address cap, same generic reply: the per-IP limit alone could be
+    # sidestepped to flood a victim's inbox with reset mails.
+    if password_reset_requests.blocked_for(email):
+        logger.warning("Password reset rate limit hit for %s", email)
+        return _FORGOT_PASSWORD_REPLY
+    password_reset_requests.hit(email)
+
     user = db.query(User).filter(User.email == email).first()
 
     if not user or not user.is_active:
@@ -447,8 +490,9 @@ def forgot_password(request: Request, body: ForgotPasswordRequest, db: Session =
 @router.post("/reset-password")
 def reset_password(body: ResetPasswordRequest, db: Session = Depends(get_db)):
     """Set a new password using a token from the reset email."""
-    if len(body.new_password) < 6:
-        raise HTTPException(status_code=422, detail="Password must be at least 6 characters")
+    problem = password_problem(body.new_password)
+    if problem:
+        raise HTTPException(status_code=422, detail=problem)
 
     token = (body.token or "").strip()
     if not token:
@@ -556,8 +600,9 @@ def create_user(
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
 
-    if len(body.password) < 6:
-        raise HTTPException(status_code=422, detail="Password must be at least 6 characters")
+    problem = password_problem(body.password)
+    if problem:
+        raise HTTPException(status_code=422, detail=problem)
 
     # Admins cannot create super_admin users
     if current_user.role == UserRole.admin and body.role == UserRole.super_admin:

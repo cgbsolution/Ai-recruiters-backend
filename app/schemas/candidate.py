@@ -1,41 +1,59 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, computed_field, field_serializer
+from pydantic import BaseModel, Field, computed_field, field_serializer, field_validator
 
 from app.media import sign_media_url
 from app.refs import JobId, encode_ref
 
 
+def _valid_candidate_status(value: Optional[str]) -> Optional[str]:
+    """`status` is a Postgres enum: an unknown value used to reach the INSERT /
+    UPDATE and come back as a 500 carrying the SQL statement. Accept the enum's
+    values (or member names, case-insensitively) and refuse anything else."""
+    if value is None:
+        return None
+    from app.models.candidate import CandidateStatus
+
+    for member in CandidateStatus:
+        if value == member.value or value.strip().lower() in (member.name, member.value.lower()):
+            return member.value
+    raise ValueError(f"status must be one of: {', '.join(m.value for m in CandidateStatus)}")
+
+
 class CandidateCreate(BaseModel):
-    name: str
+    name: str = Field(max_length=255)
     # These default to None, not "" / "Applied": re-adding an existing email to
     # the same job upserts the row with model_dump(exclude_none=True), so
     # non-None defaults silently wiped the candidate's phone, location and role
     # and reset their status.
-    role: Optional[str] = None
-    email: str
-    phone: Optional[str] = None
-    location: Optional[str] = None
+    role: Optional[str] = Field(default=None, max_length=255)
+    email: str = Field(max_length=255)
+    phone: Optional[str] = Field(default=None, max_length=50)
+    location: Optional[str] = Field(default=None, max_length=255)
     status: Optional[str] = None
     job_id: Optional[JobId] = None
+
+    _check_status = field_validator("status")(_valid_candidate_status)
     # `image` and `resume_path` are server-managed (photo capture / resume
     # upload) and no longer accepted from clients: they are file paths that
     # reach file readers and deletion. Unknown keys are ignored.
 
 
 class CandidateUpdate(BaseModel):
-    name: Optional[str] = None
-    role: Optional[str] = None
-    email: Optional[str] = None
-    phone: Optional[str] = None
-    location: Optional[str] = None
+    name: Optional[str] = Field(default=None, max_length=255)
+    role: Optional[str] = Field(default=None, max_length=255)
+    email: Optional[str] = Field(default=None, max_length=255)
+    phone: Optional[str] = Field(default=None, max_length=50)
+    location: Optional[str] = Field(default=None, max_length=255)
     status: Optional[str] = None
     job_id: Optional[JobId] = None
     # Stage
-    candidate_stage: Optional[str] = None
+    candidate_stage: Optional[str] = Field(default=None, max_length=50)
     # Interview scheduling
-    interview_status: Optional[str] = None
+    interview_status: Optional[str] = Field(default=None, max_length=60)
+
+    _check_status = field_validator("status")(_valid_candidate_status)
     interview_date: Optional[datetime] = None
     interview_timezone: Optional[str] = None
     allow_candidate_reschedule: Optional[bool] = None

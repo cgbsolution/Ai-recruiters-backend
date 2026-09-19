@@ -307,12 +307,17 @@ Recommendations: `Strong Hire` (≥80) · `Hire` (≥65) · `Maybe` (≥50) · `
 - Smart scoring engine (no AI) for instant fit-score during upload (~50ms)
 """
 
+# The interactive docs map every endpoint (super-admin ones included) for
+# anyone who finds them; production (APP_ENV=production) doesn't serve them.
+_API_DOCS = (settings.APP_ENV or "").strip().lower() != "production"
+
 app = FastAPI(
     title="CGB AI Recruiters API",
     description=_DESCRIPTION,
     version="3.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if _API_DOCS else None,
+    redoc_url="/redoc" if _API_DOCS else None,
+    openapi_url="/openapi.json" if _API_DOCS else None,
     contact={"name": "CGB Solutions", "email": "sindubrj@cgbindia.com"},
     openapi_tags=[
         {
@@ -453,6 +458,12 @@ async def add_cors_on_error(request: Request, call_next):
             response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Methods"] = "*"
         response.headers["Access-Control-Allow-Headers"] = "*"
+    # Baseline security headers on every API response. /media is exempt from
+    # X-Frame-Options: the admin UI previews resumes from it in an <iframe>.
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if not request.url.path.startswith("/media/"):
+        response.headers.setdefault("X-Frame-Options", "DENY")
     return response
 
 # ── Upload folders ───────────────────────────────────────────────────────────

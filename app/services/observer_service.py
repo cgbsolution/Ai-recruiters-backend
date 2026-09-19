@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
+from html import escape as _esc
 from email.mime.text import MIMEText
 from email.utils import formataddr
 from typing import Optional
@@ -26,6 +27,28 @@ def _build_observer_url(token: str) -> str:
     return f"{base}/observe/{token}"
 
 
+# Expiry for a link minted without an interview date (e.g. resent for a
+# candidate who was never scheduled, or after a cancel). Such links used to be
+# minted with expires_at=None and never expired.
+DEFAULT_OBSERVER_LINK_TTL = timedelta(days=7)
+
+
+def revoke_observer_tokens(db: Session, candidate_id: int) -> int:
+    """Revoke every live observer link for a candidate (cancel / retake), so a
+    link once handed to an outside panelist doesn't carry over to the next
+    interview. Open observer sockets notice within a few seconds. The caller
+    commits."""
+    now = datetime.utcnow()
+    rows = (
+        db.query(ObserverToken)
+        .filter(ObserverToken.candidate_id == candidate_id, ObserverToken.revoked_at.is_(None))
+        .all()
+    )
+    for row in rows:
+        row.revoked_at = now
+    return len(rows)
+
+
 def get_or_create_observer_token(
     db: Session,
     candidate: Candidate,
@@ -40,6 +63,8 @@ def get_or_create_observer_token(
     URL — that way recruiters who already shared the link don't have to
     re-share it after a reschedule.
     """
+    if expires_at is None:
+        expires_at = datetime.utcnow() + DEFAULT_OBSERVER_LINK_TTL
     existing = (
         db.query(ObserverToken)
         .filter(
@@ -82,6 +107,13 @@ def _observer_email_html(
     is_reschedule: bool,
 ) -> str:
     title = "Interview Observer Link (Updated)" if is_reschedule else "Your Interview Observer Link"
+    # The candidate's name comes from the public /apply form — escape it (and
+    # everything else interpolated) so an applicant can't put links or markup
+    # into an email the platform sends from its own domain.
+    candidate_name = _esc(candidate.name or "")
+    job_title = _esc(job_title or "")
+    when_str = _esc(when_str or "")
+    observer_url = _esc(observer_url or "", quote=True)
     return f"""\
 <!DOCTYPE html>
 <html><body style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:#f7f7fb;">
@@ -89,7 +121,7 @@ def _observer_email_html(
     <div style="background:#fff;border-radius:12px;padding:32px;box-shadow:0 1px 3px rgba(0,0,0,.05);">
       <h2 style="margin:0 0 8px 0;color:#111;font-size:22px;">{title}</h2>
       <p style="margin:0 0 24px 0;color:#555;font-size:14px;">
-        You scheduled an AI interview with <strong>{candidate.name}</strong> for <strong>{job_title}</strong>.
+        You scheduled an AI interview with <strong>{candidate_name}</strong> for <strong>{job_title}</strong>.
         Use the private link below to silently watch it live — the candidate is not notified, the
         interview continues without any interruption, and nothing is recorded on your end.
       </p>

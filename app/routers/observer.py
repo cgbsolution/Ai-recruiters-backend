@@ -225,6 +225,8 @@ async def stream(token: str, request: Request, db: Session = Depends(get_db)):
         return StreamingResponse(waiting_gen(), media_type="text/event-stream")
 
     session_id = session.id
+    if broker.viewer_count(session_id) >= _MAX_VIEWERS_PER_SESSION:
+        raise HTTPException(status_code=429, detail="Too many viewers are watching this interview.")
     queue = await broker.subscribe_events(session_id)
 
     # Take a snapshot of existing messages so the observer sees everything
@@ -297,6 +299,45 @@ async def _ws_resolve_observer(websocket: WebSocket, token: str) -> Optional[Obs
         return obj
 
 
+# One observer link can be forwarded to anyone, and every viewer holds queues
+# and tasks in this single-worker process: cap viewers per session.
+_MAX_VIEWERS_PER_SESSION = 20
+_MAX_SIGNAL_MESSAGE_CHARS = 64 * 1024
+
+# How often an open observer WebSocket re-reads its link. The link was checked
+# only when the socket opened, so revoking a leaked link left every viewer who
+# was already connected watching the live frames until the interview ended.
+_REVOCATION_CHECK_SECONDS = 20
+
+
+def _observer_link_still_valid(obs_id: int) -> bool:
+    with SessionLocal() as db:
+        row = db.query(ObserverToken).filter(ObserverToken.id == obs_id).first()
+        return (
+            row is not None
+            and row.revoked_at is None
+            and not (row.expires_at and row.expires_at < datetime.utcnow())
+        )
+
+
+async def _watch_revocation(websocket: WebSocket, obs_id: int) -> None:
+    """Returns (after closing the socket) once the observer link is revoked or
+    expires. A failed lookup keeps the viewer connected and retries."""
+    while True:
+        await asyncio.sleep(_REVOCATION_CHECK_SECONDS)
+        try:
+            valid = await asyncio.to_thread(_observer_link_still_valid, obs_id)
+        except Exception:
+            logger.exception("observer link re-check failed for token id %s", obs_id)
+            continue
+        if not valid:
+            try:
+                await websocket.close(code=4410, reason="revoked")
+            except Exception:
+                pass
+            return
+
+
 async def _ws_session_for_observer(observer: ObserverToken) -> Optional[InterviewSession]:
     with SessionLocal() as db:
         if observer.session_id:
@@ -343,6 +384,9 @@ async def observer_ws(websocket: WebSocket, token: str):
         return
 
     session_id = session.id
+    if broker.viewer_count(session_id) >= _MAX_VIEWERS_PER_SESSION:
+        await websocket.close(code=4429, reason="too many viewers")
+        return
     observer_id = secrets.token_hex(8)
     inbox = await broker.register_observer(session_id, observer_id)
     await websocket.send_json({"type": "ready", "observer_id": observer_id})
@@ -351,6 +395,10 @@ async def observer_ws(websocket: WebSocket, token: str):
         try:
             while True:
                 raw = await websocket.receive_text()
+                # An SDP offer/answer or ICE candidate is a few KB; anything
+                # far bigger is dropped rather than queued (256 deep).
+                if len(raw) > _MAX_SIGNAL_MESSAGE_CHARS:
+                    continue
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
@@ -376,11 +424,12 @@ async def observer_ws(websocket: WebSocket, token: str):
 
     t1 = asyncio.create_task(relay_to_publisher())
     t2 = asyncio.create_task(relay_to_observer())
+    t3 = asyncio.create_task(_watch_revocation(websocket, obs.id))
     try:
-        # Whichever task ends first signals the connection is dead — cancel
-        # the other so the finally block (and observer_leave broadcast) runs
-        # immediately.
-        done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+        # Whichever task ends first signals the connection is dead (or the
+        # link was revoked) — cancel the others so the finally block (and
+        # observer_leave broadcast) runs immediately.
+        done, pending = await asyncio.wait({t1, t2, t3}, return_when=asyncio.FIRST_COMPLETED)
         for p in pending:
             p.cancel()
         for p in pending:
@@ -462,6 +511,10 @@ async def publisher_ws(
         try:
             while True:
                 raw = await websocket.receive_text()
+                # An SDP offer/answer or ICE candidate is a few KB; anything
+                # far bigger is dropped rather than queued (256 deep).
+                if len(raw) > _MAX_SIGNAL_MESSAGE_CHARS:
+                    continue
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
@@ -591,6 +644,9 @@ async def observer_frames_ws(websocket: WebSocket, token: str):
         return
 
     session_id = session.id
+    if broker.viewer_count(session_id) >= _MAX_VIEWERS_PER_SESSION:
+        await websocket.close(code=4429, reason="too many viewers")
+        return
     queue = await broker.register_frame_subscriber(session_id)
 
     async def relay_frames():
@@ -615,8 +671,9 @@ async def observer_frames_ws(websocket: WebSocket, token: str):
 
     t1 = asyncio.create_task(relay_frames())
     t2 = asyncio.create_task(watch_disconnect())
+    t3 = asyncio.create_task(_watch_revocation(websocket, obs.id))
     try:
-        done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait({t1, t2, t3}, return_when=asyncio.FIRST_COMPLETED)
         for p in pending:
             p.cancel()
         for p in pending:

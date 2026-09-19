@@ -37,9 +37,17 @@ def ensure_invite_token(candidate) -> str:
 
 def email_access_allowed(candidate) -> bool:
     """Legacy email-only verification is allowed only for candidates who were
-    scheduled before personal links existed (no invite_token yet)."""
+    scheduled before personal links existed (no invite_token yet).
+
+    The evidence of that is the stored interview_link: scheduling wrote it and
+    emailed it. The status alone is not enough — a recruiter moving a candidate
+    through the pipeline (PUT /candidates/{id} with status "Interview" maps to
+    "Scheduled") changes interview_status without ever sending a link, which
+    let anyone with the job link and that candidate's email open a session in
+    their name."""
     status = (candidate.interview_status or "New").strip()
-    return not candidate.invite_token and status != "New"
+    was_sent_a_link = bool((candidate.interview_link or "").strip())
+    return not candidate.invite_token and status != "New" and was_sent_a_link
 
 
 def active_job_token(db, job_id: int):

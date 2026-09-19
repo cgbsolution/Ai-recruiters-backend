@@ -54,6 +54,9 @@ _PROBLEM_EVENTS = {
 # is anonymous, so a raw newline in it could forge extra backend log lines.
 _LOG_UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _LOG_MESSAGE_MAX_CHARS = 2000
+# Stored fields are capped (message 4000, context 8000, url 1000 chars), so a
+# body past this is junk — and it used to be read into memory whole.
+_MAX_BODY_BYTES = 64 * 1024
 
 
 def _log_safe(value, limit: int) -> str:
@@ -80,9 +83,19 @@ def _coerce_float(value):
 @router.post("/client-events", status_code=204)
 @limiter.limit("120/minute")
 async def ingest_client_event(request: Request, db: Session = Depends(get_db)):
+    # Anonymous endpoint: never buffer more than a telemetry event needs. A
+    # real beacon is a few KB; everything beyond the stored caps is discarded
+    # anyway, so an oversized body is dropped unread.
+    declared = request.headers.get("content-length") or ""
+    if declared.isdigit() and int(declared) > _MAX_BODY_BYTES:
+        return Response(status_code=204)
     # Read the raw body — the beacon arrives as text/plain, not application/json.
     try:
-        raw = await request.body()
+        raw = b""
+        async for chunk in request.stream():
+            raw += chunk
+            if len(raw) > _MAX_BODY_BYTES:
+                return Response(status_code=204)
         payload = json.loads(raw.decode("utf-8")) if raw else {}
         if not isinstance(payload, dict):
             payload = {}

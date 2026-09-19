@@ -1,16 +1,24 @@
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+# Bounds for text that is pasted into paid LLM prompts. Unbounded, one request
+# could carry ~1 MB per field and bill a near-full context window each time.
+# Resume text and job descriptions stay unbounded here: internal callers pass
+# whole documents, and the services truncate them before prompting.
+ShortText = Annotated[str, Field(max_length=500)]
+LongText = Annotated[str, Field(max_length=20_000)]
+ListItem = Annotated[str, Field(max_length=2_000)]
 
 
 class GenerateJDRequest(BaseModel):
-    title: str
-    department: str = ""
+    title: ShortText
+    department: ShortText = ""
     experience_min: Optional[int] = 0
     experience_max: Optional[int] = 2
-    experience_level: Optional[str] = "0-2 Years"
-    job_type: Optional[str] = "Full-time"
-    location: Optional[str] = ""
+    experience_level: Optional[ShortText] = "0-2 Years"
+    job_type: Optional[ShortText] = "Full-time"
+    location: Optional[ShortText] = ""
 
 
 class SkillGroupItem(BaseModel):
@@ -33,12 +41,12 @@ class GenerateJDResponse(BaseModel):
 
 
 class GenerateQuestionsRequest(BaseModel):
-    job_title: str
-    department: str
-    skills: List[str] = []
-    difficulty: str = "intermediate"
-    count: int = 10
-    mode: str = "TRADITIONAL"
+    job_title: ShortText
+    department: ShortText
+    skills: List[ShortText] = Field(default=[], max_length=100)
+    difficulty: ShortText = "intermediate"
+    count: int = Field(default=10, ge=1, le=50)
+    mode: ShortText = "TRADITIONAL"
 
 
 class GenerateQuestionsResponse(BaseModel):
@@ -46,10 +54,10 @@ class GenerateQuestionsResponse(BaseModel):
 
 
 class EvaluateCandidateRequest(BaseModel):
-    job_title: str
-    question: str
-    answer: str
-    scoring: str = "Standard Evaluation"
+    job_title: ShortText
+    question: LongText
+    answer: LongText
+    scoring: ShortText = "Standard Evaluation"
 
 
 class EvaluateCandidateResponse(BaseModel):
@@ -59,9 +67,9 @@ class EvaluateCandidateResponse(BaseModel):
 
 
 class SuggestQuestionsRequest(BaseModel):
-    category: str
-    difficulty: str = "intermediate"
-    count: int = 5
+    category: ShortText
+    difficulty: ShortText = "intermediate"
+    count: int = Field(default=5, ge=1, le=50)
 
 
 class SuggestQuestionsResponse(BaseModel):
@@ -101,12 +109,12 @@ class ParseResumeResponse(BaseModel):
 
 class FitScoreRequest(BaseModel):
     resume_text: str
-    job_title: str
+    job_title: ShortText
     job_description: Optional[str] = None
     required_experience_min: Optional[int] = None
     required_experience_max: Optional[int] = None
-    required_skills: List[str] = []
-    responsibilities: List[str] = []
+    required_skills: List[ListItem] = Field(default=[], max_length=300)
+    responsibilities: List[ListItem] = Field(default=[], max_length=300)
 
 
 class FitScoreBreakdown(BaseModel):

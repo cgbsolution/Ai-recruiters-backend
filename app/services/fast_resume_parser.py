@@ -278,13 +278,14 @@ def extract_text_from_file(file_path: str) -> Optional[str]:
     Returns None for purely image/scanned PDFs (no embedded text layer).
     """
     import os
+    from app.services.resume_service import MAX_PDF_PAGES, check_docx_is_safe
     ext = os.path.splitext(file_path)[1].lower()
     try:
         if ext == ".pdf":
             import pdfplumber
             with pdfplumber.open(file_path) as pdf:
                 parts: list[str] = []
-                for page in pdf.pages:
+                for page in pdf.pages[:MAX_PDF_PAGES]:
                     try:
                         deduped = page.dedupe_chars(tolerance=1)
                         parts.append(deduped.extract_text() or "")
@@ -301,6 +302,7 @@ def extract_text_from_file(file_path: str) -> Optional[str]:
             return result
         elif ext in (".doc", ".docx"):
             from docx import Document
+            check_docx_is_safe(file_path)  # zip-bomb guard (raises → logged below)
             doc = Document(file_path)
             return "\n".join(p.text for p in doc.paragraphs)
     except Exception as e:
@@ -370,8 +372,19 @@ def extract_email(text: str) -> Optional[str]:
     """
     if not text:
         return None
-    pattern = r"[a-zA-Z0-9._%+\-]+\s*@\s*[a-zA-Z0-9\-]+(?:\s*\.\s*[a-zA-Z0-9\-]+)+"
-    match = re.search(pattern, text)
+    # Bounded runs (RFC limits: 64-char local part, 63-char labels), and only
+    # the text around each "@" is searched. Unbounded, every start position in
+    # a long run scanned to its end — quadratic, 8 s for one 16,000-character
+    # token; bounded but run over the whole text it was still ~26 µs a char.
+    pattern = r"[a-zA-Z0-9._%+\-]{1,64}\s*@\s*[a-zA-Z0-9\-]{1,63}(?:\s*\.\s*[a-zA-Z0-9\-]{1,63})+"
+    match = None
+    for tried, at in enumerate(re.finditer("@", text)):
+        if tried >= 50:  # a real resume has a handful of "@"s
+            break
+        window = text[max(0, at.start() - 100): at.start() + 300]
+        match = re.search(pattern, window)
+        if match:
+            break
     if not match:
         return None
     email = re.sub(r"\s+", "", match.group(0)).lower()
@@ -425,7 +438,9 @@ def extract_social_links(text: str) -> dict:
 
     # Portfolio / personal websites (common patterns)
     portfolio_patterns = [
-        r"(?:https?://)?(?:www\.)?[a-zA-Z0-9\-]+\.(?:dev|io|me|com|net|org)/?\b",
+        # Label bounded to 63 chars (the DNS limit): unbounded, every start
+        # position in a long letter/digit run scanned to its end (quadratic).
+        r"(?:https?://)?(?:www\.)?[a-zA-Z0-9\-]{1,63}\.(?:dev|io|me|com|net|org)/?\b",
         r"(?:portfolio|website|blog)\s*[:\-]?\s*(https?://[^\s]+)",
     ]
     for p in portfolio_patterns:
@@ -1015,11 +1030,17 @@ def _is_valid_skill(s: str) -> bool:
 
 def extract_experience_years(text: str) -> Optional[float]:
     """Extract years of experience from text."""
+    # The number is bounded (1-2 digits, optional 1-2 decimals) and may not
+    # start mid-number. The old `(\d+\.?\d*)` could split a digit run in O(n^2)
+    # ways at each of n start positions: a resume containing 1,000 digits took
+    # 44 s and 10,000 would take hours, freezing whichever worker parsed it.
+    # Only 0 < years <= 50 is ever accepted, so nothing valid is lost.
+    num = r"(?<![\d.])(\d{1,2}(?:\.\d{1,2})?)"
     patterns = [
-        r"(\d+\.?\d*)\+?\s*(?:years?|yrs?)\s+(?:of\s+)?(?:experience|exp)",
-        r"(?:experience|exp)\s*(?::|of)\s*(\d+\.?\d*)\+?\s*(?:years?|yrs?)",
-        r"(?:total|overall)\s+(?:experience|exp)\s*(?::|of)?\s*(\d+\.?\d*)\+?\s*(?:years?|yrs?)",
-        r"(\d+\.?\d*)\+?\s*(?:years?|yrs?)\s+(?:in\s+)?(?:IT|software|development|engineering|industry)",
+        num + r"\+?\s*(?:years?|yrs?)\s+(?:of\s+)?(?:experience|exp)",
+        r"(?:experience|exp)\s*(?::|of)\s*" + num + r"\+?\s*(?:years?|yrs?)",
+        r"(?:total|overall)\s+(?:experience|exp)\s*(?::|of)?\s*" + num + r"\+?\s*(?:years?|yrs?)",
+        num + r"\+?\s*(?:years?|yrs?)\s+(?:in\s+)?(?:IT|software|development|engineering|industry)",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)

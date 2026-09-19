@@ -5,7 +5,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    DATABASE_URL: str = "postgresql+psycopg://postgres:Deepak%40123@localhost:5432/ai_recruiters"
+    # Always set in .env / the environment; no credential lives in the code.
+    DATABASE_URL: str = "postgresql+psycopg://postgres@localhost:5432/ai_recruiters"
     # ── AI Provider ─────────────────────────────────────────────────────────
     # Set AI_PROVIDER to: "anthropic", "gemini", or "openai"
     # Then set the corresponding API key below
@@ -14,6 +15,12 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
     DEEPGRAM_API_KEY: str = ""
+    # When Deepgram refuses to mint a short-lived grant token for this key,
+    # /interview/deepgram-token hands the admitted candidate's browser the
+    # PERMANENT key instead (anyone who opens DevTools can copy it). Give the
+    # backend a key with the Member role — which can mint grants — and then set
+    # this to false so the master key can never leave the server.
+    DEEPGRAM_ALLOW_MASTER_KEY_FALLBACK: bool = True
     GOOGLE_TTS_API_KEY: str = ""
     CORS_ORIGINS: str = "*"
 

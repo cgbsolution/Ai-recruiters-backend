@@ -123,7 +123,12 @@ def world(client):
         cand_a = cand("Alice", "alice@mailbox.co", j=job_a, status="Scheduled")
         cand_b = cand("Bob", "bob@mailbox.co", j=job_b, status="Scheduled")
         invited = cand("Ivy", "ivy@mailbox.co", j=job_a, status="Scheduled", invite=secrets.token_urlsafe(24))
+        # Scheduled before personal invites existed: scheduling stored (and
+        # emailed) the job link, so interview_link is set.
         legacy = cand("Leo", "leo@mailbox.co", j=job_a, status="Scheduled")
+        legacy.interview_link = f"http://localhost:3000/interview/{tok_a.token}"
+        # Moved to "Scheduled" through the pipeline status, never sent a link.
+        status_only = cand("Sam", "sam@mailbox.co", j=job_a, status="Scheduled")
         fresh = cand("Nia", "nia@mailbox.co", j=job_a, status="New")
         invited_b = cand("Bea", "bea@mailbox.co", j=job_b, status="Scheduled", invite=secrets.token_urlsafe(24))
 
@@ -166,7 +171,7 @@ def world(client):
             cand_a=cand_a.id, cand_b=cand_b.id,
             cand_a_ref=encode_ref("candidate", cand_a.id), cand_b_ref=encode_ref("candidate", cand_b.id),
             invited_email=invited.email, invite=invited.invite_token, invite_b=invited_b.invite_token,
-            legacy_email=legacy.email, fresh_email=fresh.email,
+            legacy_email=legacy.email, fresh_email=fresh.email, status_only_email=status_only.email,
             sess_a=sess_a.id, sess_b=sess_b.id, sess_a_token=session_token(sess_a), sess_b_token=session_token(sess_b),
             q_a=q_a.id, q_b=q_b.id,
         )

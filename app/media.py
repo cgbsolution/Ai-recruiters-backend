@@ -191,6 +191,28 @@ def safe_upload_name(filename: Optional[str], allowed_exts: Iterable[str],
     return stem, ext
 
 
+# Leading bytes of the accepted resume formats: PDF, DOCX (a zip), legacy DOC (OLE).
+RESUME_MAGIC = (b"%PDF", b"PK\x03\x04", b"\xd0\xcf\x11\xe0")
+
+
+def resume_upload_problem(upload) -> Optional[str]:
+    """Why an uploaded resume (a Starlette UploadFile) must be refused, or None.
+    Checks the spooled size against MAX_UPLOAD_SIZE_MB and the file's real
+    leading bytes — the client-declared content type was the only check on
+    several upload routes, and some had no size cap at all."""
+    max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    if upload.size is not None and upload.size > max_bytes:
+        return f"file exceeds the {settings.MAX_UPLOAD_SIZE_MB}MB limit"
+    try:
+        head = upload.file.read(8)
+        upload.file.seek(0)
+    except Exception:
+        return "file could not be read"
+    if not head.startswith(RESUME_MAGIC):
+        return "not a PDF, DOC or DOCX file"
+    return None
+
+
 def client_resume_path(stored: Optional[str]) -> Optional[str]:
     """Validate a resume path echoed back by a client (the candidate apply
     flow): it must name an existing file directly in the resumes folder.

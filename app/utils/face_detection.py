@@ -90,10 +90,34 @@ def detect_faces(
         return None
 
 
+# Largest image OpenCV may decode. Screenshots and camera frames are at most a
+# few megapixels; OpenCV's own ceiling is ~1 billion pixels, so a 109 KB PNG
+# declaring 30000x30000 decoded to ~2.7 GB and a few in parallel killed the
+# single-worker server mid-interview.
+MAX_DECODE_PIXELS = 40_000_000
+
+
+def image_size_is_safe(source) -> bool:
+    """True when the image's declared dimensions (read from its header only,
+    nothing is decoded) are within MAX_DECODE_PIXELS. `source` is a path or a
+    binary file object; an unreadable image is not safe."""
+    try:
+        from PIL import Image
+
+        with Image.open(source) as im:
+            width, height = im.size
+    except Exception:
+        return False
+    return 0 < width * height <= MAX_DECODE_PIXELS
+
+
 def count_faces_in_image(path: str) -> Optional[int]:
     """Count faces in a screenshot file. Returns an int, or None if detection
     couldn't run (so the caller can fall back to 'unknown')."""
     if get_face_cascade() is None:
+        return None
+    if not image_size_is_safe(path):
+        logger.warning("[Proctor] screenshot %s refused: unreadable or too many pixels", path)
         return None
     try:
         import cv2

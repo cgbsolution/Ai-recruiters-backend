@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, EmailStr, field_validator, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 
 # ── Token / Job Config ────────────────────────────────────────────────────────
@@ -85,10 +85,11 @@ class VerifyAccessResponse(BaseModel):
 # ── Apply for Job (resume upload + basic details) ────────────────────────────
 
 class ApplyForJobRequest(BaseModel):
-    name: str
+    # Anonymous input that lands in recruiter emails, exports and PDFs.
+    name: str = Field(min_length=1, max_length=150)
     email: EmailStr
-    phone: Optional[str] = None
-    resume_path: str  # path to uploaded resume file
+    phone: Optional[str] = Field(default=None, max_length=40)
+    resume_path: str = Field(max_length=500)  # path to uploaded resume file
 
 
 class ApplyForJobResponse(BaseModel):
@@ -116,7 +117,11 @@ class ResumeSessionResponse(BaseModel):
 # ── Interview Turn ────────────────────────────────────────────────────────────
 
 class InterviewMessageRequest(BaseModel):
-    content: str                        # candidate's spoken/typed answer
+    # Candidate's spoken/typed answer (a code submission is sent through here
+    # too). Bounded: every stored answer is re-sent to the LLM on each later
+    # turn and at evaluation, so one ~600 KB answer multiplied the cost of the
+    # whole interview.
+    content: str = Field(max_length=60_000)
     # Client-generated idempotency key. The client retries /message after a
     # network timeout while the original request may still complete server-side;
     # replaying the same turn_id returns the stored response instead of running
@@ -176,6 +181,18 @@ class EvaluationRead(BaseModel):
     created_at: Optional[datetime]
 
     model_config = {"from_attributes": True}
+
+
+class CandidateEvaluationRead(BaseModel):
+    """What the CANDIDATE may see of their evaluation. The full EvaluationRead
+    (every score, the Hire / No Hire recommendation, weaknesses, the reviewer
+    feedback) is for recruiters — the candidate's completion screen only uses
+    meets_threshold."""
+    id: int
+    session_id: int
+    candidate_id: int
+    meets_threshold: bool
+    created_at: Optional[datetime]
 
 
 # ── Feedback ──────────────────────────────────────────────────────────────────

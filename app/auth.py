@@ -1,6 +1,8 @@
 """
 Authentication utilities: JWT tokens, password hashing, org scoping, and dependency injection.
 """
+import hashlib
+import hmac
 from datetime import datetime, timedelta
 from typing import Annotated, List, Optional
 
@@ -15,6 +17,21 @@ from app.database import get_db
 from app.models.user import User, UserRole
 
 # ── Password Hashing (using bcrypt directly — passlib has Python 3.14 issues)
+PASSWORD_MIN_LENGTH = 8
+# bcrypt only reads the first 72 bytes, and bcrypt 5 raises on anything longer
+# (which surfaced as an unhandled 500 on signup / change / reset).
+PASSWORD_MAX_BYTES = 72
+
+
+def password_problem(plain: str) -> Optional[str]:
+    """Why a NEW password is unacceptable, or None when it is fine."""
+    if len(plain or "") < PASSWORD_MIN_LENGTH:
+        return f"Password must be at least {PASSWORD_MIN_LENGTH} characters"
+    if len(plain.encode("utf-8")) > PASSWORD_MAX_BYTES:
+        return f"Password must be at most {PASSWORD_MAX_BYTES} bytes long"
+    return None
+
+
 def hash_password(plain: str) -> str:
     return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
@@ -26,11 +43,33 @@ def verify_password(plain: str, hashed: str) -> bool:
         return False
 
 
+# A real hash to check against when the email is unknown, so a login attempt
+# for a non-existent account costs the same bcrypt time as a wrong password —
+# otherwise the response time says which emails have accounts.
+_DUMMY_HASH = bcrypt.hashpw(b"timing-equaliser", bcrypt.gensalt()).decode("utf-8")
+
+
+def burn_password_check(plain: str) -> None:
+    verify_password(plain, _DUMMY_HASH)
+
+
 # ── JWT ──────────────────────────────────────────────────────────────────────
 ALGORITHM = "HS256"
 
 
-def create_access_token(user_id: int, role: str, org_id: Optional[int] = None) -> str:
+def password_fingerprint(password_hash: Optional[str]) -> str:
+    """Short keyed digest of the user's CURRENT password hash, carried in the
+    login token. Changing or resetting the password changes the hash, so every
+    token issued before that stops matching and is refused — a stolen token no
+    longer outlives the password change meant to lock the thief out."""
+    return hmac.new(
+        settings.SECRET_KEY.encode("utf-8"), (password_hash or "").encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:24]
+
+
+def create_access_token(
+    user_id: int, role: str, org_id: Optional[int] = None, password_hash: Optional[str] = None
+) -> str:
     expire = datetime.utcnow() + timedelta(minutes=settings.SESSION_TIMEOUT_MINUTES)
     payload = {
         "sub": str(user_id),
@@ -39,6 +78,8 @@ def create_access_token(user_id: int, role: str, org_id: Optional[int] = None) -
     }
     if org_id:
         payload["org_id"] = org_id
+    if password_hash:
+        payload["pwf"] = password_fingerprint(password_hash)
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=ALGORITHM)
 
 
@@ -76,6 +117,15 @@ def get_current_user(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or inactive",
+        )
+    # Tokens issued before the fingerprint existed carry none; they are still
+    # accepted and age out within SESSION_TIMEOUT_MINUTES.
+    pwf = payload.get("pwf")
+    if pwf is not None and not hmac.compare_digest(str(pwf), password_fingerprint(user.password_hash)):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Your password was changed. Please sign in again.",
+            headers={"WWW-Authenticate": "Bearer"},
         )
     # Tenant users must belong to an ACTIVE organization. Suspending a tenant
     # (Organization.is_active=False) previously had no effect on live tokens,

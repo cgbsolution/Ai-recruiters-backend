@@ -21,6 +21,26 @@ from app.services.llm_provider import LLMResult
 logger = logging.getLogger(__name__)
 
 
+def _owning_org_id(db: Session, job_id, candidate_id, session_id) -> Optional[int]:
+    """The organization that owns the job behind this call, if any is known."""
+    try:
+        from app.models.candidate import Candidate
+        from app.models.interview import InterviewSession
+        from app.models.job import Job
+
+        if job_id is None and session_id is not None:
+            job_id = db.query(InterviewSession.job_id).filter(InterviewSession.id == session_id).scalar()
+        if job_id is None and candidate_id is not None:
+            job_id = db.query(Candidate.job_id).filter(Candidate.id == candidate_id).scalar()
+        if job_id is None:
+            return None
+        return db.query(Job.organization_id).filter(Job.id == job_id).scalar()
+    except Exception:
+        logger.exception("Could not resolve the organization for an AI usage row")
+        db.rollback()
+        return None
+
+
 def log_usage(
     result: LLMResult,
     feature: str,
@@ -32,6 +52,10 @@ def log_usage(
     try:
         db = SessionLocal()
         row = AiCreditUsage(
+            # Attribute the spend to its tenant. Rows were written without an
+            # organization, so per-tenant dashboards read zero and any bulk
+            # "claim org-less data" swept the whole platform's usage into one org.
+            organization_id=_owning_org_id(db, job_id, candidate_id, session_id),
             feature=feature,
             provider=result.provider,
             model=result.model,

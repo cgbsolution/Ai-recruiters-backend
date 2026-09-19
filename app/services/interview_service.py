@@ -160,9 +160,12 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
     action_word = "Rescheduled" if is_reschedule else "Schedule"
     subject = str(template.get("subject") or "").replace("\r", " ").replace("\n", " ").strip()[:200]
     subject = subject or f"Your Interview {action_word} for {job_title}"
+    # The candidate's name can come from the anonymous /apply form, and job /
+    # org names are tenant-controlled: escape them for the HTML body too.
+    candidate_name_html = _html_escape(candidate.name or "")
     intro_text = _html_escape(str(template.get("intro_text") or "")) or (
         f"You are shortlisted for an AI Interview round for the role of "
-        f"{job_title} at {org_name}."
+        f"{_html_escape(job_title)} at {_html_escape(org_name)}."
     )
     date_str = _format_interview_date(candidate)
 
@@ -325,7 +328,7 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
 
         <!-- Body -->
         <tr><td style="padding:28px 24px 6px;">
-          <p style="margin:0 0 6px 0;font-size:16px;color:#1F2937;">Hello <strong>{candidate.name}</strong>,</p>
+          <p style="margin:0 0 6px 0;font-size:16px;color:#1F2937;">Hello <strong>{candidate_name_html}</strong>,</p>
           <p style="margin:0 0 24px 0;font-size:14px;color:#4B5563;line-height:1.6;">
             {intro_text}
           </p>
@@ -377,7 +380,7 @@ async def send_schedule_email(candidate, db: "Session", is_reschedule: bool = Fa
                     </a>
                   </td>
                   <td>
-                    <a href="mailto:{getattr(settings, 'EMAIL_FROM', '') or getattr(settings, 'SMTP_USER', '')}?subject=Interview%20Decline%20-%20{candidate.name}" style="display:inline-block;padding:10px 28px;background-color:#FEF2F2;color:#DC2626;font-size:14px;font-weight:600;text-decoration:none;border-radius:8px;border:1px solid #FECACA;">
+                    <a href="mailto:{getattr(settings, 'EMAIL_FROM', '') or getattr(settings, 'SMTP_USER', '')}?subject=Interview%20Decline%20-%20{_html_escape(quote(candidate.name or '', safe=''), quote=True)}" style="display:inline-block;padding:10px 28px;background-color:#FEF2F2;color:#DC2626;font-size:14px;font-weight:600;text-decoration:none;border-radius:8px;border:1px solid #FECACA;">
                       &#10007; Reject
                     </a>
                   </td>
@@ -439,11 +442,18 @@ async def send_cancel_email(candidate, db: "Session") -> bool:
 
     subject = f"Interview Cancelled – {job_title}"
 
+    # Escaped for the HTML body: the name can come from the anonymous /apply
+    # form, and the job / org names are tenant-controlled.
+    from html import escape as _html_escape
+    candidate_name_html = _html_escape(candidate.name or "")
+    job_title = _html_escape(job_title)
+    org_name = _html_escape(org_name)
+
     html_body = f"""
 <html><body style="font-family: Arial, sans-serif; color: #333;">
   <div style="max-width:600px;margin:auto;padding:24px;border:1px solid #e0e0e0;border-radius:8px;">
     <h2 style="color:#dc2626;">Interview Cancelled</h2>
-    <p>Hello {candidate.name},</p>
+    <p>Hello {candidate_name_html},</p>
     <p>We regret to inform you that your scheduled interview for the role of
        <strong>{job_title}</strong> at {org_name} has been cancelled.</p>
     <p>If you have any questions, please reach out to the HR team.</p>

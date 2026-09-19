@@ -27,13 +27,25 @@ from sqlalchemy.orm import Session
 from app.auth import get_current_user, get_org_id, require_roles
 from app.authz import can_access_org
 from app.database import get_db, SessionLocal
-from app.media import UPLOAD_ROOT, resume_file_in_use, safe_unlink_upload, safe_upload_name, sign_media_url
+from app.media import (
+    UPLOAD_ROOT,
+    resume_file_in_use,
+    resume_upload_problem,
+    safe_unlink_upload,
+    safe_upload_name,
+    sign_media_url,
+)
 from app.models.organization import Organization
 from app.models.resume_metadata import ResumeMetadata
 from app.models.user import User, UserRole
 from app.schemas.resume_metadata import ResumeMetadataUpdate
 
 logger = logging.getLogger(__name__)
+
+# Bounds for POST /import (a JSON export from another instance).
+_MAX_IMPORT_BODY_BYTES = 200 * 1024 * 1024
+_MAX_IMPORT_RECORDS = 20_000
+_MAX_IMPORT_RAW_TEXT = 100_000
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
@@ -427,6 +439,13 @@ async def upload_resumes(
             _bulk_progress[batch_id]["total"] -= 1
             _bulk_progress[batch_id]["failed"] += 1
             continue
+        # Size cap and real file-type check (this route had neither).
+        problem = resume_upload_problem(file)
+        if problem:
+            logger.warning("Skipped bulk resume %s: %s", file.filename, problem)
+            _bulk_progress[batch_id]["total"] -= 1
+            _bulk_progress[batch_id]["failed"] += 1
+            continue
 
         # Save file to disk under a sanitized, server-chosen name
         safe_name = _stored_resume_name(file.filename, default_ext=ALLOWED_RESUME_TYPES[file.content_type])
@@ -519,16 +538,23 @@ def download_failed_resumes(db: Session = Depends(get_db), user: User = Depends(
     writer = csv.writer(output)
     writer.writerow(["ID", "Filename", "Name", "Email", "Error", "Created At"])
 
+    def _cell(value) -> str:
+        # Spreadsheet formula injection: names come from uploaded file names and
+        # resume contents, and a cell starting with = + - @ runs as a formula
+        # when the CSV is opened in Excel (e.g. =HYPERLINK(...) exfiltration).
+        text = str(value)
+        return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+
     for m in failed:
         filename = os.path.basename(m.resume_file_path) if m.resume_file_path else ""
-        writer.writerow([
+        writer.writerow([_cell(v) for v in (
             m.id,
             filename,
             m.candidate_name or "",
             m.candidate_email or "",
             m.parsing_error or "Unknown error",
             m.created_at.isoformat() if m.created_at else "",
-        ])
+        )])
 
     output.seek(0)
     return StreamingResponse(
@@ -875,8 +901,9 @@ async def reparse_single_resume(meta_id: int, use_llm: bool = True, db: Session 
         raise HTTPException(status_code=400, detail="No raw text available for re-parsing")
 
     try:
-        # Step 1: Fast regex parse
-        result = fast_parse_resume(meta.raw_text)
+        # Step 1: Fast regex parse — off the event loop, so a large or hostile
+        # resume can't stall every other request while it parses.
+        result = await asyncio.to_thread(fast_parse_resume, meta.raw_text)
 
         # Step 2: LLM correction if regex output looks bad
         llm_used = False
@@ -968,7 +995,7 @@ async def reparse_bad_resumes(db: Session = Depends(get_db), user: User = Depend
     errors = 0
     for meta in needs_fix:
         try:
-            regex_result = fast_parse_resume(meta.raw_text)
+            regex_result = await asyncio.to_thread(fast_parse_resume, meta.raw_text)
             llm_result = await llm_parse_resume(meta.raw_text, regex_result)
 
             if llm_result:
@@ -1103,12 +1130,25 @@ async def import_resumes(
     user: User = Depends(_require_resume_admin),
 ):
     _check_resume_db_permission(user, db)
+    # The whole body is read into memory: refuse oversized imports up front.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > _MAX_IMPORT_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Import is too large. Split it into smaller files.")
     try:
         body = await request.json()
     except ValueError:
         raise HTTPException(status_code=400, detail="Expected a JSON array of resume records")
     if not isinstance(body, list):
         raise HTTPException(status_code=400, detail="Expected a JSON array of resume records")
+    if len(body) > _MAX_IMPORT_RECORDS:
+        raise HTTPException(
+            status_code=413, detail=f"Import at most {_MAX_IMPORT_RECORDS} records at a time."
+        )
+    for record in body:
+        # raw_text feeds the regex parser and LLM re-parsing; a resume is a
+        # few thousand characters, not megabytes.
+        if isinstance(record, dict) and isinstance(record.get("raw_text"), str):
+            record["raw_text"] = record["raw_text"][:_MAX_IMPORT_RAW_TEXT]
 
     org_id = get_org_id(user)
     imported = 0
@@ -1202,6 +1242,9 @@ async def import_with_file(
     safe_name = _stored_resume_name(file.filename)
     if safe_name is None:
         return {"status": "skipped", "reason": "unsupported file type"}
+    problem = resume_upload_problem(file)
+    if problem:
+        return {"status": "skipped", "reason": problem}
     file_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)

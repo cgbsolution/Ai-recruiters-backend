@@ -8,12 +8,13 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, require_roles
 from app.database import get_db
+from app.models.interview import InterviewSession
 from app.models.organization import Organization
 from app.models.user import User, UserRole
 from app.models.job import Job
@@ -549,8 +550,26 @@ def claim_unassigned(
             detail=f"Only users with an @{org.domain} email who are not already in '{org.name}' can be linked.",
         )
 
-    moved = {}
-    for key, model in (("jobs", Job), ("questions", Question), ("ai_credit_usage", AiCreditUsage)):
+    # AI usage is moved only when it is tied to one of the jobs being claimed.
+    # Usage rows were never tagged with an organization, so "every org-less
+    # row" meant the whole platform's AI history — every tenant's usage and
+    # cost would have shown up on this organization's dashboard.
+    claimed_job_ids = select(Job.id).where(Job.organization_id.is_(None)).scalar_subquery()
+    claimed_session_ids = select(InterviewSession.id).where(InterviewSession.job_id.in_(claimed_job_ids))
+    moved = {
+        "ai_credit_usage": (
+            db.query(AiCreditUsage)
+            .filter(
+                AiCreditUsage.organization_id.is_(None),
+                or_(
+                    AiCreditUsage.job_id.in_(claimed_job_ids),
+                    AiCreditUsage.session_id.in_(claimed_session_ids),
+                ),
+            )
+            .update({AiCreditUsage.organization_id: org.id}, synchronize_session=False)
+        )
+    }
+    for key, model in (("jobs", Job), ("questions", Question)):
         moved[key] = (
             db.query(model)
             .filter(model.organization_id.is_(None))

@@ -15,6 +15,9 @@ engine = create_engine(
     # Recycle idle connections before typical LB/Postgres idle kill windows
     # so a stale connection never surfaces as a mid-interview 500.
     pool_recycle=1800,
+    # Keep bound values (session access tokens, password hashes, resume text)
+    # out of exception messages, which end up in logs and error reports.
+    hide_parameters=True,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

@@ -69,6 +69,28 @@ def _save_snapshot(upload: UploadFile, filepath: str) -> None:
         raise
 
 
+def _live_cam_session(db: Session, pairing_code: str) -> SecondaryCamSession:
+    """The phone-side routes carry no credential but the pairing code, so the
+    code only works while its interview is pending or in progress. It used to
+    stay valid forever: whoever later saw the QR / URL could still register a
+    device, mark the session verified and inject snapshots into the finished
+    interview's proctoring record."""
+    from app.models.interview import InterviewSession, SessionStatus
+
+    cam_session = db.query(SecondaryCamSession).filter(
+        SecondaryCamSession.pairing_code == pairing_code
+    ).first()
+    if cam_session is not None:
+        status = (
+            db.query(InterviewSession.status)
+            .filter(InterviewSession.id == cam_session.session_id)
+            .scalar()
+        )
+        if status in (SessionStatus.pending, SessionStatus.in_progress):
+            return cam_session
+    raise HTTPException(404, "Invalid or expired pairing code")
+
+
 def _clean_device_info(raw: Optional[str]) -> Optional[str]:
     """Store device_info only when it is a small JSON object."""
     if not raw or len(raw) > MAX_DEVICE_INFO_CHARS:
@@ -184,14 +206,9 @@ def get_status(session_id: int, db: Session = Depends(get_db)):
 @router.get("/connect/{pairing_code}", summary="Validate pairing code (mobile page load)")
 def validate_pairing(pairing_code: str, db: Session = Depends(get_db)):
     """Validate a pairing code and return session info for the mobile page."""
-    cam_session = db.query(SecondaryCamSession).filter(
-        SecondaryCamSession.pairing_code == pairing_code
-    ).first()
-    if not cam_session:
-        raise HTTPException(404, "Invalid or expired pairing code")
-
-    # Pairing code is valid as long as the interview session exists.
+    # Valid while the interview is pending / in progress (see _live_cam_session).
     # It's generated fresh when the candidate reaches the secondary camera step.
+    cam_session = _live_cam_session(db, pairing_code)
 
     from app.models.interview import InterviewSession
     session = db.query(InterviewSession).filter(
@@ -228,11 +245,7 @@ def register_device(
     db: Session = Depends(get_db),
 ):
     """Register the mobile device and mark as connected."""
-    cam_session = db.query(SecondaryCamSession).filter(
-        SecondaryCamSession.pairing_code == pairing_code
-    ).first()
-    if not cam_session:
-        raise HTTPException(404, "Invalid pairing code")
+    cam_session = _live_cam_session(db, pairing_code)
 
     cam_session.status = "connected"
     cam_session.device_info = _clean_device_info(device_info)
@@ -251,11 +264,7 @@ async def confirm_position(
     db: Session = Depends(get_db),
 ):
     """Upload positioning snapshot and mark as verified."""
-    cam_session = db.query(SecondaryCamSession).filter(
-        SecondaryCamSession.pairing_code == pairing_code
-    ).first()
-    if not cam_session:
-        raise HTTPException(404, "Invalid pairing code")
+    cam_session = _live_cam_session(db, pairing_code)
 
     # Save snapshot
     filename = f"{pairing_code}_position_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.jpg"
@@ -276,11 +285,7 @@ async def confirm_position(
 @router.post("/connect/{pairing_code}/heartbeat", summary="Mobile heartbeat")
 def heartbeat(pairing_code: str, db: Session = Depends(get_db)):
     """Update the heartbeat timestamp to prove the phone is still connected."""
-    cam_session = db.query(SecondaryCamSession).filter(
-        SecondaryCamSession.pairing_code == pairing_code
-    ).first()
-    if not cam_session:
-        raise HTTPException(404, "Invalid pairing code")
+    cam_session = _live_cam_session(db, pairing_code)
 
     cam_session.last_heartbeat = datetime.utcnow()
 
@@ -305,11 +310,7 @@ async def upload_snapshot(
     db: Session = Depends(get_db),
 ):
     """Upload a periodic camera snapshot during the interview."""
-    cam_session = db.query(SecondaryCamSession).filter(
-        SecondaryCamSession.pairing_code == pairing_code
-    ).first()
-    if not cam_session:
-        raise HTTPException(404, "Invalid pairing code")
+    cam_session = _live_cam_session(db, pairing_code)
 
     filename = f"{pairing_code}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.jpg"
     filepath = os.path.join(SECONDARY_CAM_DIR, filename)
@@ -338,11 +339,7 @@ async def verify_frame(
     2. Laptop/screen is visible (bright rectangular area)
     Returns detection results for real-time UI updates on phone.
     """
-    cam_session = db.query(SecondaryCamSession).filter(
-        SecondaryCamSession.pairing_code == pairing_code
-    ).first()
-    if not cam_session:
-        raise HTTPException(404, "Invalid pairing code")
+    cam_session = _live_cam_session(db, pairing_code)
 
     import numpy as np
 
@@ -350,6 +347,12 @@ async def verify_frame(
     contents = await frame.read(MAX_SNAPSHOT_BYTES + 1)
     if len(contents) > MAX_SNAPSHOT_BYTES:
         raise HTTPException(413, "Frame too large")
+    # Header-only dimension check before OpenCV decodes anything (a tiny PNG
+    # can declare a multi-gigabyte bitmap).
+    import io as _io
+    from app.utils.face_detection import image_size_is_safe
+    if not image_size_is_safe(_io.BytesIO(contents)):
+        return {"person_detected": False, "screen_detected": False, "error": "Invalid image"}
     np_arr = np.frombuffer(contents, np.uint8)
 
     person_detected = False

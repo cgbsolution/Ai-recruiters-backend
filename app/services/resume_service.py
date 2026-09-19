@@ -28,6 +28,34 @@ logger = logging.getLogger(__name__)
 
 # ── Text Extraction ───────────────────────────────────────────────────────────
 
+# Hard ceilings for untrusted documents. A resume or JD is a few pages and a
+# few hundred KB of XML; anything far beyond is either broken or an attack. A
+# 200 KB .docx "zip bomb" inflated to 463 MB inside python-docx (which reads
+# every part into memory), and a 10 MB one would take the whole single-worker
+# server — and every live interview — down with it.
+MAX_PDF_PAGES = 60
+MAX_DOCX_UNCOMPRESSED_BYTES = 60 * 1024 * 1024
+MAX_DOCX_COMPRESSION_RATIO = 200
+
+
+def check_docx_is_safe(file_path: str) -> None:
+    """Raise RuntimeError for a .docx whose parts would inflate to an unsafe
+    size. Reads only the zip directory, never the part contents."""
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(file_path) as zf:
+            infos = zf.infolist()
+    except zipfile.BadZipFile:
+        raise RuntimeError("This file is not a valid DOCX document.")
+    total = sum(max(0, i.file_size) for i in infos)
+    packed = sum(max(0, i.compress_size) for i in infos) or 1
+    if total > MAX_DOCX_UNCOMPRESSED_BYTES or (
+        total > 10 * 1024 * 1024 and total / packed > MAX_DOCX_COMPRESSION_RATIO
+    ):
+        raise RuntimeError("This DOCX file is too large to process. Please upload a smaller document or a PDF.")
+
+
 def extract_text_from_pdf(file_path: str) -> str:
     """Extract plain text from a PDF file using pdfplumber.
 
@@ -41,7 +69,7 @@ def extract_text_from_pdf(file_path: str) -> str:
         import pdfplumber
         text_parts = []
         with pdfplumber.open(file_path) as pdf:
-            for page in pdf.pages:
+            for page in pdf.pages[:MAX_PDF_PAGES]:
                 try:
                     page_text = page.dedupe_chars(tolerance=1).extract_text() or ""
                 except Exception:
@@ -61,11 +89,15 @@ def extract_text_from_pdf(file_path: str) -> str:
     except ImportError:
         raise RuntimeError("pdfplumber is not installed. Run: pip install pdfplumber")
     except Exception as exc:
-        raise RuntimeError(f"PDF extraction failed: {exc}") from exc
+        # These messages reach API responses; the parser's own text (which
+        # includes server file paths) goes to the log only.
+        logger.warning("PDF extraction failed for %s: %s", file_path, exc)
+        raise RuntimeError("Could not read this PDF file. It may be damaged or password-protected.") from exc
 
 
 def extract_text_from_docx(file_path: str) -> str:
     """Extract plain text from a DOCX file using python-docx."""
+    check_docx_is_safe(file_path)
     try:
         from docx import Document
         doc = Document(file_path)
@@ -74,7 +106,8 @@ def extract_text_from_docx(file_path: str) -> str:
     except ImportError:
         raise RuntimeError("python-docx is not installed. Run: pip install python-docx")
     except Exception as exc:
-        raise RuntimeError(f"DOCX extraction failed: {exc}") from exc
+        logger.warning("DOCX extraction failed for %s: %s", file_path, exc)
+        raise RuntimeError("Could not read this Word file. Please upload a .docx or PDF.") from exc
 
 
 def extract_text(file_path: str) -> str:

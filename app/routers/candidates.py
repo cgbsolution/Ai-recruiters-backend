@@ -32,9 +32,11 @@ from app.models.candidate import Candidate
 from app.models.organization import Organization
 from app.models.resume_metadata import ResumeMetadata
 from app.models.user import User
+from app.ratelimit import per_user_limit, user_or_ip_key
 from app.refs import CandidateId, JobId, encode_ref
 
-limiter = Limiter(key_func=get_remote_address)
+# Keyed on the signed-in user, not the (spoofable) forwarded client IP.
+limiter = Limiter(key_func=user_or_ip_key)
 
 
 def _get_candidate_with_org_check(db: Session, candidate_id: int, user: User) -> Candidate:
@@ -116,6 +118,26 @@ _RESUME_EXT_FOR_TYPE = {
     "application/msword": ".doc",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
 }
+
+
+def _download_stem(name: Optional[str]) -> str:
+    """File-name stem for a Content-Disposition header. The raw candidate name
+    (settable by anyone through the public /apply form) was pasted into the
+    header: a quote let it inject its own filename*= (downloading the
+    transcript as .html), and any non-Latin-1 name made the download 500."""
+    import re as _re
+
+    stem = _re.sub(r"[^A-Za-z0-9_-]+", "_", name or "").strip("_")[:80]
+    return stem or "candidate"
+
+
+MAX_RESUME_FILES_PER_UPLOAD = 200
+
+
+def _resume_upload_problem(file: UploadFile) -> Optional[str]:
+    from app.media import resume_upload_problem
+
+    return resume_upload_problem(file)
 
 
 def _stored_resume_name(file: UploadFile) -> str:
@@ -660,13 +682,17 @@ def update_candidate(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         import traceback
+        import uuid as _uuid
+        # Details go to the log only: the exception text carried the failing
+        # SQL statement and its bound parameters back to the browser.
+        error_id = _uuid.uuid4().hex
         logger.error(
-            "update_candidate(%s) failed: %s\n%s",
-            candidate_id, exc, traceback.format_exc()
+            "update_candidate(%s) failed [%s]: %s\n%s",
+            candidate_id, error_id, exc, traceback.format_exc()
         )
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to update candidate: {type(exc).__name__}: {exc}",
+            detail=f"Failed to update candidate. Please check the values and try again (error id {error_id}).",
         ) from exc
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
@@ -682,7 +708,7 @@ def update_candidate(
         )
         raise HTTPException(
             status_code=500,
-            detail=f"Candidate updated but response serialization failed: {type(exc).__name__}: {exc}",
+            detail="Candidate updated, but the updated record could not be returned. Please refresh.",
         ) from exc
 
 
@@ -915,11 +941,22 @@ async def upload_resumes(
 
     skipped_files: list[str] = []
 
+    if len(files) > MAX_RESUME_FILES_PER_UPLOAD:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Upload at most {MAX_RESUME_FILES_PER_UPLOAD} resumes at a time.",
+        )
+
     for file in files:
         if file.content_type not in ALLOWED_RESUME_TYPES:
             ext = Path(file.filename).suffix.upper() if file.filename else "Unknown"
             skipped_files.append(f"{file.filename} ({ext})")
             logger.warning("Skipped unsupported file: %s (type: %s)", file.filename, file.content_type)
+            continue
+        problem = _resume_upload_problem(file)
+        if problem:
+            skipped_files.append(f"{file.filename} ({problem})")
+            logger.warning("Skipped resume upload %s: %s", file.filename, problem)
             continue
 
         safe_name = _stored_resume_name(file)
@@ -1128,6 +1165,9 @@ async def replace_resume(
             status_code=400,
             detail=f"Unsupported file type ({ext}). Only PDF, DOC, and DOCX are accepted.",
         )
+    problem = _resume_upload_problem(file)
+    if problem:
+        raise HTTPException(status_code=400, detail=f"Resume rejected: {problem}.")
 
     safe_name = _stored_resume_name(file)
     new_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
@@ -1157,6 +1197,7 @@ async def replace_resume(
 
 @router.post(
     "/{candidate_id}/compute-fit-score",
+    dependencies=[Depends(per_user_limit("compute-fit-score", 20))],
     response_model=CandidateRead,
     summary="Recompute resume fit score using AI (deep analysis)",
     description=(
@@ -1182,6 +1223,8 @@ async def compute_fit_score(candidate_id: CandidateId, db: Session = Depends(get
 
 @router.post(
     "/batch-recompute-scores",
+    # One call can queue an LLM scoring run per candidate in the job.
+    dependencies=[Depends(per_user_limit("batch-recompute", 3, 10 * 60))],
     summary="Batch recompute fit scores for all candidates in a job",
     description=(
         "Re-runs smart scoring instantly for all candidates, then triggers "
@@ -1403,6 +1446,8 @@ async def _ai_fit_score_for_candidate(candidate: Candidate, db: Session, resume_
 
 @router.post(
     "/{candidate_id}/schedule-interview",
+    # Each call emails the candidate (plus CCs) from the platform's domain.
+    dependencies=[Depends(per_user_limit("schedule-interview", 30))],
     summary="Schedule / reschedule interview",
     description=(
         "Set the interview date/time for a candidate and trigger notifications.\n\n"
@@ -1699,6 +1744,9 @@ async def cancel_interview(
     # The emailed personal link must stop working; scheduling again issues a new one.
     rotate_invite_token(candidate)
     candidate.interview_link = None
+    # Likewise any observer link shared for this interview.
+    from app.services.observer_service import revoke_observer_tokens
+    revoke_observer_tokens(db, candidate.id)
     db.commit()
     db.refresh(candidate)
 
@@ -2018,6 +2066,9 @@ def retake_interview(
     candidate.enthusiasm_score = None
     candidate.conciseness_score = None
     candidate.ai_cheating_score = None
+    # An observer link shared for the old interview must not open the retake.
+    from app.services.observer_service import revoke_observer_tokens
+    revoke_observer_tokens(db, candidate.id)
 
     db.commit()
     db.refresh(candidate)
@@ -2064,6 +2115,7 @@ def promote_candidate(
 
 @router.post(
     "/{candidate_id}/send-whatsapp",
+    dependencies=[Depends(per_user_limit("send-whatsapp", 20))],
     summary="Send WhatsApp message",
     description="Send a custom free-form text message to the candidate via Meta WhatsApp Business Cloud API. Requires `WHATSAPP_TOKEN` and `WHATSAPP_PHONE_NUMBER_ID` in `.env`.",
 )
@@ -2446,6 +2498,7 @@ def get_evaluation(candidate_id: CandidateId, db: Session = Depends(get_db), use
 
 @router.post(
     "/{candidate_id}/regenerate-evaluation",
+    dependencies=[Depends(per_user_limit("regenerate-evaluation", 10))],
     summary="Force-regenerate AI evaluation for a completed session",
 )
 def regenerate_evaluation(
@@ -2685,7 +2738,7 @@ def download_evaluation_pdf(candidate_id: CandidateId, db: Session = Depends(get
         pdf_bytes = _build_evaluation_pdf_bytes(db, candidate)
     except ImportError:
         raise HTTPException(status_code=500, detail="fpdf2 package not installed")
-    safe_name = (candidate.name or "candidate").replace(" ", "_")
+    safe_name = _download_stem(candidate.name)
     return StreamingResponse(
         BytesIO(pdf_bytes),
         media_type="application/pdf",
@@ -2851,7 +2904,7 @@ def download_evaluation_docx(candidate_id: CandidateId, db: Session = Depends(ge
     buf = BytesIO()
     doc.save(buf)
     buf.seek(0)
-    safe_name = (candidate.name or "candidate").replace(" ", "_")
+    safe_name = _download_stem(candidate.name)
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -2912,7 +2965,7 @@ def download_transcript(candidate_id: CandidateId, db: Session = Depends(get_db)
 
     content = "\n".join(lines)
     buf = BytesIO(content.encode("utf-8"))
-    safe_name = (candidate.name or "candidate").replace(" ", "_")
+    safe_name = _download_stem(candidate.name)
     return StreamingResponse(
         buf,
         media_type="text/plain; charset=utf-8",
@@ -3042,6 +3095,7 @@ def revoke_observer_link(
 
 @router.post(
     "/{candidate_id}/observer-link/resend",
+    dependencies=[Depends(per_user_limit("observer-link-resend", 20))],
     summary="Email the observer link to the current user",
 )
 async def resend_observer_link(
