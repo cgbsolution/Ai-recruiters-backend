@@ -61,7 +61,20 @@ class Settings(BaseSettings):
     MAX_UPLOAD_SIZE_MB: int = 10
     APP_ENV: str = "development"
     SECRET_KEY: str = "change-me-in-production"
+    # Idle timeout: a login token lives this long and the frontend renews it
+    # (POST /auth/refresh) while the user is active, so only this much time
+    # WITHOUT activity signs someone out.
     SESSION_TIMEOUT_MINUTES: int = 60 * 24  # 24 hours — override via .env
+    # Hard ceiling on one sign-in, however active: renewals stop this many
+    # days after the password was entered. 0 disables the ceiling.
+    SESSION_MAX_LIFETIME_DAYS: int = 30
+    # Resume Database bulk parsing. AI concurrency is bounded by the LLM
+    # provider's rate limits; extract workers are separate processes (CPU
+    # heavy PDF reading kept away from the live-interview event loop).
+    RESUME_AI_CONCURRENCY: int = 4
+    RESUME_EXTRACT_WORKERS: int = 2
+    RESUME_EXTRACT_TIMEOUT_SECONDS: int = 90
+    RESUME_AI_TIMEOUT_SECONDS: int = 120
     # HMAC keys for signed media URLs (app.media) and opaque page-URL refs
     # (app.refs). Optional: when empty they are derived from SECRET_KEY with
     # domain separation. Rotating a key invalidates outstanding links/refs.

@@ -4,31 +4,37 @@ Resume Database — bulk upload, search, and manage the central resume store.
 This router is for the admin-facing "Resume Database" page. Resumes are
 uploaded here independently of any job opening. Supports two parsing modes:
 - "fast": Regex-based parser (no AI calls, < 1s per resume, ~85% accuracy)
-- "ai":   Claude AI parser (LLM call per resume, ~3s each, ~99% accuracy)
+- "ai":   Claude AI parser (one LLM call per resume, several seconds each,
+          RESUME_AI_CONCURRENCY at a time, ~99% accuracy)
 """
 
 import asyncio
-import concurrent.futures
 import csv
+import hashlib
 import io
 import json
 import logging
 import os
 import shutil
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, get_org_id, require_roles
 from app.authz import can_access_org
+from app.config import settings
 from app.database import get_db, SessionLocal
 from app.media import (
     UPLOAD_ROOT,
+    resolve_upload_file,
     resume_file_in_use,
     resume_upload_problem,
     safe_unlink_upload,
@@ -126,253 +132,494 @@ def _parse_failure_message(exc: Exception) -> str:
     return "Resume could not be parsed due to an internal error."
 
 # ── Background processing queue ──────────────────────────────────────────────
+#
+# Every uploaded file becomes a placeholder row plus a queue item. A worker
+# reads the file in a separate process (app.services.extraction_pool), parses
+# it (regex, or the LLM in AI mode) and saves the result under one lock.
+# Saving is where duplicates are merged; serializing it means two copies of
+# the same resume in flight can never both survive.
+#
+# The queue and the per-batch counters live in memory (the app runs a single
+# uvicorn process). Rows also carry batch_id + parse_mode, so after a restart
+# requeue_unfinished_bulk_rows() queues them again and GET /batch/{id}
+# reports from the database.
+
 _bulk_queue: asyncio.Queue = asyncio.Queue()
-_bulk_worker_started = False
-_bulk_progress: dict = {}  # batch_id -> {total, completed, failed, status, parse_mode}
+_bulk_workers: list = []  # strong refs: the loop only keeps weak ones to tasks
+_bulk_progress: dict = {}  # batch_id -> {total, completed, failed, replaced, status, parse_mode}
 
-_NUM_WORKERS = 4
-_executor = concurrent.futures.ThreadPoolExecutor(max_workers=_NUM_WORKERS)
-# Limit concurrent AI API calls to avoid rate-limiting (Gemini free tier = ~15 RPM)
-_ai_semaphore = asyncio.Semaphore(1)
+# Concurrent LLM calls. This was 1 (sized for the Gemini free tier) and the
+# 1 s rate-limit pause sat inside the slot, so AI mode parsed one resume at a
+# time — an 11k upload needed more than a day.
+_ai_semaphore = asyncio.Semaphore(max(1, settings.RESUME_AI_CONCURRENCY))
+_save_lock = asyncio.Lock()
+_NUM_WORKERS = max(settings.RESUME_AI_CONCURRENCY, settings.RESUME_EXTRACT_WORKERS) + 2
+
+# Rows to list: everything except placeholder rows that never parsed
+# (pending / processing / failed uploads).
+_NOT_UNPARSED_PLACEHOLDER = or_(
+    ~ResumeMetadata.candidate_email.like("%@pending.local"),
+    ResumeMetadata.parsing_status == "completed",
+)
+
+# Finished batches are dropped from memory after this long.
+_BATCH_RETENTION_SECONDS = 6 * 3600
+# Attempts for one resume when the LLM answers "rate limited" / "overloaded".
+_AI_RATE_LIMIT_ATTEMPTS = 3
+
+_PARSED_FIELDS = (
+    "phone", "current_designation", "experience_years", "skills", "education",
+    "certifications", "work_experience", "location", "personal_details",
+    "keywords", "summary",
+)
 
 
-def _update_batch_progress(batch_id: str, field: str):
-    """Increment a batch progress field and mark completed if done."""
-    if not batch_id or batch_id not in _bulk_progress:
+def _new_batch(batch_id: str, total: int, parse_mode: str, org_id: Optional[int]) -> None:
+    now = time.time()
+    for old_id in [b for b, p in _bulk_progress.items()
+                   if p.get("finished_at") and now - p["finished_at"] > _BATCH_RETENTION_SECONDS]:
+        _bulk_progress.pop(old_id, None)
+        _bulk_owner.pop(old_id, None)
+    _bulk_progress[batch_id] = {
+        "total": total,
+        "completed": 0,
+        "failed": 0,
+        "replaced": 0,
+        "status": "processing",
+        "parse_mode": parse_mode,
+    }
+    _bulk_owner[batch_id] = org_id
+
+
+def _record_outcome(batch_id: str, outcome: str) -> None:
+    """Count one file of a batch: "completed", "replaced" (completed, and an
+    older copy of the same resume was replaced) or "failed"."""
+    p = _bulk_progress.get(batch_id)
+    if p is None:
         return
-    _bulk_progress[batch_id][field] += 1
-    p = _bulk_progress[batch_id]
-    if (p["completed"] + p["failed"]) >= p["total"]:
+    if outcome == "failed":
+        p["failed"] += 1
+    else:
+        p["completed"] += 1
+        if outcome == "replaced":
+            p["replaced"] += 1
+    if p["status"] != "completed" and p["completed"] + p["failed"] >= p["total"]:
         p["status"] = "completed"
+        p["finished_at"] = time.time()
 
 
-def _parse_single_resume(meta_id: int, file_path: str, batch_id: str):
+def _org_rows(db: Session, org_id: Optional[int]):
+    """ResumeMetadata rows of one organization — org-less rows only match
+    other org-less rows, so nothing is ever merged across tenants."""
+    q = db.query(ResumeMetadata)
+    if org_id is not None:
+        return q.filter(ResumeMetadata.organization_id == org_id)
+    return q.filter(ResumeMetadata.organization_id.is_(None))
+
+
+def _same_file_copies(db: Session, meta: ResumeMetadata) -> list:
+    """Other finished rows of the org holding these exact bytes. Copies still
+    queued are left alone: they merge themselves when their turn comes."""
+    if not meta.file_hash:
+        return []
+    return _org_rows(db, meta.organization_id).filter(
+        ResumeMetadata.id != meta.id,
+        ResumeMetadata.file_hash == meta.file_hash,
+        ResumeMetadata.parsing_status.in_(("completed", "failed")),
+    ).all()
+
+
+def _replace_older_copies(db: Session, target: ResumeMetadata, losers: list, new_file: str) -> List[str]:
+    """Fold `losers` (older records of the same resume) into `target`:
+    candidates linked to them are relinked to `target`, then the rows are
+    deleted. Returns their files, to delete once nothing references them."""
+    from app.models.candidate import Candidate
+
+    if not losers:
+        return []
+    db.query(Candidate).filter(Candidate.resume_metadata_id.in_([m.id for m in losers])).update(
+        {"resume_metadata_id": target.id}, synchronize_session=False
+    )
+    stale = [m.resume_file_path for m in losers if m.resume_file_path and m.resume_file_path != new_file]
+    for m in losers:
+        db.delete(m)
+    db.flush()
+    return stale
+
+
+def _claim_bulk_row(meta_id: int, file_path: str, batch_id: str, parse_mode: str) -> Optional[str]:
+    """First step for a queue item (runs under _save_lock).
+
+    Returns None when the file must be read and parsed (the row is then marked
+    processing). Otherwise the item is finished here:
+    - "replaced": the org already holds a parsed copy of these exact bytes.
+      That record now points at the new upload, the placeholder and the old
+      file are removed — no re-read, no second LLM call.
+    - "superseded": another upload of the same person already merged into this
+      row (so this file was replaced by a newer one).
+    - "missing": the row was deleted meanwhile (Clear All / Cleanup).
     """
-    Parse a single resume using fast regex parser.
-    Runs in a THREAD POOL so it doesn't block the event loop.
-    """
-    from app.services.resume_service import extract_text
-    from app.services.fast_resume_parser import fast_parse_resume
-
     db = SessionLocal()
     try:
         meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
-        if not meta:
-            _update_batch_progress(batch_id, "failed")
-            return
+        if meta is None:
+            return "missing"
+        if meta.parsing_status != "pending" or meta.resume_file_path != file_path:
+            return "superseded"
+
+        copies = _same_file_copies(db, meta)
+        reusable = [
+            c for c in copies
+            if c.parsing_status == "completed"
+            # Choosing AI mode means wanting the AI parse: a regex-parsed copy
+            # is re-parsed rather than reused.
+            and (parse_mode != "ai" or c.parse_mode == "ai")
+        ]
+        if reusable:
+            target = max(reusable, key=lambda c: c.id)
+            previous_file = target.resume_file_path
+            losers = [c for c in copies if c.id != target.id] + [meta]
+            stale = _replace_older_copies(db, target, losers, file_path)
+            if previous_file and previous_file != file_path:
+                stale.append(previous_file)
+            target.resume_file_path = file_path
+            target.batch_id = batch_id
+            target.updated_at = datetime.utcnow()
+            db.commit()
+            _remove_unused_resume_files(stale)
+            return "replaced"
 
         meta.parsing_status = "processing"
+        meta.parsing_error = None
         db.commit()
-
-        raw_text = extract_text(file_path)
-        if not raw_text or len(raw_text.strip()) < 20:
-            meta.parsing_status = "failed"
-            meta.parsing_error = "Could not extract meaningful text from file"
-            db.commit()
-            _update_batch_progress(batch_id, "failed")
-            return
-
-        parsed = fast_parse_resume(raw_text)
-        parsed_email = parsed.get("candidate_email")
-
-        # Deduplication (org-scoped: never merges across organizations; rows
-        # without an organization only dedupe against other org-less rows)
-        target = meta
-        replaced_file = None
-        if parsed_email and meta.candidate_email != parsed_email:
-            dedup_query = db.query(ResumeMetadata).filter(
-                ResumeMetadata.candidate_email == parsed_email,
-                ResumeMetadata.id != meta.id,
-            )
-            if meta.organization_id is not None:
-                dedup_query = dedup_query.filter(ResumeMetadata.organization_id == meta.organization_id)
-            else:
-                dedup_query = dedup_query.filter(ResumeMetadata.organization_id.is_(None))
-            existing = dedup_query.first()
-            if existing:
-                target = existing
-                if existing.resume_file_path and existing.resume_file_path != file_path:
-                    replaced_file = existing.resume_file_path
-                db.delete(meta)
-                db.flush()
-            else:
-                meta.candidate_email = parsed_email
-
-        target.candidate_name = parsed.get("candidate_name") or target.candidate_name
-        target.phone = parsed.get("phone")
-        target.current_designation = parsed.get("current_designation")
-        target.experience_years = parsed.get("experience_years")
-        target.skills = json.dumps(parsed.get("skills", []))
-        target.education = json.dumps(parsed.get("education", []))
-        target.certifications = json.dumps(parsed.get("certifications", []))
-        target.work_experience = json.dumps(parsed.get("work_experience", []))
-        target.location = parsed.get("location")
-        target.personal_details = json.dumps(parsed.get("personal_details") or {})
-        target.keywords = json.dumps(parsed.get("keywords", []))
-        target.summary = parsed.get("summary")
-        target.raw_text = raw_text
-        target.resume_file_path = file_path
-        target.parsing_status = "completed"
-        target.parsed_at = datetime.utcnow()
-        db.commit()
-
-        # The merged record now points at the new upload: drop its old file
-        # unless another row (e.g. a hired candidate) still uses it.
-        if replaced_file:
-            _remove_resume_file_if_unused(db, replaced_file)
-
-        _update_batch_progress(batch_id, "completed")
-
-    except Exception as exc:
-        logger.error("Bulk parse failed for meta %s: %s", meta_id, exc, exc_info=True)
-        try:
-            meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
-            if meta:
-                meta.parsing_status = "failed"
-                meta.parsing_error = _parse_failure_message(exc)
-                db.commit()
-        except Exception:
-            pass
-        _update_batch_progress(batch_id, "failed")
+        return None
     finally:
         db.close()
 
 
-async def _ai_parse_single_resume(meta_id: int, file_path: str, batch_id: str):
-    """
-    Parse a single resume using Claude AI — high accuracy.
-    Runs as an async coroutine (AI API call is async).
-    """
-    from app.services.resume_service import extract_text, parse_resume
+def _file_sha256(stored_path: Optional[str]) -> Optional[str]:
+    full = resolve_upload_file(stored_path, ("resumes",))
+    if not full:
+        return None
+    digest = hashlib.sha256()
+    try:
+        with open(full, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _save_parsed_once(db: Session, meta_id: int, file_path: str, batch_id: str, parse_mode: str,
+                      raw_text: str, fields: dict) -> str:
+    from app.services.fast_resume_parser import is_role_mailbox
+
+    meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
+    if meta is None:
+        return "failed"
+    new_hash = meta.file_hash
+    # The email written on the resume is the candidate's identity. A shared
+    # inbox (a vendor's "resumes@...", a company "hr@...") is not: keyed on it,
+    # every resume carrying that header would collapse into one record.
+    email = (fields.get("email") or "").strip() or None
+    if email and is_role_mailbox(email):
+        email = None
+
+    # The same person (email, case-insensitive) or the same file (hash) seen
+    # before in this org: the newest upload wins and the older record + file go.
+    email_match = None
+    if email:
+        email_match = _org_rows(db, meta.organization_id).filter(
+            ResumeMetadata.id != meta.id,
+            func.lower(ResumeMetadata.candidate_email) == email.lower(),
+        ).order_by(ResumeMetadata.id.desc()).first()
+    copies = _same_file_copies(db, meta)
+    if email_match is not None:
+        target = email_match
+    else:
+        parsed_copies = [c for c in copies if c.parsing_status == "completed"]
+        target = max(parsed_copies, key=lambda c: c.id) if parsed_copies else meta
+
+    losers = [c for c in copies if c.id != target.id]
+    if target is not meta:
+        losers.append(meta)
+    previous_file = target.resume_file_path if target is not meta else None
+    stale = _replace_older_copies(db, target, losers, file_path)
+    if previous_file and previous_file != file_path:
+        stale.append(previous_file)
+
+    # Records stored before file fingerprints existed: fingerprint the old file
+    # now. Same bytes re-uploaded in fast mode must not overwrite an AI parse
+    # with the less accurate regex one (e.g. resumes an earlier AI run already
+    # parsed, uploaded again in fast mode).
+    if target is not meta and target.file_hash is None and previous_file:
+        target.file_hash = _file_sha256(previous_file)
+    keep_existing_parse = (
+        target is not meta
+        and new_hash is not None
+        and target.file_hash == new_hash
+        and parse_mode == "fast"
+        and target.parse_mode != "fast"
+        and target.parsing_status == "completed"
+    )
+    if keep_existing_parse:
+        target.resume_file_path = file_path
+        target.batch_id = batch_id
+        target.updated_at = datetime.utcnow()
+        db.commit()
+        _remove_unused_resume_files(stale)
+        return "replaced"
+
+    if target is meta and email:
+        meta.candidate_email = email
+    target.candidate_name = fields.get("name") or target.candidate_name
+    target.phone = fields.get("phone")
+    target.current_designation = fields.get("current_designation")
+    target.experience_years = fields.get("experience_years")
+    target.skills = json.dumps(fields.get("skills") or [])
+    target.education = json.dumps(fields.get("education") or [])
+    target.certifications = json.dumps(fields.get("certifications") or [])
+    target.work_experience = json.dumps(fields.get("work_experience") or [])
+    target.location = fields.get("location")
+    target.personal_details = json.dumps(fields.get("personal_details") or {})
+    target.keywords = json.dumps(fields.get("keywords") or [])
+    target.summary = fields.get("summary")
+    target.raw_text = raw_text
+    target.resume_file_path = file_path
+    target.file_hash = new_hash
+    target.batch_id = batch_id
+    target.parse_mode = parse_mode
+    target.parsing_status = "completed"
+    target.parsing_error = None
+    target.parsed_at = datetime.utcnow()
+    db.commit()
+
+    # Old files go only once no other row (e.g. a hired candidate) uses them.
+    _remove_unused_resume_files(stale)
+    return "replaced" if losers else "completed"
+
+
+def _save_parsed(meta_id: int, file_path: str, batch_id: str, parse_mode: str,
+                 raw_text: str, fields: dict) -> str:
+    """Store a parse result, merging older copies (runs under _save_lock).
+    Returns "completed", "replaced" or "failed"."""
+    for attempt in (1, 2):
+        db = SessionLocal()
+        try:
+            return _save_parsed_once(db, meta_id, file_path, batch_id, parse_mode, raw_text, fields)
+        except IntegrityError:
+            # Another code path (e.g. a candidate application) stored the same
+            # email meanwhile; on the retry the email lookup finds that row.
+            db.rollback()
+            if attempt == 2:
+                raise
+        finally:
+            db.close()
+    return "failed"  # unreachable
+
+
+def _mark_failed(meta_id: int, message: str) -> None:
+    db = SessionLocal()
+    try:
+        meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
+        if meta is not None:
+            meta.parsing_status = "failed"
+            meta.parsing_error = message[:500]
+            db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning("Could not mark resume %s as failed: %s", meta_id, exc)
+    finally:
+        db.close()
+
+
+def _fields_from_fast(parsed: dict) -> dict:
+    fields = {k: parsed.get(k) for k in _PARSED_FIELDS}
+    fields["email"] = parsed.get("candidate_email")
+    fields["name"] = parsed.get("candidate_name")
+    return fields
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    name = type(exc).__name__.lower()
+    return status in (429, 529) or "ratelimit" in name or "overloaded" in name or "resourceexhausted" in name
+
+
+async def _fields_from_ai(raw_text: str) -> dict:
     from app.schemas.ai import ParseResumeRequest
+    from app.services.resume_service import parse_resume
 
-    db = SessionLocal()
-    try:
-        meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
-        if not meta:
-            _update_batch_progress(batch_id, "failed")
-            return
-
-        meta.parsing_status = "processing"
-        db.commit()
-
-        # Extract text in thread (sync I/O)
-        raw_text = await asyncio.to_thread(extract_text, file_path)
-        if not raw_text or len(raw_text.strip()) < 20:
-            meta.parsing_status = "failed"
-            meta.parsing_error = "Could not extract meaningful text from file"
-            db.commit()
-            _update_batch_progress(batch_id, "failed")
-            return
-
-        # AI parse (async LLM call)
-        req = ParseResumeRequest(resume_text=raw_text)
-        result = await parse_resume(req)
-        data = result.parsed_data.model_dump()
-
-        parsed_email = data.get("email")
-
-        # Deduplication (org-scoped: never merges across organizations; rows
-        # without an organization only dedupe against other org-less rows)
-        target = meta
-        replaced_file = None
-        if parsed_email and meta.candidate_email != parsed_email:
-            dedup_query = db.query(ResumeMetadata).filter(
-                ResumeMetadata.candidate_email == parsed_email,
-                ResumeMetadata.id != meta.id,
-            )
-            if meta.organization_id is not None:
-                dedup_query = dedup_query.filter(ResumeMetadata.organization_id == meta.organization_id)
-            else:
-                dedup_query = dedup_query.filter(ResumeMetadata.organization_id.is_(None))
-            existing = dedup_query.first()
-            if existing:
-                target = existing
-                if existing.resume_file_path and existing.resume_file_path != file_path:
-                    replaced_file = existing.resume_file_path
-                db.delete(meta)
-                db.flush()
-            else:
-                meta.candidate_email = parsed_email
-
-        target.candidate_name = data.get("name") or target.candidate_name
-        target.phone = data.get("phone")
-        target.current_designation = data.get("current_designation")
-        target.experience_years = data.get("experience_years")
-        target.skills = json.dumps(data.get("skills") or [])
-        target.education = json.dumps(data.get("education") or [])
-        target.certifications = json.dumps(data.get("certifications") or [])
-        target.work_experience = json.dumps(data.get("work_experience") or [])
-        target.location = data.get("location")
-        target.personal_details = json.dumps(data.get("personal_details") or {})
-        target.keywords = json.dumps(data.get("keywords") or [])
-        target.summary = data.get("summary")
-        target.raw_text = raw_text
-        target.resume_file_path = file_path
-        target.parsing_status = "completed"
-        target.parsed_at = datetime.utcnow()
-        db.commit()
-
-        # The merged record now points at the new upload: drop its old file
-        # unless another row (e.g. a hired candidate) still uses it.
-        if replaced_file:
-            _remove_resume_file_if_unused(db, replaced_file)
-
-        _update_batch_progress(batch_id, "completed")
-
-        # Small delay between AI calls to respect rate limits
-        await asyncio.sleep(1)
-
-    except Exception as exc:
-        logger.error("AI parse failed for meta %s: %s", meta_id, exc, exc_info=True)
+    timeout = max(10, settings.RESUME_AI_TIMEOUT_SECONDS)
+    for attempt in range(1, _AI_RATE_LIMIT_ATTEMPTS + 1):
         try:
-            meta = db.query(ResumeMetadata).filter(ResumeMetadata.id == meta_id).first()
-            if meta:
-                meta.parsing_status = "failed"
-                meta.parsing_error = _parse_failure_message(exc)
-                db.commit()
-        except Exception:
-            pass
-        _update_batch_progress(batch_id, "failed")
-    finally:
-        db.close()
+            async with _ai_semaphore:
+                # The SDK's own timeout is 10 minutes (plus retries); one stalled
+                # request used to hold the only parse slot that long.
+                result = await asyncio.wait_for(parse_resume(ParseResumeRequest(resume_text=raw_text)), timeout)
+            break
+        except asyncio.TimeoutError:
+            raise RuntimeError("AI parsing timed out. Upload this resume again to retry.")
+        except Exception as exc:
+            if attempt < _AI_RATE_LIMIT_ATTEMPTS and _is_rate_limited(exc):
+                logger.warning("LLM rate-limited during bulk parse (attempt %d); backing off", attempt)
+                await asyncio.sleep(15 * attempt)  # outside the slot, so it is not held idle
+                continue
+            raise
+    data = result.parsed_data.model_dump()
+    fields = {k: data.get(k) for k in _PARSED_FIELDS}
+    fields["email"] = data.get("email")
+    fields["name"] = data.get("name")
+    return fields
+
+
+async def _process_bulk_item(meta_id: int, file_path: str, batch_id: str, parse_mode: str) -> None:
+    from app.services.extraction_pool import extract_text_isolated
+
+    async with _save_lock:
+        claim = await asyncio.to_thread(_claim_bulk_row, meta_id, file_path, batch_id, parse_mode)
+    if claim is not None:
+        _record_outcome(batch_id, "failed" if claim == "missing" else "replaced")
+        return
+
+    try:
+        raw_text, fast_parsed = await extract_text_isolated(file_path, fast_parse=(parse_mode != "ai"))
+        if not raw_text or len(raw_text.strip()) < 20:
+            raise ValueError("Could not extract meaningful text from file")
+        if parse_mode == "ai":
+            fields = await _fields_from_ai(raw_text)
+        else:
+            fields = _fields_from_fast(fast_parsed or {})
+        async with _save_lock:
+            outcome = await asyncio.to_thread(
+                _save_parsed, meta_id, file_path, batch_id, parse_mode, raw_text, fields
+            )
+    except Exception as exc:
+        if isinstance(exc, (RuntimeError, ValueError)):
+            logger.warning("Bulk parse failed for resume %s (%s): %s", meta_id, os.path.basename(file_path), exc)
+        else:
+            logger.error("Bulk parse failed for resume %s: %s", meta_id, exc, exc_info=True)
+        await asyncio.to_thread(_mark_failed, meta_id, _parse_failure_message(exc))
+        outcome = "failed"
+    _record_outcome(batch_id, outcome)
 
 
 async def _bulk_parse_worker():
-    """
-    Process bulk resume parse jobs from the queue.
-    Dispatches to regex (thread pool) or AI (async) based on parse_mode.
-    """
-    loop = asyncio.get_event_loop()
-
     while True:
-        item = await _bulk_queue.get()
-        meta_id, file_path, batch_id = item[0], item[1], item[2]
-        parse_mode = item[3] if len(item) > 3 else "fast"
-
+        meta_id, file_path, batch_id, parse_mode = await _bulk_queue.get()
         try:
-            if parse_mode == "ai":
-                # Serialize AI calls to avoid rate-limiting
-                async with _ai_semaphore:
-                    await _ai_parse_single_resume(meta_id, file_path, batch_id)
-            else:
-                await loop.run_in_executor(
-                    _executor, _parse_single_resume, meta_id, file_path, batch_id
-                )
-        except Exception as exc:
-            logger.error("Worker error for meta %s: %s", meta_id, exc)
+            await _process_bulk_item(meta_id, file_path, batch_id, parse_mode)
+        except Exception as exc:  # never let a worker die
+            logger.error("Bulk worker error for resume %s: %s", meta_id, exc, exc_info=True)
+            _record_outcome(batch_id, "failed")
         finally:
             _bulk_queue.task_done()
 
 
 def _ensure_bulk_worker():
-    """Start background bulk parse workers if not already running."""
-    global _bulk_worker_started
-    if not _bulk_worker_started:
-        _bulk_worker_started = True
-        loop = asyncio.get_event_loop()
-        for _ in range(_NUM_WORKERS):
-            loop.create_task(_bulk_parse_worker())
+    """Start the background parse workers once, on the running loop."""
+    if _bulk_workers:
+        return
+    loop = asyncio.get_running_loop()
+    for _ in range(_NUM_WORKERS):
+        _bulk_workers.append(loop.create_task(_bulk_parse_worker()))
+
+
+def _reset_unfinished_bulk_rows() -> list:
+    db = SessionLocal()
+    try:
+        unfinished = (
+            ResumeMetadata.batch_id.isnot(None),
+            ResumeMetadata.parsing_status.in_(("pending", "processing")),
+            ResumeMetadata.resume_file_path.isnot(None),
+        )
+        items = (
+            db.query(ResumeMetadata.id, ResumeMetadata.resume_file_path,
+                     ResumeMetadata.batch_id, ResumeMetadata.parse_mode)
+            .filter(*unfinished)
+            .order_by(ResumeMetadata.id)
+            .all()
+        )
+        # "processing" rows were mid-parse when the server stopped.
+        db.query(ResumeMetadata).filter(*unfinished).filter(
+            ResumeMetadata.parsing_status == "processing"
+        ).update({"parsing_status": "pending"}, synchronize_session=False)
+        db.commit()
+        return [(i, path, batch, mode if mode in ("fast", "ai") else "fast") for i, path, batch, mode in items]
+    finally:
+        db.close()
+
+
+async def requeue_unfinished_bulk_rows() -> int:
+    """Startup: queue again the bulk rows a restart left unfinished."""
+    items = await asyncio.to_thread(_reset_unfinished_bulk_rows)
+    if not items:
+        return 0
+    _ensure_bulk_worker()
+    for item in items:
+        _bulk_queue.put_nowait(item)
+    logger.info("Re-queued %d unfinished bulk resume parse(s) after restart", len(items))
+    return len(items)
+
+
+def _save_upload_with_hash(upload: UploadFile, file_path: str) -> str:
+    """Write the upload to `file_path` (never overwriting) and return the
+    SHA-256 of its bytes."""
+    digest = hashlib.sha256()
+    with open(file_path, "xb") as out:
+        while True:
+            chunk = upload.file.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            out.write(chunk)
+    return digest.hexdigest()
+
+
+def _store_bulk_uploads(db: Session, files: List[UploadFile], batch_id: str, parse_mode: str,
+                        org_id: Optional[int]) -> Tuple[list, list]:
+    """Save each file and its pending row. Returns (queue items, skipped files)."""
+    queued, skipped = [], []
+    for file in files:
+        name = file.filename or "resume"
+        if file.content_type not in ALLOWED_RESUME_TYPES:
+            skipped.append({"file": name, "reason": "not a PDF, DOC or DOCX file"})
+            continue
+        problem = resume_upload_problem(file)
+        if problem:
+            logger.warning("Skipped bulk resume %s: %s", name, problem)
+            skipped.append({"file": name, "reason": problem})
+            continue
+
+        safe_name = _stored_resume_name(name, default_ext=ALLOWED_RESUME_TYPES[file.content_type])
+        file_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
+        try:
+            file_hash = _save_upload_with_hash(file, file_path)
+            meta = ResumeMetadata(
+                # Unique placeholder until parsing finds the real email (the
+                # old name-derived one could collide within one batch).
+                candidate_email=f"noemail_{uuid.uuid4().hex}@pending.local",
+                candidate_name=Path(name).stem.replace("_", " ").replace("-", " ").title(),
+                resume_file_path=file_path,
+                file_hash=file_hash,
+                batch_id=batch_id,
+                parse_mode=parse_mode,
+                parsing_status="pending",
+                organization_id=org_id,
+            )
+            db.add(meta)
+            db.flush()
+            meta_id = meta.id
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            logger.error("Could not store bulk resume %s: %s", name, exc)
+            safe_unlink_upload(file_path, ("resumes",))
+            skipped.append({"file": name, "reason": "could not be saved"})
+            continue
+        queued.append((meta_id, file_path, batch_id, parse_mode))
+    return queued, skipped
 
 
 # ── Bulk Upload ──────────────────────────────────────────────────────────────
@@ -395,11 +642,12 @@ def get_resume_db_permissions(
     "/upload",
     summary="Upload resumes to the central database (bulk)",
     description=(
-        "Upload one or more resume files (PDF/DOC/DOCX). Files are saved and "
-        "queued for fast regex-based parsing (no AI). Each resume takes < 1 second "
-        "to parse. Returns a batch_id to track progress.\n\n"
-        "Duplicate detection: if a file yields an email that already exists in "
-        "the database, the existing record is updated with the new resume."
+        "Upload up to 100 resume files (PDF/DOC/DOCX) per request. Files are "
+        "saved and queued for background parsing ('fast' regex or 'ai'). "
+        "Returns a batch_id to track progress.\n\n"
+        "Duplicates: a file whose bytes match an earlier upload, or whose email "
+        "matches an existing record, replaces that record — the older record "
+        "and its file are removed."
     ),
 )
 async def upload_resumes(
@@ -421,60 +669,28 @@ async def upload_resumes(
             detail="Maximum 100 files per upload batch. Upload in smaller batches."
         )
 
-    import uuid
     batch_id = uuid.uuid4().hex[:12]
-    _bulk_progress[batch_id] = {
-        "total": len(files),
-        "completed": 0,
-        "failed": 0,
-        "status": "processing",
-        "parse_mode": parse_mode,
-    }
-    _bulk_owner[batch_id] = user.organization_id
+    _new_batch(batch_id, len(files), parse_mode, user.organization_id)
 
-    created_ids = []
-
-    for file in files:
-        if file.content_type not in ALLOWED_RESUME_TYPES:
-            _bulk_progress[batch_id]["total"] -= 1
-            _bulk_progress[batch_id]["failed"] += 1
-            continue
-        # Size cap and real file-type check (this route had neither).
-        problem = resume_upload_problem(file)
-        if problem:
-            logger.warning("Skipped bulk resume %s: %s", file.filename, problem)
-            _bulk_progress[batch_id]["total"] -= 1
-            _bulk_progress[batch_id]["failed"] += 1
-            continue
-
-        # Save file to disk under a sanitized, server-chosen name
-        safe_name = _stored_resume_name(file.filename, default_ext=ALLOWED_RESUME_TYPES[file.content_type])
-        file_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
-        with open(file_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-
-        # Create a pending metadata record
-        placeholder_email = f"noemail_{safe_name[:30]}@pending.local"
-        meta = ResumeMetadata(
-            candidate_email=placeholder_email,
-            candidate_name=Path(file.filename).stem.replace("_", " ").replace("-", " ").title(),
-            resume_file_path=file_path,
-            parsing_status="pending",
-            organization_id=user.organization_id,
-        )
-        db.add(meta)
-        db.commit()
-        db.refresh(meta)
-        created_ids.append(meta.id)
-
-        # Queue for background parsing
-        await _bulk_queue.put((meta.id, file_path, batch_id, parse_mode))
+    # Writing up to 100 files and their rows is blocking disk + DB work: done
+    # in a thread so live interviews on this event loop never stall behind it.
+    queued, skipped = await asyncio.to_thread(
+        _store_bulk_uploads, db, files, batch_id, parse_mode, user.organization_id
+    )
+    # Skipped files count as failed. Total stays len(files): it used to be
+    # decremented as well, so a batch reported "completed" too early — and one
+    # where every file was skipped never completed, freezing the upload screen.
+    for _ in skipped:
+        _record_outcome(batch_id, "failed")
+    for item in queued:
+        _bulk_queue.put_nowait(item)
 
     return {
         "batch_id": batch_id,
-        "queued": len(created_ids),
+        "queued": len(queued),
         "total_files": len(files),
-        "message": f"Queued {len(created_ids)} resume(s) for parsing. Use GET /resume-database/batch/{batch_id} to track progress.",
+        "skipped": skipped,
+        "message": f"Queued {len(queued)} resume(s) for parsing. Use GET /resume-database/batch/{batch_id} to track progress.",
     }
 
 
@@ -484,11 +700,37 @@ async def upload_resumes(
     "/batch/{batch_id}",
     summary="Check bulk upload batch progress",
 )
-def get_batch_progress(batch_id: str, user: User = Depends(get_current_user)):
-    # Only the uploader's organization (or a global super admin) may poll a batch
-    if batch_id not in _bulk_progress or not can_access_org(user, _bulk_owner.get(batch_id)):
+def get_batch_progress(batch_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    progress = _bulk_progress.get(batch_id)
+    if progress is not None:
+        # Only the uploader's organization (or a global super admin) may poll a batch
+        if not can_access_org(user, _bulk_owner.get(batch_id)):
+            raise HTTPException(status_code=404, detail="Batch not found")
+        return progress
+
+    # Not in memory: the server restarted since the upload. Report from the
+    # rows (requeue_unfinished_bulk_rows picked the unfinished ones back up).
+    rows = (
+        db.query(ResumeMetadata.organization_id, ResumeMetadata.parsing_status, func.count(ResumeMetadata.id))
+        .filter(ResumeMetadata.batch_id == batch_id)
+        .group_by(ResumeMetadata.organization_id, ResumeMetadata.parsing_status)
+        .all()
+    )
+    if not rows or not all(can_access_org(user, org_id) for org_id, _, _ in rows):
         raise HTTPException(status_code=404, detail="Batch not found")
-    return _bulk_progress[batch_id]
+    counts: dict = {}
+    for _, status, n in rows:
+        counts[status] = counts.get(status, 0) + n
+    unfinished = counts.get("pending", 0) + counts.get("processing", 0)
+    return {
+        "total": sum(counts.values()),
+        "completed": counts.get("completed", 0),
+        "failed": counts.get("failed", 0),
+        "replaced": 0,
+        "status": "processing" if unfinished else "completed",
+        "parse_mode": None,
+        "recovered": True,
+    }
 
 
 # ── Failed Resumes ──────────────────────────────────────────────────────────
@@ -598,10 +840,9 @@ def list_resumes(
     if org_id is not None:
         query = query.filter(ResumeMetadata.organization_id == org_id)
 
-    # Exclude stale placeholder records (never parsed)
-    query = query.filter(
-        ~ResumeMetadata.candidate_email.like("%@pending.local")
-    )
+    # Exclude placeholder records that never parsed. A parsed resume with no
+    # usable email keeps its placeholder email and is listed (shown as "—").
+    query = query.filter(_NOT_UNPARSED_PLACEHOLDER)
 
     # Filter by parsing status
     if status and status != "all":
@@ -671,8 +912,8 @@ def list_resumes(
 def get_stats(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     org_id = get_org_id(user)
 
-    # Base filter: exclude stale placeholder records
-    base_filters = [~ResumeMetadata.candidate_email.like("%@pending.local")]
+    # Base filter: exclude placeholder records that never parsed
+    base_filters = [_NOT_UNPARSED_PLACEHOLDER]
     if org_id is not None:
         base_filters.append(ResumeMetadata.organization_id == org_id)
 

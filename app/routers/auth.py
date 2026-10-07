@@ -7,9 +7,10 @@ import threading
 import time
 from datetime import datetime, timedelta
 from html import escape as html_escape
-from typing import Optional
+from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 from slowapi import Limiter
@@ -20,11 +21,13 @@ from app.auth import (
     ALGORITHM,
     burn_password_check,
     create_access_token,
+    decode_access_token,
     get_current_user,
     get_org_id,
     hash_password,
     password_problem,
     require_roles,
+    security,
     verify_password,
 )
 from app.config import settings
@@ -277,6 +280,42 @@ def login(request: Request, body: SignInRequest, db: Session = Depends(get_db)):
             "organization_name": org_name,
         },
     )
+
+
+# ── Refresh (sliding session) ────────────────────────────────────────────────
+
+@router.post("/refresh")
+def refresh_session(
+    credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(security)],
+    user: User = Depends(get_current_user),
+):
+    """Renew the login token while the user is active.
+
+    The frontend calls this every few minutes while someone is using the app
+    (or a long job such as a bulk upload is running), so a session ends after
+    SESSION_TIMEOUT_MINUTES *without activity* instead of a fixed time after
+    sign-in. get_current_user has already refused expired tokens, tokens from
+    before a password change and users of a suspended organization."""
+    payload = decode_access_token(credentials.credentials)
+    auth_time = payload.get("auth_time")
+    if not isinstance(auth_time, (int, float)):
+        # Issued before auth_time existed: it was minted one lifetime before exp.
+        auth_time = int(payload["exp"]) - settings.SESSION_TIMEOUT_MINUTES * 60
+    max_days = settings.SESSION_MAX_LIFETIME_DAYS
+    if max_days > 0 and time.time() - auth_time > max_days * 86400:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Your session has expired. Please sign in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return {
+        "access_token": create_access_token(
+            user.id, user.role.value, org_id=user.organization_id,
+            password_hash=user.password_hash, auth_time=int(auth_time),
+        ),
+        "token_type": "bearer",
+        "expires_in": settings.SESSION_TIMEOUT_MINUTES * 60,
+    }
 
 
 # ── Me ───────────────────────────────────────────────────────────────────────

@@ -364,8 +364,26 @@ def _split_sections(text: str) -> dict[str, str]:
 # Basic Info Extraction
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Shared / role mailboxes — a consultancy's header ("resumes@vendor.com"), a
+# company's HR address, a referee's office inbox. Never the candidate. The
+# email is the candidate's identity in the Resume Database (a re-upload with
+# the same email replaces the older record), so picking one of these would
+# merge different people and delete all but one of them.
+_ROLE_MAILBOX = re.compile(
+    r"(?:info|hr|careers?|jobs?|recruit\w*|hiring|talent\w*|no-?reply|do-?not-?reply|"
+    r"support|admin|contact|enquir\w*|resumes?|cv|placements?|sales|office|mail)"
+)
+
+
+def is_role_mailbox(email: Optional[str]) -> bool:
+    """True for a shared inbox (hr@, careers@, resumes@, noreply@ ...)."""
+    return bool(email) and "@" in email and bool(_ROLE_MAILBOX.fullmatch(email.split("@", 1)[0].strip().lower()))
+
+
 def extract_email(text: str) -> Optional[str]:
-    """Extract the first email address from text.
+    """Extract the candidate's email address from text: the first address,
+    skipping role mailboxes (hr@, careers@, noreply@ ...) when the text also
+    has a personal one.
 
     Tolerates whitespace inserted around `@` or `.` by PDF text extractors
     (common with Canva / InDesign exports — e.g. ``foo @gmail.com``).
@@ -377,20 +395,27 @@ def extract_email(text: str) -> Optional[str]:
     # a long run scanned to its end — quadratic, 8 s for one 16,000-character
     # token; bounded but run over the whole text it was still ~26 µs a char.
     pattern = r"[a-zA-Z0-9._%+\-]{1,64}\s*@\s*[a-zA-Z0-9\-]{1,63}(?:\s*\.\s*[a-zA-Z0-9\-]{1,63})+"
-    match = None
+    first_role = None
     for tried, at in enumerate(re.finditer("@", text)):
         if tried >= 50:  # a real resume has a handful of "@"s
             break
-        window = text[max(0, at.start() - 100): at.start() + 300]
-        match = re.search(pattern, window)
-        if match:
-            break
-    if not match:
-        return None
-    email = re.sub(r"\s+", "", match.group(0)).lower()
-    if not re.search(r"\.[a-zA-Z]{2,}$", email):
-        return None
-    return email
+        start = max(0, at.start() - 100)
+        window = text[start: at.start() + 300]
+        pos = at.start() - start
+        # The address around THIS "@" — the window also reaches back over the
+        # previous one, which must not be found again.
+        match = next((m for m in re.finditer(pattern, window) if m.start() <= pos < m.end()), None)
+        if not match:
+            continue
+        email = re.sub(r"\s+", "", match.group(0)).lower()
+        if not re.search(r"\.[a-zA-Z]{2,}$", email):
+            continue
+        if not is_role_mailbox(email):
+            return email
+        first_role = first_role or email
+    # Only role mailboxes: returned for callers that just need a contact
+    # address; the Resume Database refuses them as identity (is_role_mailbox).
+    return first_role
 
 
 def extract_phone(text: str) -> Optional[str]:

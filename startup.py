@@ -199,6 +199,10 @@ REQUIRED_COLUMNS = REQUIRED_COLUMNS + [
     ("candidates", "invite_token", "VARCHAR(64)", None),
     # Migration: l6m7n8o9p0q1_add_interview_message_feedback
     ("interview_messages", "feedback", "TEXT", None),
+    # Migration: m7n8o9p0q1r2_resume_bulk_dedup_columns
+    ("resume_metadata", "file_hash", "VARCHAR(64)", None),
+    ("resume_metadata", "batch_id", "VARCHAR(32)", None),
+    ("resume_metadata", "parse_mode", "VARCHAR(10)", None),
 ]
 
 # Indexes to create (safe with IF NOT EXISTS)
@@ -219,6 +223,8 @@ REQUIRED_INDEXES = [
     "CREATE INDEX IF NOT EXISTS ix_resume_metadata_organization_id ON resume_metadata (organization_id)",
     "CREATE INDEX IF NOT EXISTS ix_ai_credit_usage_organization_id ON ai_credit_usage (organization_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ix_candidates_invite_token ON candidates (invite_token)",
+    "CREATE INDEX IF NOT EXISTS ix_resume_metadata_file_hash ON resume_metadata (file_hash)",
+    "CREATE INDEX IF NOT EXISTS ix_resume_metadata_batch_id ON resume_metadata (batch_id)",
 ]
 
 

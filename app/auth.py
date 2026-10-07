@@ -3,6 +3,7 @@ Authentication utilities: JWT tokens, password hashing, org scoping, and depende
 """
 import hashlib
 import hmac
+import time
 from datetime import datetime, timedelta
 from typing import Annotated, List, Optional
 
@@ -68,13 +69,18 @@ def password_fingerprint(password_hash: Optional[str]) -> str:
 
 
 def create_access_token(
-    user_id: int, role: str, org_id: Optional[int] = None, password_hash: Optional[str] = None
+    user_id: int, role: str, org_id: Optional[int] = None, password_hash: Optional[str] = None,
+    auth_time: Optional[int] = None,
 ) -> str:
+    """`auth_time` (epoch seconds) is when the password was entered. A renewed
+    token (POST /auth/refresh) carries the original one forward, which is what
+    SESSION_MAX_LIFETIME_DAYS is measured from."""
     expire = datetime.utcnow() + timedelta(minutes=settings.SESSION_TIMEOUT_MINUTES)
     payload = {
         "sub": str(user_id),
         "role": role,
         "exp": expire,
+        "auth_time": int(auth_time if auth_time is not None else time.time()),
     }
     if org_id:
         payload["org_id"] = org_id

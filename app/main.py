@@ -29,6 +29,10 @@ logging.basicConfig(
 )
 # Keep app-level loggers at INFO so our own messages still appear
 logging.getLogger("app").setLevel(logging.INFO)
+# pdfminer logs a WARNING per glyph lookup for PDFs with incomplete font
+# metadata ("Could not get FontBBox ..."). Text still extracts; during a bulk
+# resume upload those lines buried every real message in the log.
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 # Login JWTs (and signed media URLs / URL refs, unless MEDIA_SIGNING_KEY /
 # URL_REF_KEY are set) are keyed off SECRET_KEY. Warn loudly, but never refuse
@@ -188,6 +192,12 @@ _raw_migrations = [
         "CREATE UNIQUE INDEX IF NOT EXISTS ix_candidates_invite_token ON candidates (invite_token)",
         # Nira's feedback, stored apart from the next question (interview_text)
         "ALTER TABLE interview_messages ADD COLUMN IF NOT EXISTS feedback TEXT",
+        # Bulk resume upload: dedup by file content + restart-safe queue
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS file_hash VARCHAR(64)",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS batch_id VARCHAR(32)",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS parse_mode VARCHAR(10)",
+        "CREATE INDEX IF NOT EXISTS ix_resume_metadata_file_hash ON resume_metadata (file_hash)",
+        "CREATE INDEX IF NOT EXISTS ix_resume_metadata_batch_id ON resume_metadata (batch_id)",
 ]
 if not _SKIP_STARTUP_MIGRATIONS:
     try:
@@ -547,6 +557,26 @@ async def _start_recording_sweeper():
             await asyncio.sleep(300)
 
     asyncio.create_task(_loop())
+
+
+@app.on_event("startup")
+async def _resume_unfinished_bulk_parses():
+    """Bulk resume parsing is queued in memory. Rows a restart (deploy, crash)
+    left pending/processing are queued again, so a large upload resumes where
+    it stopped instead of sitting at "pending" forever."""
+    from app.routers.resume_database import requeue_unfinished_bulk_rows
+
+    try:
+        await requeue_unfinished_bulk_rows()
+    except Exception as exc:  # never block startup over this
+        logging.getLogger("app.resume_bulk").warning("Could not re-queue unfinished resume parses: %s", exc)
+
+
+@app.on_event("shutdown")
+def _stop_extraction_workers():
+    from app.services.extraction_pool import shutdown_extraction_pool
+
+    shutdown_extraction_pool()
 
 
 @app.get("/health", tags=["Health"])

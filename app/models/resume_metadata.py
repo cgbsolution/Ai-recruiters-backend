@@ -49,6 +49,15 @@ class ResumeMetadata(Base):
     # ── File Reference ────────────────────────────────────────────────────────
     resume_file_path = Column(String(500), nullable=True)
     raw_text = Column(Text, nullable=True)          # full extracted text (for re-matching)
+    # SHA-256 of the uploaded bytes: re-uploading the identical file replaces
+    # the older copy instead of adding a second record (bulk upload only).
+    file_hash = Column(String(64), nullable=True, index=True)
+
+    # ── Bulk upload bookkeeping ───────────────────────────────────────────────
+    # Lets a restarted server re-queue unfinished rows and still report
+    # progress for a batch whose in-memory counters were lost.
+    batch_id = Column(String(32), nullable=True, index=True)
+    parse_mode = Column(String(10), nullable=True)   # "fast" | "ai"
 
     # ── Status ────────────────────────────────────────────────────────────────
     parsing_status = Column(
