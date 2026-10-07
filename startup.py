@@ -203,6 +203,21 @@ REQUIRED_COLUMNS = REQUIRED_COLUMNS + [
     ("resume_metadata", "file_hash", "VARCHAR(64)", None),
     ("resume_metadata", "batch_id", "VARCHAR(32)", None),
     ("resume_metadata", "parse_mode", "VARCHAR(10)", None),
+    # Migration: n8o9p0q1r2s3_resume_search_profile_columns
+    ("resume_metadata", "pipeline_status", "VARCHAR(20) NOT NULL", "'new'"),
+    ("resume_metadata", "source", "VARCHAR(20)", None),
+    ("resume_metadata", "current_company", "VARCHAR(255)", None),
+    ("resume_metadata", "city", "VARCHAR(100)", None),
+    ("resume_metadata", "highest_education", "VARCHAR(20)", None),
+    ("resume_metadata", "parse_quality", "INTEGER", None),
+    ("resume_metadata", "skills_index", "TEXT", None),
+    ("resume_metadata", "certs_index", "TEXT", None),
+    ("resume_metadata", "search_text", "TEXT", None),
+    ("resume_metadata", "current_ctc", "FLOAT", None),
+    ("resume_metadata", "expected_ctc", "FLOAT", None),
+    ("resume_metadata", "notice_period_days", "INTEGER", None),
+    ("resume_metadata", "open_to_relocate", "BOOLEAN", None),
+    ("resume_metadata", "derived_version", "INTEGER", None),
 ]
 
 # Indexes to create (safe with IF NOT EXISTS)
@@ -225,6 +240,8 @@ REQUIRED_INDEXES = [
     "CREATE UNIQUE INDEX IF NOT EXISTS ix_candidates_invite_token ON candidates (invite_token)",
     "CREATE INDEX IF NOT EXISTS ix_resume_metadata_file_hash ON resume_metadata (file_hash)",
     "CREATE INDEX IF NOT EXISTS ix_resume_metadata_batch_id ON resume_metadata (batch_id)",
+    "CREATE INDEX IF NOT EXISTS ix_resume_metadata_pipeline_status ON resume_metadata (pipeline_status)",
+    "CREATE INDEX IF NOT EXISTS ix_resume_metadata_city ON resume_metadata (city)",
 ]
 
 

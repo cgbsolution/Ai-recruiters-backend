@@ -198,6 +198,23 @@ _raw_migrations = [
         "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS parse_mode VARCHAR(10)",
         "CREATE INDEX IF NOT EXISTS ix_resume_metadata_file_hash ON resume_metadata (file_hash)",
         "CREATE INDEX IF NOT EXISTS ix_resume_metadata_batch_id ON resume_metadata (batch_id)",
+        # Resume Database search page: derived facts + recruiter workflow
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS pipeline_status VARCHAR(20) NOT NULL DEFAULT 'new'",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS source VARCHAR(20)",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS current_company VARCHAR(255)",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS city VARCHAR(100)",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS highest_education VARCHAR(20)",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS parse_quality INTEGER",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS skills_index TEXT",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS certs_index TEXT",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS search_text TEXT",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS current_ctc FLOAT",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS expected_ctc FLOAT",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS notice_period_days INTEGER",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS open_to_relocate BOOLEAN",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS derived_version INTEGER",
+        "CREATE INDEX IF NOT EXISTS ix_resume_metadata_pipeline_status ON resume_metadata (pipeline_status)",
+        "CREATE INDEX IF NOT EXISTS ix_resume_metadata_city ON resume_metadata (city)",
 ]
 if not _SKIP_STARTUP_MIGRATIONS:
     try:
@@ -570,6 +587,27 @@ async def _resume_unfinished_bulk_parses():
         await requeue_unfinished_bulk_rows()
     except Exception as exc:  # never block startup over this
         logging.getLogger("app.resume_bulk").warning("Could not re-queue unfinished resume parses: %s", exc)
+
+
+@app.on_event("startup")
+async def _backfill_resume_search_fields():
+    """Fill the Resume Database search columns (city, CTC, notice period, parse
+    quality, ...) for rows stored before they existed. One-off per
+    PROFILE_VERSION; runs in the background so startup is not delayed."""
+    import asyncio
+    from app.services.resume_profile import backfill_profiles
+
+    log = logging.getLogger("app.resume_search")
+
+    async def _run():
+        try:
+            updated = await asyncio.to_thread(backfill_profiles)
+            if updated:
+                log.info("Filled search fields for %d existing resume(s)", updated)
+        except Exception as exc:  # the page still works; filters just lack old rows
+            log.warning("Resume search backfill failed: %s", exc)
+
+    app.state.resume_backfill_task = asyncio.create_task(_run())
 
 
 @app.on_event("shutdown")

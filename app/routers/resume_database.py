@@ -24,6 +24,7 @@ from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -45,6 +46,8 @@ from app.models.organization import Organization
 from app.models.resume_metadata import ResumeMetadata
 from app.models.user import User, UserRole
 from app.schemas.resume_metadata import ResumeMetadataUpdate
+from app.services import resume_search
+from app.services.resume_search import NOT_UNPARSED_PLACEHOLDER as _NOT_UNPARSED_PLACEHOLDER
 
 logger = logging.getLogger(__name__)
 
@@ -154,13 +157,6 @@ _bulk_progress: dict = {}  # batch_id -> {total, completed, failed, replaced, st
 _ai_semaphore = asyncio.Semaphore(max(1, settings.RESUME_AI_CONCURRENCY))
 _save_lock = asyncio.Lock()
 _NUM_WORKERS = max(settings.RESUME_AI_CONCURRENCY, settings.RESUME_EXTRACT_WORKERS) + 2
-
-# Rows to list: everything except placeholder rows that never parsed
-# (pending / processing / failed uploads).
-_NOT_UNPARSED_PLACEHOLDER = or_(
-    ~ResumeMetadata.candidate_email.like("%@pending.local"),
-    ResumeMetadata.parsing_status == "completed",
-)
 
 # Finished batches are dropped from memory after this long.
 _BATCH_RETENTION_SECONDS = 6 * 3600
@@ -605,6 +601,7 @@ def _store_bulk_uploads(db: Session, files: List[UploadFile], batch_id: str, par
                 file_hash=file_hash,
                 batch_id=batch_id,
                 parse_mode=parse_mode,
+                source="bulk_upload",
                 parsing_status="pending",
                 organization_id=org_id,
             )
@@ -934,6 +931,161 @@ def get_stats(db: Session = Depends(get_db), user: User = Depends(get_current_us
         "pending": pending,
         "failed": failed,
     }
+
+
+# ── Search (filters, facet counts, relevance) ────────────────────────────────
+
+def _clean_values(values: List[str], allowed: Optional[tuple] = None, limit: int = 50) -> List[str]:
+    out = []
+    for v in values[:limit]:
+        v = (v or "").strip()[:100]
+        if v and (allowed is None or v in allowed) and v not in out:
+            out.append(v)
+    return out
+
+
+@router.get(
+    "/search",
+    summary="Search the resume database: keywords, filters, facet counts and relevance",
+    description=(
+        "`q`: every word must match; \"quoted words\" match as a phrase; a leading "
+        "minus excludes (-intern). Repeat list parameters for several values "
+        "(`city=Noida&city=Pune`). Facet counts are disjunctive: each section's "
+        "counts apply every other active filter."
+    ),
+)
+def search_resume_database(
+    q: str = Query("", max_length=500),
+    location: str = Query("", max_length=200),
+    exp_min: Optional[float] = Query(None, ge=0, le=60),
+    exp_max: Optional[float] = Query(None, ge=0, le=60),
+    ctc: List[str] = Query([]),
+    notice: List[str] = Query([]),
+    city: List[str] = Query([]),
+    relocate: bool = False,
+    skills: List[str] = Query([]),
+    skills_mode: str = Query("all", pattern="^(all|any)$"),
+    certs: List[str] = Query([]),
+    education: List[str] = Query([]),
+    freshness: Optional[int] = Query(None, ge=1, le=3650, description="Resume parsed within N days"),
+    pipeline: List[str] = Query([]),
+    source: List[str] = Query([]),
+    quality: Optional[str] = Query(None, pattern="^(high|medium|low)$"),
+    sort: str = Query("relevance"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    facets: bool = True,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    params = resume_search.SearchParams(
+        q=q,
+        location=location,
+        exp_min=exp_min,
+        exp_max=exp_max,
+        ctc=_clean_values(ctc, tuple(k for k, *_ in resume_search.CTC_BUCKETS) + (resume_search.NA,)),
+        notice=_clean_values(notice, tuple(k for k, *_ in resume_search.NOTICE_BUCKETS) + (resume_search.NA,)),
+        city=_clean_values(city),
+        relocate=relocate,
+        skills=_clean_values(skills, limit=20),
+        skills_mode=skills_mode,
+        certs=_clean_values(certs, limit=20),
+        education=_clean_values(education, tuple(k for k, _ in resume_search.EDUCATION) + (resume_search.NA,)),
+        freshness_days=freshness,
+        pipeline=_clean_values(pipeline, resume_search.PIPELINE_STATUSES),
+        source=_clean_values(source, tuple(k for k, _ in resume_search.SOURCES)),
+        quality=quality,
+        sort=sort if sort in resume_search.SORTS else "relevance",
+        page=page,
+        page_size=page_size,
+        include_facets=facets,
+    )
+    return resume_search.search(db, get_org_id(user), params)
+
+
+# ── Pipeline status (Shortlist, Contacted, ...) ──────────────────────────────
+
+class PipelineStatusUpdate(BaseModel):
+    status: str
+
+
+class BulkPipelineStatusUpdate(BaseModel):
+    ids: List[int] = Field(..., min_length=1, max_length=500)
+    status: str
+
+
+class BulkResumeIds(BaseModel):
+    ids: List[int] = Field(..., min_length=1, max_length=500)
+
+
+def _check_pipeline_status(status: str) -> str:
+    if status not in resume_search.PIPELINE_STATUSES:
+        raise HTTPException(status_code=422, detail=f"Unknown status. Use one of: {', '.join(resume_search.PIPELINE_STATUSES)}")
+    return status
+
+
+def _org_scoped_ids(db: Session, user: User, ids: List[int]):
+    query = db.query(ResumeMetadata).filter(ResumeMetadata.id.in_(ids))
+    org_id = get_org_id(user)
+    if org_id is not None:
+        query = query.filter(ResumeMetadata.organization_id == org_id)
+    return query
+
+
+@router.post("/bulk/pipeline-status", summary="Set the pipeline status of several resumes")
+def bulk_set_pipeline_status(
+    body: BulkPipelineStatusUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(_require_resume_admin),
+):
+    status = _check_pipeline_status(body.status)
+    updated = _org_scoped_ids(db, user, body.ids).update(
+        {"pipeline_status": status, "updated_at": datetime.utcnow()}, synchronize_session=False
+    )
+    db.commit()
+    return {"updated": updated, "pipeline_status": status}
+
+
+@router.post("/bulk/delete", summary="Delete several resume records and their files")
+def bulk_delete_resumes(
+    body: BulkResumeIds,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(_require_resume_admin),
+):
+    from app.models.candidate import Candidate
+
+    _check_resume_db_permission(user, db)
+    rows = _org_scoped_ids(db, user, body.ids).all()
+    ids = [m.id for m in rows]
+    if ids:
+        db.query(Candidate).filter(Candidate.resume_metadata_id.in_(ids)).update(
+            {"resume_metadata_id": None}, synchronize_session="fetch"
+        )
+    file_paths = [m.resume_file_path for m in rows if m.resume_file_path]
+    for meta in rows:
+        db.delete(meta)
+    db.commit()
+    # Files go after the response, and only those nothing else references.
+    background_tasks.add_task(_remove_unused_resume_files, file_paths)
+    return {"deleted": len(ids)}
+
+
+@router.patch("/{meta_id}/pipeline-status", summary="Set one resume's pipeline status (e.g. shortlist)")
+def set_pipeline_status(
+    meta_id: int,
+    body: PipelineStatusUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(_require_resume_admin),
+):
+    status = _check_pipeline_status(body.status)
+    meta = _org_scoped_ids(db, user, [meta_id]).first()
+    if not meta:
+        raise HTTPException(status_code=404, detail="Resume not found")
+    meta.pipeline_status = status
+    meta.updated_at = datetime.utcnow()
+    db.commit()
+    return {"id": meta.id, "pipeline_status": meta.pipeline_status}
 
 
 # ── Single Resume Detail ─────────────────────────────────────────────────────
@@ -1429,6 +1581,7 @@ async def import_resumes(
                 parsing_status=_import_parsing_status(record),
                 parsed_at=datetime.fromisoformat(record["parsed_at"]) if record.get("parsed_at") else None,
                 organization_id=user.organization_id,
+                source="import",
             )
             db.add(meta)
             imported += 1
@@ -1510,6 +1663,7 @@ async def import_with_file(
             parsing_status=_import_parsing_status(record),
             parsed_at=datetime.fromisoformat(record["parsed_at"]) if record.get("parsed_at") else None,
             organization_id=user.organization_id,
+            source="import",
         )
         db.add(meta)
         db.commit()
@@ -1564,6 +1718,17 @@ def _serialize_meta(meta: ResumeMetadata, include_text: bool = False) -> dict:
         "keywords": _parse_json(meta.keywords),
         "summary": meta.summary,
         "parsing_status": meta.parsing_status,
+        "pipeline_status": meta.pipeline_status or "new",
+        "source": meta.source,
+        "current_company": meta.current_company,
+        "city": meta.city,
+        "current_ctc": meta.annual_package if meta.annual_package is not None else meta.current_ctc,
+        "expected_ctc": meta.expected_ctc,
+        "notice_period_days": meta.notice_period_days,
+        "open_to_relocate": meta.open_to_relocate,
+        "highest_education": meta.highest_education,
+        "parse_quality": meta.parse_quality,
+        "parsing_error": meta.parsing_error,
         "resume_file_path": meta.resume_file_path,
         "resume_file_url": sign_media_url(meta.resume_file_path),
         "parsed_at": meta.parsed_at.isoformat() if meta.parsed_at else None,

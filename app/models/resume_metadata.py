@@ -9,8 +9,10 @@ fast cross-job candidate matching.
 
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
-from sqlalchemy.orm import relationship
+from sqlalchemy import (
+    Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, event, inspect,
+)
+from sqlalchemy.orm import Session, relationship
 
 from app.database import Base
 
@@ -65,7 +67,54 @@ class ResumeMetadata(Base):
     )  # "pending" | "processing" | "completed" | "failed"
     parsing_error = Column(Text, nullable=True)
 
+    # ── Recruiter workflow ────────────────────────────────────────────────────
+    # "new" | "shortlisted" | "contacted" | "interviewing" | "on_hold" | "rejected"
+    pipeline_status = Column(String(20), nullable=False, default="new", server_default="new", index=True)
+    # Where the resume came from: "bulk_upload" | "application" | "import"
+    source = Column(String(20), nullable=True)
+
+    # ── Derived for search (app.services.resume_profile — never edit directly) ─
+    # Kept in sync by the before_flush hook below; filled for older rows by
+    # resume_profile.backfill_profiles() at startup.
+    current_company = Column(String(255), nullable=True)
+    city = Column(String(100), nullable=True, index=True)
+    highest_education = Column(String(20), nullable=True)
+    parse_quality = Column(Integer, nullable=True)
+    skills_index = Column(Text, nullable=True)       # "|Python|Django|AWS|"
+    certs_index = Column(Text, nullable=True)
+    search_text = Column(Text, nullable=True)        # lowercase, for keyword search
+    # Stated in the resume text (NULL when it does not say)
+    current_ctc = Column(Float, nullable=True)       # LPA; annual_package (typed in) wins
+    expected_ctc = Column(Float, nullable=True)      # LPA
+    notice_period_days = Column(Integer, nullable=True)  # 0 = immediate joiner
+    open_to_relocate = Column(Boolean, nullable=True)
+    derived_version = Column(Integer, nullable=True)
+
     # ── Timestamps ────────────────────────────────────────────────────────────
     parsed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+@event.listens_for(Session, "before_flush")
+def _refresh_derived_resume_fields(session, flush_context, instances):
+    """Every ORM write of a ResumeMetadata row — bulk upload, re-parse, edit,
+    candidate application — refreshes its derived search columns, so no write
+    path can leave the search page's filters stale."""
+    from app.services.resume_profile import PROFILE_VERSION, derive_profile
+
+    with session.no_autoflush:
+        for obj in list(session.new) + list(session.dirty):
+            if not isinstance(obj, ResumeMetadata) or obj in session.deleted:
+                continue
+            state = inspect(obj)
+            if state.pending and obj.source is None:
+                # Bulk upload and imports say so explicitly; the other writers
+                # (candidate applications, the public apply form) are applications.
+                obj.source = "bulk_upload" if obj.batch_id else "application"
+            text_changed = (
+                state.pending
+                or state.attrs.raw_text.history.has_changes()
+                or (obj.derived_version or 0) < PROFILE_VERSION
+            )
+            derive_profile(obj, text_changed=text_changed)
