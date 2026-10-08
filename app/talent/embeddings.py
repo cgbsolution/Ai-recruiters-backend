@@ -141,11 +141,14 @@ def embed_versions(db: Session, version_ids: List[str]) -> dict:
         profile = db.get(ResumeMetadata, version.profile_id)
         text = embedding_text(version.parsed, profile.candidate_name if profile else None)
         if not text.strip():
+            # Nothing to embed: record that this model looked, so backfills move on.
+            version.embedding_model, version.embedded_text_hash = model, "empty"
             continue
         h = _text_hash(text)
         if version.embedding_model == model and version.embedded_text_hash == h:
             continue
         rows.append((version.id, text, h))
+    db.commit()
     done = 0
     for i in range(0, len(rows), BATCH):
         chunk = rows[i:i + BATCH]

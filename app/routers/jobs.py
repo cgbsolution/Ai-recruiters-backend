@@ -26,6 +26,7 @@ from app.schemas.interview import (
     MeetingSlotRead,
 )
 from app.refs import JobId
+from app.talent import hooks as talent_hooks
 from app.schemas.job import AddMatchedCandidatesRequest, JobCreate, JobListItem, JobRead, JobUpdate
 from app.services import job_service
 
@@ -382,6 +383,7 @@ def create_job(payload: JobCreate, background_tasks: BackgroundTasks, db: Sessio
     token_str = _create_token(db, job.id)
     # Extract JD metadata in background
     background_tasks.add_task(_bg_build_job_metadata, job.id)
+    background_tasks.add_task(talent_hooks.job_changed, job.id)  # Talent Agent Loop B (if switched on)
     result = JobRead.model_validate(job)
     return result.model_copy(update={"interview_token": token_str})
 
@@ -412,6 +414,7 @@ def update_job(job_id: JobId, payload: JobUpdate, background_tasks: BackgroundTa
         raise HTTPException(status_code=404, detail="Job not found")
     # Re-extract JD metadata in background
     background_tasks.add_task(_bg_build_job_metadata, job.id)
+    background_tasks.add_task(talent_hooks.job_changed, job.id)  # Talent Agent Loop B (if switched on)
     result = JobRead.model_validate(job)
     return result.model_copy(update={"interview_token": _get_active_token(db, job_id)})
 
@@ -425,6 +428,7 @@ def update_job(job_id: JobId, payload: JobUpdate, background_tasks: BackgroundTa
 def change_job_status(
     job_id: JobId,
     new_status: str,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -443,6 +447,8 @@ def change_job_status(
     job.status = status_map[new_status]
     db.commit()
     db.refresh(job)
+    if job.status == JobStatus.open:
+        background_tasks.add_task(talent_hooks.job_changed, job.id)  # Talent Agent Loop B (if switched on)
     result = JobRead.model_validate(job)
     return result.model_copy(update={"interview_token": _get_active_token(db, job_id)})
 

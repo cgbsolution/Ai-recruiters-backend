@@ -86,11 +86,14 @@ def apply_parse(db: Session, version_id: str, raw_text: Optional[str], parsed: d
     version.parse_status = "parsed"
     cv.make_current(db, version)
 
-    if version.source == "refresh_upload":
+    if version.source in ("refresh_upload", "reparse"):
+        # A new CV (or a better parse of the same one) updates the profile —
+        # except what a recruiter typed in or the candidate confirmed.
         owned = set(json_list(profile.recruiter_fields)) | set(json_list(profile.candidate_fields))
         if raw_text:
             profile.raw_text = raw_text
-        profile.resume_file_path, profile.file_hash = version.file_path, version.file_hash
+        if version.source == "refresh_upload":
+            profile.resume_file_path, profile.file_hash = version.file_path, version.file_hash
         for column in _SCALAR_COLUMNS:
             if column not in owned and parsed.get(column) not in (None, ""):
                 setattr(profile, column, parsed[column])

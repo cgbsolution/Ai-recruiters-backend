@@ -64,6 +64,20 @@ _PHONE = re.compile(r"(?<![\w-])\+?\d[\d \-().]{8,}\d(?![\w-])")
 _URL = re.compile(r"(?i)\b(?:https?://|www\.)\S+|\b(?:linkedin|github|facebook|instagram|twitter)\.com/\S*")
 _AGE = re.compile(r"(?i)\b(?:aged?\s*\d{2}|\d{2}\s*(?:years?|yrs?)\s*old|\(\s*\d{2}\s*(?:years?|yrs?)\s*\))")
 _DATE_OF_BIRTH = re.compile(r"(?i)\bborn\b[^.\n;]*")
+# Unlabelled addresses: "lives at …", and "<number>, <words> Road/Nagar/…".
+_RESIDENCE = re.compile(
+    r"(?i)\b(?:lives?|living|resides?|residing|resident|staying|stays|currently\s+residing)\s+(?:at|in|of|near)\b[^.;\n]*"
+)
+# Case-sensitive on purpose: addresses are written "12, Shanti Nagar", while
+# "street-level", "main platform" or "block storage" in a job description are not.
+_STREET = re.compile(
+    r"\b(?:(?:[Ff]lat|[Hh]ouse|[Pp]lot|[Dd]oor|H\.?\s?[Nn]o\.?)\s*)?\d{1,5}[A-Za-z]?\s*[,/-]?\s*"
+    r"(?:[A-Z][\w.'-]*\s+){0,3}"
+    r"(?:Road|Rd|Street|Nagar|Colony|Lane|Marg|Layout|Cross|Avenue|Apartments?|Society|Enclave|Salai|Chowk|"
+    r"Vihar|Puram|Bagh|Gali|Mohalla)\b(?![-\w])"
+    r"(?:\s*,\s*[A-Z][\w-]+){0,2}(?:\s*[-,]?\s*\d{6})?"
+)
+_PIN = re.compile(r"(?i)\b(?:pin(?:\s*code)?|pincode|zip)\s*[:\-]?\s*\d{5,6}\b")
 _HONORIFIC = re.compile(r"(?i)\b(?:mr|mrs|ms|miss|smt|shri|sri|kumari|km)\.?\s+(?=[A-Z])")
 _STANDALONE = re.compile(
     r"(?i)\b(?:male|female|transgender|married|unmarried|divorced|widowed|widow|bachelor\s+status|"
@@ -114,6 +128,9 @@ def scrub_text(text: Optional[str], names: Iterable[str] = (), counts: Optional[
     sub(_PHONE, "", "phone")
     sub(_AGE, "", "age")
     sub(_DATE_OF_BIRTH, "", "date_of_birth")
+    sub(_RESIDENCE, "", "address")
+    sub(_STREET, "", "address")
+    sub(_PIN, "", "address")
     sub(_HONORIFIC, "", "honorific")
     for token in names:
         sub(_name_pattern(token), "the candidate", "name")

@@ -340,6 +340,10 @@ class JobMatch(Base):
     response = Column(String(20), nullable=True)  # interested | not_interested
     confirmed = Column(JsonB, nullable=True)  # CTC / notice the candidate confirmed on the invite page
     application_id = Column(Integer, ForeignKey("candidates.id", ondelete="SET NULL"), nullable=True)
+    # A recruiter's judgement of the match, for the precision@10 report.
+    recruiter_rating = Column(String(16), nullable=True)  # relevant | not_relevant
+    rated_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    rated_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

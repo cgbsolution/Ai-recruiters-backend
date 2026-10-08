@@ -1,5 +1,7 @@
 """Every Inngest function the Talent Agent serves."""
 
+from app.agent.cv_backfill import cv_backfill
+from app.agent.match_job import match_job
 from app.agent.refresh_dead_letter import refresh_dead_letter
 from app.agent.refresh_reengage import refresh_reengage
 from app.agent.refresh_respond import refresh_respond
@@ -13,4 +15,7 @@ FUNCTIONS = [
     refresh_respond,
     refresh_reengage,
     refresh_dead_letter,
+    # Loop B — match
+    match_job,
+    cv_backfill,
 ]
