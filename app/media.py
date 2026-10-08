@@ -171,7 +171,15 @@ def resume_file_in_use(db, stored: Optional[str], *, exclude_candidate_id: Optio
     )
     if exclude_meta_id is not None:
         q2 = q2.filter(ResumeMetadata.id != exclude_meta_id)
-    return any(to_upload_relpath(p) == rel for _, p in q2.all())
+    if any(to_upload_relpath(p) == rel for _, p in q2.all()):
+        return True
+    # Talent Agent CV versions keep earlier files of a profile.
+    from app.models.talent import CvVersion
+
+    q3 = db.query(CvVersion.profile_id, CvVersion.file_path).filter(CvVersion.file_path.endswith(base, autoescape=True))
+    if exclude_meta_id is not None:
+        q3 = q3.filter(CvVersion.profile_id != exclude_meta_id)
+    return any(to_upload_relpath(p) == rel for _, p in q3.all())
 
 
 def safe_upload_name(filename: Optional[str], allowed_exts: Iterable[str],

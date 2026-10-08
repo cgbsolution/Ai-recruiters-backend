@@ -97,6 +97,26 @@ class ResumeMetadata(Base):
     # profile shows "Recruiter" instead of "From CV"). Maintained by the hook
     # below: a recruiter edit adds the field, any later CV write takes it back.
     recruiter_fields = Column(Text, nullable=True)
+    # Same, for values the candidate confirmed on the Talent Agent refresh
+    # page ("Candidate"). A recruiter edit takes a field over and vice versa.
+    candidate_fields = Column(Text, nullable=True)
+
+    # ── Talent Agent freshness (app.talent) ───────────────────────────────────
+    # When the candidate last confirmed the profile on the refresh page.
+    last_verified_at = Column(DateTime, nullable=True)
+    # unverified | fresh | stale | refreshing | unreachable
+    verification_status = Column(
+        String(20), nullable=False, default="unverified", server_default="unverified", index=True
+    )
+    job_search_status = Column(String(20), nullable=True)  # active | open | not_looking
+    # SHA-256 of the normalized email (or phone when there is no usable email):
+    # the same person across rows. app.talent.identity.dedupe_key.
+    dedupe_key = Column(String(64), nullable=True, index=True)
+    # valid | invalid | placeholder | role | no_mx | unknown (app.talent.identity)
+    email_status = Column(String(20), nullable=True)
+    email_checked_at = Column(DateTime, nullable=True)
+    # After this date the retention sweep deletes the profile and its CVs.
+    retention_until = Column(DateTime, nullable=True)
 
     # ── Timestamps ────────────────────────────────────────────────────────────
     parsed_at = Column(DateTime, nullable=True)
@@ -117,6 +137,20 @@ def mark_recruiter_edit(session) -> None:
     session.info["recruiter_edit"] = True
 
 
+# Fields a candidate can confirm on the Talent Agent refresh page.
+CANDIDATE_CONFIRMABLE = (
+    "current_designation", "current_company", "location", "current_ctc", "expected_ctc",
+    "notice_period_days", "open_to_relocate",
+)
+
+
+def mark_candidate_confirmation(session) -> None:
+    """Call before committing values the candidate confirmed themselves: the
+    fields it changes are recorded as candidate-provided, so a later CV text
+    re-read does not overwrite them."""
+    session.info["candidate_confirm"] = True
+
+
 @event.listens_for(Session, "before_flush")
 def _refresh_derived_resume_fields(session, flush_context, instances):
     """Every ORM write of a ResumeMetadata row — bulk upload, re-parse, edit,
@@ -125,22 +159,31 @@ def _refresh_derived_resume_fields(session, flush_context, instances):
     from app.services.resume_profile import PROFILE_VERSION, derive_profile, json_list
 
     recruiter_edit = session.info.pop("recruiter_edit", False)
+    candidate_confirm = session.info.pop("candidate_confirm", False)
     with session.no_autoflush:
         for obj in list(session.new) + list(session.dirty):
             if not isinstance(obj, ResumeMetadata) or obj in session.deleted:
                 continue
             state = inspect(obj)
             if not state.pending:
-                changed = {f for f in RECRUITER_EDITABLE if state.attrs[f].history.has_changes()}
+                tracked = set(RECRUITER_EDITABLE) | set(CANDIDATE_CONFIRMABLE)
+                changed = {f for f in tracked if state.attrs[f].history.has_changes()}
                 if changed:
                     owned = set(json_list(obj.recruiter_fields))
+                    confirmed = set(json_list(obj.candidate_fields))
+                    # A value someone clears is no longer theirs: the CV may fill it again.
+                    cleared = {f for f in changed if getattr(obj, f) is None}
                     if recruiter_edit:
-                        # A value a recruiter clears is no longer theirs: the CV may fill it again.
-                        cleared = {f for f in changed if getattr(obj, f) is None}
-                        owned = (owned | changed) - cleared
+                        owned = (owned | (changed & set(RECRUITER_EDITABLE))) - cleared
+                        confirmed -= changed
+                    elif candidate_confirm:
+                        confirmed = (confirmed | (changed & set(CANDIDATE_CONFIRMABLE))) - cleared
+                        owned -= changed
                     else:
                         owned -= changed
+                        confirmed -= changed
                     obj.recruiter_fields = json.dumps(sorted(owned)) if owned else None
+                    obj.candidate_fields = json.dumps(sorted(confirmed)) if confirmed else None
             if state.pending and obj.source is None:
                 # Bulk upload and imports say so explicitly; the other writers
                 # (candidate applications, the public apply form) are applications.

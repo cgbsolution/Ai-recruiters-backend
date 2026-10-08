@@ -325,8 +325,9 @@ def _search_text(meta, work: List[dict]) -> str:
 
 def derive_profile(meta, text_changed: bool = True) -> None:
     """Refresh the derived columns of `meta` (an ORM object) in place."""
+    # Values a recruiter typed in or the candidate confirmed beat the CV's.
+    typed_in = set(json_list(meta.recruiter_fields)) | set(json_list(getattr(meta, "candidate_fields", None)))
     if text_changed:
-        typed_in = set(json_list(meta.recruiter_fields))
         if "location" not in typed_in:
             _repair_location(meta)
         if "skills" not in typed_in:
@@ -335,7 +336,8 @@ def derive_profile(meta, text_changed: bool = True) -> None:
     work = work_entries(meta.work_experience)
     meta.skills_index = tag_index(json_list(meta.skills))
     meta.certs_index = tag_index(json_list(meta.certifications))
-    meta.current_company = (str(work[0].get("company") or "").strip()[:255] or None) if work else None
+    if "current_company" not in typed_in:
+        meta.current_company = (str(work[0].get("company") or "").strip()[:255] or None) if work else None
     meta.city = normalize_city(meta.location)
     meta.highest_education = highest_education(json_list(meta.education))
     meta.parse_quality = parse_quality(meta)
@@ -346,7 +348,6 @@ def derive_profile(meta, text_changed: bool = True) -> None:
     # states — an unrelated write such as a status change never clears them.
     if text_changed:
         text = meta.raw_text or ""
-        typed_in = set(json_list(meta.recruiter_fields))  # a recruiter's value beats the CV's
         for column, value in (
             ("current_ctc", extract_ctc(text)),
             ("expected_ctc", extract_ctc(text, expected=True)),

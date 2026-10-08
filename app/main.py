@@ -46,7 +46,7 @@ if settings.secret_key_is_weak:
 
 from app.database import Base, engine
 from app import media
-from app.routers import ai, auth, calendar, candidates, client_events, credits, file_manager, interview, jobs, observer, organizations, questions, resume_database, secondary_cam, tts, uploads
+from app.routers import ai, auth, calendar, candidates, client_events, credits, file_manager, interview, jobs, observer, organizations, questions, resume_database, secondary_cam, talent_admin, tts, uploads
 
 import app.models  # noqa: F401 — ensure all models are registered with Base
 import app.services.observer_events  # noqa: F401 — wire SQLAlchemy listeners for the live observer broker
@@ -531,6 +531,8 @@ app.include_router(tts.router, tags=["Text-to-Speech"])
 app.include_router(observer.router, tags=["Live Observer"])
 app.include_router(client_events.router, tags=["Client Telemetry"])
 app.include_router(media.router)
+# Talent Agent admin API (app.talent).
+app.include_router(talent_admin.router, prefix="/talent", tags=["Talent Agent"])
 
 
 @app.on_event("startup")
