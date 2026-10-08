@@ -60,13 +60,19 @@ def set_sink(sink: Optional[Callable[[str, dict], None]]) -> None:
     _sink = sink
 
 
+def _can_send() -> bool:
+    """No event key outside dev mode is a misconfiguration (the settings page
+    says so): don't make every request wait on a call that must fail."""
+    return talent_config.TALENT_AGENT_ENABLED and (talent_config.inngest_is_dev or bool(talent_config.INNGEST_EVENT_KEY))
+
+
 def emit(name: str, data: Dict[str, Any]) -> bool:
     """Send one event. True if Inngest accepted it."""
     _check_ids_only(data)
     if _sink is not None:
         _sink(name, data)
         return True
-    if not talent_config.TALENT_AGENT_ENABLED:
+    if not _can_send():
         return False
     try:
         inngest_client.send_sync(inngest.Event(name=name, data=data))
@@ -84,7 +90,7 @@ def emit_many(events: List[tuple]) -> int:
         for name, data in events:
             _sink(name, data)
         return len(events)
-    if not talent_config.TALENT_AGENT_ENABLED or not events:
+    if not _can_send() or not events:
         return 0
     sent = 0
     for i in range(0, len(events), 100):

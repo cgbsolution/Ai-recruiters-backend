@@ -87,6 +87,29 @@ def reserve(db: Session, domain: str, priority: str, now: Optional[datetime] = N
     return db.execute(stmt).rowcount == 1
 
 
+def reserve_many(db: Session, domain: str, priority: str, n: int, now: Optional[datetime] = None) -> int:
+    """Take up to `n` sends from today's budget in one locked step; returns how many were granted."""
+    if n <= 0:
+        return 0
+    day = (now or datetime.utcnow()).date()
+    dom = get_domain(db, domain, day)
+    if dom.paused:
+        return 0
+    cap, bulk_cap = cap_for(dom, day), bulk_cap_for(dom, day)
+    db.execute(
+        pg_insert(SendCounter.__table__).values(domain=domain, day=day, total=0, bulk=0)
+        .on_conflict_do_nothing(index_elements=["domain", "day"])
+    )
+    row = db.query(SendCounter).filter_by(domain=domain, day=day).with_for_update().populate_existing().one()
+    room = cap - row.total if priority != BULK else min(cap - row.total, bulk_cap - row.bulk)
+    granted = max(0, min(n, room))
+    row.total += granted
+    if priority == BULK:
+        row.bulk += granted
+    db.flush()
+    return granted
+
+
 def release(db: Session, domain: str, priority: str, now: Optional[datetime] = None) -> None:
     """Give back a reservation whose message certainly did not leave."""
     day = (now or datetime.utcnow()).date()

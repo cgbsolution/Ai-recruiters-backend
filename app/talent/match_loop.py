@@ -19,7 +19,7 @@ from app.models.resume_metadata import ResumeMetadata
 from app.models.talent import CampaignMember, JobMatch
 from app.talent import campaigns, matching
 from app.talent.audit import audit
-from app.talent.settings import get_job_settings, loop_enabled
+from app.talent.settings import freshness_window, get_job_settings, get_settings, loop_enabled
 
 REFRESH_PRIORITY = 100  # ahead of the rolling sweep's skill-overlap priorities
 
@@ -64,9 +64,14 @@ def finish(db: Session, job_id: int, now: Optional[datetime] = None) -> dict:
     job = db.get(Job, job_id)
     js = get_job_settings(db, job.id, job.organization_id)
     top = ordered_matches(db, job_id, js.top_k)
+    window = freshness_window(get_settings(db, job.organization_id))
+    asked = {pid for (pid,) in db.query(CampaignMember.profile_id)
+             .filter(campaigns.asked_since(now - window), CampaignMember.profile_id.in_([p.id for _, p in top] or [0]))}
     needs = []
     for match, profile in top:
-        if match.status == "ranked" and profile.verification_status == "stale":
+        # Already asked this cycle: no second refresh sequence — the invite
+        # itself asks them to confirm salary and notice.
+        if match.status == "ranked" and profile.verification_status == "stale" and profile.id not in asked:
             match.status, match.status_reason = "needs_refresh", "profile_stale"
             needs.append(profile.id)
     if needs:

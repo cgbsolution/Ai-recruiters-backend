@@ -14,6 +14,7 @@ from app.agent.refresh_reengage import refresh_reengage
 from app.agent.refresh_respond import refresh_respond
 from app.agent.refresh_sweep import refresh_sweep
 from app.agent.refresh_touch import refresh_touch
+from app.agent.retention_sweep import retention_sweep
 
 FUNCTIONS = [
     # Loop A — refresh
@@ -37,4 +38,6 @@ FUNCTIONS = [
     shortlist_build,
     # Phase 5 — live voice (behind its switch)
     live_voice_sync,
+    # Retention
+    retention_sweep,
 ]

@@ -592,3 +592,50 @@ def test_candidate_can_opt_back_in_but_complaints_stay_suppressed(client, world,
     db.expire_all()
     assert consent.is_suppressed(db, email="spam@acme.com")
     assert consent.can_contact(db, q.id, "email", "jobs").reason == "suppressed"
+
+
+def test_non_responders_are_not_asked_again_within_the_window(world, db):
+    """Regression (found by the 40K load test): someone who ignored a refresh
+    cycle went straight back to "due", was re-picked first every day, and
+    starved the rest of the backlog — and would have been messaged again."""
+    org = world.org()
+    world.enable(org, "refresh", "refresh_rolling")
+    dom = caps.get_domain(db, "agent.test")
+    dom.ramp = [{"from_day": 0, "cap": 10}]
+    db.commit()
+    people = [world.profile(org, email=f"n{i}@acme.com", email_status="valid", created_at=_old(400 + i))
+              for i in range(6)]
+    for p in people:
+        world.consent(p, "refresh")
+    first = campaigns.sweep_org(db, org.id, rolling=True)["dispatch"]
+    assert len(first) == 2
+    for campaign_id, pid in first:
+        campaigns.finish_member(db, campaign_id, pid, "no_response")
+    later = datetime.utcnow() + timedelta(days=1)
+    second = campaigns.sweep_org(db, org.id, rolling=True, now=later)["dispatch"]
+    assert len(second) == 2 and {p for _, p in second}.isdisjoint({p for _, p in first})
+    # Six months on, they are due again.
+    far = datetime.utcnow() + timedelta(days=200)
+    due_again = {r.id for r in campaigns.eligible_query(db, org.id, far)}
+    assert {p for _, p in first} <= due_again
+
+
+def test_a_cancelled_sequence_counts_as_asked_only_if_a_message_left(world, db):
+    """Cancelling a cycle before anything went out must not lock people out
+    of the refresh for six months; once a message left, it does."""
+    org = world.org()
+    world.enable(org, "refresh", "refresh_rolling")
+    people = [world.profile(org, email=f"c{i}@acme.com", email_status="valid", created_at=_old(400 + i))
+              for i in range(2)]
+    for p in people:
+        world.consent(p, "refresh")
+    dispatched = campaigns.sweep_org(db, org.id, rolling=True)["dispatch"]
+    assert {p for _, p in dispatched} == {p.id for p in people}
+    campaign_id, contacted = dispatched[0]
+    db.add(Touch(profile_id=contacted, campaign_id=uuid.UUID(campaign_id), touch_no=1, channel="email",
+                 purpose="refresh", template="refresh_1", status="sent", sent_at=datetime.utcnow()))
+    campaigns.set_status(db, db.get(Campaign, uuid.UUID(campaign_id)), "cancelled", actor="test")
+    tomorrow = datetime.utcnow() + timedelta(days=1)
+    eligible = {r.id for r in campaigns.eligible_query(db, org.id, tomorrow)}
+    assert contacted not in eligible
+    assert ({p.id for p in people} - {contacted}) <= eligible

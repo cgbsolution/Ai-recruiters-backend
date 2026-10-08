@@ -70,6 +70,23 @@ def priority_expr(skills: Sequence[str]):
     return sum(sa.case((idx.contains(f"|{s}|", autoescape=True), 1), else_=0) for s in skills)
 
 
+def asked_since(since: datetime):
+    """Criteria on CampaignMember (+ Campaign) rows meaning "this person was
+    actually asked to refresh after `since`": the sequence ran its course
+    (answered, or three touches unanswered) or a refresh message left. A pilot
+    cancelled before dispatch, or a touch 1 skipped for missing consent,
+    doesn't count — that person can still be asked."""
+    sent = sa.exists().where(
+        Touch.campaign_id == CampaignMember.campaign_id, Touch.profile_id == CampaignMember.profile_id,
+        Touch.status.in_(("sent", "unknown")),
+    )
+    return sa.and_(
+        Campaign.id == CampaignMember.campaign_id, Campaign.kind == "refresh",
+        sa.func.coalesce(CampaignMember.completed_at, CampaignMember.enrolled_at) > since,
+        sa.or_(CampaignMember.status.in_(("responded", "no_response")), sent),
+    )
+
+
 def eligible_query(db: Session, organization_id: int, now: datetime, *, require_due: bool = True):
     window = freshness_window(get_settings(db, organization_id))
     consented = sa.exists().where(
@@ -81,11 +98,16 @@ def eligible_query(db: Session, organization_id: int, now: datetime, *, require_
         Campaign.id == CampaignMember.campaign_id, Campaign.kind == "refresh",
         Campaign.status.in_(("active", "paused")),
     )
+    # One refresh cycle per window: someone already asked is not asked again
+    # until the window passes, answer or not. Without this, non-responders went
+    # straight back to "due" and, sorting first, starved the rest of the
+    # backlog (found by the 40K load test).
+    asked_recently = sa.exists().where(CampaignMember.profile_id == RM.id, asked_since(now - window))
     q = db.query(RM.id, RM.candidate_email, RM.phone, RM.email_status, RM.created_at, anchor_expr().label("anchor")).filter(
         RM.organization_id == organization_id, _parsed(),
         RM.verification_status.notin_(("unreachable", "refreshing")),
         sa.or_(RM.email_status.in_(identity.EMAIL_SENDABLE), RM.email_status.is_(None)),
-        consented, ~running,
+        consented, ~running, ~asked_recently,
     )
     if require_due:
         q = q.filter(anchor_expr() < now - window)

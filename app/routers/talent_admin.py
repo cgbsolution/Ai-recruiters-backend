@@ -496,6 +496,14 @@ def erase_profile(
     return result
 
 
+@router.get("/retention", summary="Profiles past their retention date (deleted daily only if the retention switch is on)")
+def retention_report(org_id: int = Depends(talent_org), db: Session = Depends(get_db)):
+    due = retention.due_for_deletion(db, org_id, limit=100_000)
+    row = talent_settings.get_settings(db, org_id)
+    return {"due": len(due), "deletes_enabled": bool((row.flags or {}).get("retention")),
+            "retention_months": row.retention_months}
+
+
 # ── Audit view ──────────────────────────────────────────────────────────────
 
 @router.get("/audit", summary="Audit log, filterable by candidate, action and actor")
