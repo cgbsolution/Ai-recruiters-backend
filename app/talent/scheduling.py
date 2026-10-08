@@ -253,6 +253,11 @@ def book(db: Session, interview_id, booking_id, now: Optional[datetime] = None) 
           detail={"starts_at": booking.starts_at.isoformat(), "owner_user_id": booking.owner_user_id,
                   "attempt": interview.reschedule_count})
     db.commit()
+    if interview.mode == "live_voice":
+        from app.talent import live_voice
+
+        live_voice.ensure_application(db, interview)  # the live interviewer's job application + invite
+        db.commit()
     if owner is not None:
         _calendar_event(db, interview, owner)
     from app.agent.client import emit

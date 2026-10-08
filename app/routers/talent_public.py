@@ -186,6 +186,14 @@ def interview_start(token: str, body: StartRequest, db: Session = Depends(get_db
     from app.talent import interviews
 
     iv = _interview(db, token)
+    if iv.mode == "live_voice":
+        from app.talent import live_voice
+
+        try:  # same disclosure and consent step; the live interview link is revealed only after it
+            return live_voice.start(db, iv, disclosure_acknowledged=body.disclosure_acknowledged,
+                                    consent_to_record=body.consent_to_record)
+        except live_voice.LiveVoiceError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
     try:
         return interviews.start(db, iv, disclosure_acknowledged=body.disclosure_acknowledged,
                                 consent_to_record=body.consent_to_record, answer_mode=body.answer_mode)

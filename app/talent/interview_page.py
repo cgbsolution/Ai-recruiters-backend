@@ -51,8 +51,7 @@ def state(db: Session, interview: TalentInterview, now: Optional[datetime] = Non
                                                  InterviewBooking.status == "offered")
                .order_by(InterviewBooking.starts_at).all())
     opens, closes = scheduling.join_window(interview)
-    can_start = (interview.status == "scheduled" and interview.mode != "live_voice" and opens is not None
-                 and opens <= now <= closes)
+    can_start = interview.status == "scheduled" and opens is not None and opens <= now <= closes
     return {
         "organization": org.name if org else "", "job_title": job.title, "status": interview.status,
         "mode": interview.mode, "question_count": js.question_count, "time_limit_minutes": js.time_limit_minutes,

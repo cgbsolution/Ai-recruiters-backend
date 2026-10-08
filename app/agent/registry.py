@@ -7,6 +7,7 @@ from app.agent.interview_schedule import interview_schedule
 from app.agent.interview_score import interview_score, shortlist_build
 from app.agent.invite_plan import invite_plan
 from app.agent.invite_send import invite_send
+from app.agent.live_voice_sync import live_voice_sync
 from app.agent.match_job import match_job
 from app.agent.refresh_dead_letter import refresh_dead_letter
 from app.agent.refresh_reengage import refresh_reengage
@@ -34,4 +35,6 @@ FUNCTIONS = [
     interview_conduct,
     interview_score,
     shortlist_build,
+    # Phase 5 — live voice (behind its switch)
+    live_voice_sync,
 ]
