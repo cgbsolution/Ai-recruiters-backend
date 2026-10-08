@@ -294,6 +294,8 @@ class TalentJobSettings(Base):
     nice_to_haves = Column(JsonB, nullable=True)
     rubric = Column(JsonB, nullable=True)  # [{"criterion", "description", "weight"}]
     panel_user_ids = Column(JsonB, nullable=True)  # users whose Google calendars are offered
+    # Sort order from app.talent.scoring.build_shortlist: [{"match_id", "composite", "rank"}]
+    shortlist = Column(JsonB, nullable=True)
     match_status = Column(String(20), nullable=True)  # idle | running | done | failed
     match_error = Column(Text, nullable=True)
     last_matched_at = Column(DateTime, nullable=True)

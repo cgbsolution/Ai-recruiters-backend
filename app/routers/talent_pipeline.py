@@ -137,6 +137,108 @@ def list_interviews(
     return [_interview_row(db, iv) for iv in q.order_by(TalentInterview.updated_at.desc()).limit(300)]
 
 
+@router.get("/interviews/{interview_id}", summary="One interview: transcript, scores with evidence, summary")
+def get_interview(interview_id: str, org_id: int = Depends(talent_org), db: Session = Depends(get_db)):
+    from app.media import sign_media_url
+    from app.talent.scoring import rubric_for
+
+    iv = interview_or_404(db, org_id, interview_id)
+    m = db.get(JobMatch, iv.match_id)
+    p = db.get(ResumeMetadata, m.profile_id)
+    job = db.get(Job, m.job_id)
+    transcript = [{**t, "audio_url": sign_media_url(t["audio_path"]) if t.get("audio_path") else None}
+                  for t in iv.transcript or []]
+    return {
+        **_interview_row(db, iv),
+        "questions": iv.questions, "transcript": transcript, "scores": iv.scores, "summary": iv.summary,
+        "integrity_observations": iv.integrity_observations, "model": iv.model, "prompt_version": iv.prompt_version,
+        "consent_recorded_at": iv.consent_recorded_at, "ai_disclosed_at": iv.ai_disclosed_at,
+        "started_at": iv.started_at, "reviewed_at": iv.reviewed_at, "rubric": rubric_for(db, job),
+        "match": _match_out(m, p, 0),
+    }
+
+
+class OverrideRequest(BaseModel):
+    criterion: str
+    score: int
+    reason: str
+
+
+@router.post("/interviews/{interview_id}/override", summary="Change one criterion's score (audited)")
+def override_score(interview_id: str, body: OverrideRequest, org_id: int = Depends(talent_org),
+                   user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    from app.talent import scoring
+
+    iv = interview_or_404(db, org_id, interview_id)
+    try:
+        scoring.override(db, iv, body.criterion, body.score, body.reason, user)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    m = db.get(JobMatch, iv.match_id)
+    _emit("talent/shortlist.requested", {"job_id": m.job_id})
+    return {"scores": iv.scores, "overall_score": iv.overall_score}
+
+
+@router.post("/interviews/{interview_id}/review", summary="Mark the interview reviewed")
+def review_interview(interview_id: str, org_id: int = Depends(talent_org), user: User = Depends(get_current_user),
+                     db: Session = Depends(get_db)):
+    from app.talent import scoring
+
+    iv = interview_or_404(db, org_id, interview_id)
+    scoring.mark_reviewed(db, iv, user)
+    return _interview_row(db, iv)
+
+
+@router.get("/jobs/{job_id}/shortlist", summary="Interviewed candidates in shortlist order (a sort order only)")
+def get_shortlist(job_id: JobId, org_id: int = Depends(talent_org), user: User = Depends(get_current_user),
+                  db: Session = Depends(get_db)):
+    from app.talent import scoring
+
+    job = _job(db, job_id, user, org_id)
+    rows = scoring.shortlist(db, job.id)
+    for r in rows:
+        p = db.get(ResumeMetadata, r["profile_id"])
+        r["candidate"] = p.candidate_name if p else None
+        r["current_designation"] = p.current_designation if p else None
+    return rows
+
+
+class DecisionRequest(BaseModel):
+    note: Optional[str] = None
+    notify: bool = True
+
+
+@router.post("/matches/{match_id}/submit", summary="Submit this candidate to the client (your decision, recorded)")
+def submit_match(match_id: str, body: DecisionRequest, org_id: int = Depends(talent_org),
+                 user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    from app.talent import decisions
+
+    m = _match_or_404(db, org_id, match_id)
+    try:
+        decisions.submit_to_client(db, m, user, body.note)
+    except decisions.DecisionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {"status": m.status, "packet": decisions.client_packet(db, m)}
+
+
+@router.post("/matches/{match_id}/reject", summary="Close this candidate's process; optionally tell them")
+def reject_match(match_id: str, body: DecisionRequest, org_id: int = Depends(talent_org),
+                 user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    from app.talent import decisions
+
+    m = _match_or_404(db, org_id, match_id)
+    if m.status in ("closed", "declined", "submitted"):
+        raise HTTPException(status_code=409, detail="This candidate's process is already closed or submitted")
+    return decisions.reject(db, m, user, body.note, notify=body.notify)
+
+
+@router.get("/matches/{match_id}/packet", summary="What to share with the client about this candidate")
+def match_packet(match_id: str, org_id: int = Depends(talent_org), db: Session = Depends(get_db)):
+    from app.talent import decisions
+
+    return decisions.client_packet(db, _match_or_404(db, org_id, match_id))
+
+
 @router.post("/interviews/{interview_id}/reschedule", summary="Offer the candidate new times")
 def recruiter_reschedule(interview_id: str, org_id: int = Depends(talent_org), user: User = Depends(get_current_user),
                          db: Session = Depends(get_db)):

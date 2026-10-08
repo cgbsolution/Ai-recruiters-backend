@@ -501,7 +501,7 @@ async def add_cors_on_error(request: Request, call_next):
 # photos and resumes to anyone; authorized API responses now carry short-lived
 # signed /media/... URLs, served by app.media.router — a normal route, so the
 # CORS middlewares above cover its responses (including 403/404).
-for _upload_sub in ("jd", "resumes", "recordings", "photos", "screenshots"):
+for _upload_sub in ("jd", "resumes", "recordings", "photos", "screenshots", "talent_audio"):
     os.makedirs(os.path.join(media.UPLOAD_ROOT, _upload_sub), exist_ok=True)
 
 # MP4 conversion now lives in app.media. interview.py still does

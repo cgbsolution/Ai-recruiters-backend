@@ -67,4 +67,11 @@ def state(db: Session, interview: TalentInterview, now: Optional[datetime] = Non
         "meeting_link": interview.meeting_link if interview.mode == "live_voice" else None,
         "disclosure": AI_DISCLOSURE,
         "consented": interview.consent_recorded_at is not None,
+        "progress": _progress(db, interview, now) if interview.status == "in_progress" else None,
     }
+
+
+def _progress(db: Session, interview: TalentInterview, now: datetime) -> dict:
+    from app.talent import interviews
+
+    return interviews.progress(db, interview, now)

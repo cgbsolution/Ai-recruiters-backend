@@ -63,6 +63,7 @@ def decide(db: Session, approval: TalentApproval, user, approve: bool, note: Opt
           subject_id=approval.match_id, organization_id=approval.organization_id,
           profile_id=match.profile_id if match else None,
           detail={"approval_id": str(approval.id), "job_id": approval.job_id, "note": bool(approval.note)})
+    db.flush()  # sessions run without autoflush: make the decision visible to require() at once
     return approval
 
 

@@ -11,7 +11,7 @@ expired and used links all get the same 404, so links can't be probed.
 from datetime import datetime
 from typing import Dict, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -171,6 +171,60 @@ def interview_reschedule(token: str, db: Session = Depends(get_db)):
         scheduling.reschedule(db, interview.id, actor="candidate")
     except scheduling.NotReschedulable as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    return interview_page.state(db, _interview(db, token))
+
+
+class StartRequest(BaseModel):
+    disclosure_acknowledged: bool
+    consent_to_record: bool
+    answer_mode: str = "text"  # text | audio
+
+
+@router.post("/interview/{token}/start")
+def interview_start(token: str, body: StartRequest, db: Session = Depends(get_db)):
+    """Explicit AI disclosure and recording consent first — nothing is asked or stored before."""
+    from app.talent import interviews
+
+    iv = _interview(db, token)
+    try:
+        return interviews.start(db, iv, disclosure_acknowledged=body.disclosure_acknowledged,
+                                consent_to_record=body.consent_to_record, answer_mode=body.answer_mode)
+    except interviews.InterviewError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.get("/interview/{token}/progress")
+def interview_progress(token: str, db: Session = Depends(get_db)):
+    from app.talent import interviews
+
+    return interviews.progress(db, _interview(db, token))
+
+
+@router.post("/interview/{token}/answer")
+async def interview_answer(
+    token: str,
+    question_id: str = Form(...),
+    text: Optional[str] = Form(None),
+    audio: Optional[UploadFile] = File(None),
+    db: Session = Depends(get_db),
+):
+    from app.talent import interviews
+
+    iv = _interview(db, token)
+    interview_id = str(iv.id)
+    db.close()  # the answer step manages its own sessions around the transcription / follow-up calls
+    try:
+        return await interviews.answer(interview_id, question_id, text, audio)
+    except interviews.InterviewError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/interview/{token}/finish")
+def interview_finish(token: str, db: Session = Depends(get_db)):
+    from app.talent import interview_page, interviews
+
+    iv = _interview(db, token)
+    interviews.finish(db, iv, reason="candidate_finished")
     return interview_page.state(db, _interview(db, token))
 
 

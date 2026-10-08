@@ -57,6 +57,9 @@ MEDIA_TYPES = {
         ".doc": "application/msword",
         ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     },
+    # Talent Agent async voice answers (app.talent.interviews).
+    "talent_audio": {".webm": "audio/webm", ".ogg": "audio/ogg", ".m4a": "audio/mp4", ".mp4": "audio/mp4",
+                     ".wav": "audio/wav", ".mp3": "audio/mpeg"},
 }
 
 # File-name rules per category. Recordings and photos are named by numeric id
@@ -67,6 +70,7 @@ _NAME_RULES = {
     "photos": re.compile(r"^\d+\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
     "screenshots": re.compile(r"^[A-Za-z0-9_\-]+\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
     "resumes": re.compile(r"^[^./\\\x00-\x1f][^/\\\x00-\x1f]*\.(pdf|doc|docx)$", re.IGNORECASE),
+    "talent_audio": re.compile(r"^[0-9a-f]{32}-\d{1,3}\.(webm|ogg|m4a|mp4|wav|mp3)$", re.IGNORECASE),
 }
 
 _STORED_PREFIXES = ("/tmp/uploads/", "tmp/uploads/", "./uploads/", "/uploads/", "uploads/")
