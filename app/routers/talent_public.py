@@ -86,6 +86,107 @@ def refresh_submit(token: str, body: RefreshSubmit, db: Session = Depends(get_db
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+# ── Invite (Loop C) ─────────────────────────────────────────────────────────
+
+class InviteAnswer(BaseModel):
+    interested: bool
+    current_ctc: Optional[float] = None
+    expected_ctc: Optional[float] = None
+    notice_period_days: Optional[int] = None
+
+
+@router.get("/invite/{token}")
+def invite_page(token: str, db: Session = Depends(get_db)):
+    from app.talent import invites
+
+    row = tokens.lookup(db, token, "invite")
+    if row is None:
+        raise _not_found()
+    try:
+        return invites.page_data(db, row)
+    except invites.LinkError:
+        raise _not_found()
+
+
+@router.post("/invite/{token}")
+def invite_answer(token: str, body: InviteAnswer, db: Session = Depends(get_db)):
+    from app.talent import invites
+
+    row = tokens.lookup(db, token, "invite")
+    if row is None:
+        raise _not_found()
+    _throttle(token)
+    try:
+        return invites.respond(db, row, body.model_dump())
+    except invites.LinkError:
+        raise _not_found()
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ── Interview (Loop D) ──────────────────────────────────────────────────────
+
+class BookRequest(BaseModel):
+    slot_id: str
+
+
+def _interview(db: Session, token: str):
+    from app.talent import interview_page
+
+    try:
+        return interview_page.resolve(db, token)
+    except interview_page.LinkError:
+        raise _not_found()
+
+
+@router.get("/interview/{token}")
+def interview_state(token: str, db: Session = Depends(get_db)):
+    from app.talent import interview_page
+
+    return interview_page.state(db, _interview(db, token))
+
+
+@router.post("/interview/{token}/book")
+def interview_book(token: str, body: BookRequest, db: Session = Depends(get_db)):
+    from app.talent import interview_page, scheduling
+
+    interview = _interview(db, token)
+    _throttle(token)
+    try:
+        scheduling.book(db, interview.id, body.slot_id)
+    except (scheduling.SlotTaken, ValueError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc) or "That time is no longer available.")
+    return interview_page.state(db, _interview(db, token))
+
+
+@router.post("/interview/{token}/reschedule")
+def interview_reschedule(token: str, db: Session = Depends(get_db)):
+    from app.talent import interview_page, scheduling
+
+    interview = _interview(db, token)
+    _throttle(token)
+    try:
+        scheduling.reschedule(db, interview.id, actor="candidate")
+    except scheduling.NotReschedulable as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return interview_page.state(db, _interview(db, token))
+
+
+@router.post("/interview/{token}/human")
+def interview_human(token: str, db: Session = Depends(get_db)):
+    """"Talk to a person instead" — always available, never penalised."""
+    from app.talent import interview_page, scheduling
+
+    interview = _interview(db, token)
+    scheduling.human_requested(db, interview)
+    from app.agent.client import emit
+
+    emit("talent/interview.rescheduled", {"interview_id": str(interview.id)})  # stops reminders
+    return interview_page.state(db, _interview(db, token))
+
+
 # ── Unsubscribe ─────────────────────────────────────────────────────────────
 
 def _profile_for(db: Session, raw: str, purpose: str) -> ResumeMetadata:

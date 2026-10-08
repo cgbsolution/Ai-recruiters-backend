@@ -46,7 +46,7 @@ if settings.secret_key_is_weak:
 
 from app.database import Base, engine
 from app import media
-from app.routers import ai, auth, calendar, candidates, client_events, credits, file_manager, interview, jobs, observer, organizations, questions, resume_database, secondary_cam, talent_admin, talent_jobs, talent_public, tts, uploads
+from app.routers import ai, auth, calendar, candidates, client_events, credits, file_manager, interview, jobs, observer, organizations, questions, resume_database, secondary_cam, talent_admin, talent_jobs, talent_pipeline, talent_public, tts, uploads
 
 import app.models  # noqa: F401 — ensure all models are registered with Base
 import app.services.observer_events  # noqa: F401 — wire SQLAlchemy listeners for the live observer broker
@@ -536,6 +536,7 @@ app.include_router(media.router)
 # Inngest functions run in their own process: uvicorn app.agent.worker:app.
 app.include_router(talent_admin.router, prefix="/talent", tags=["Talent Agent"])
 app.include_router(talent_jobs.router, prefix="/talent", tags=["Talent Agent"])
+app.include_router(talent_pipeline.router, prefix="/talent", tags=["Talent Agent"])
 app.include_router(talent_public.router, prefix="/talent/public", tags=["Talent Agent (candidates)"])
 from app.talent.config import talent_config as _talent_config  # noqa: E402
 
