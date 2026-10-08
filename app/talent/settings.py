@@ -17,7 +17,10 @@ from sqlalchemy.orm import Session
 from app.models.talent import TalentJobSettings, TalentSettings
 from app.talent.config import talent_config
 
-LOOPS = ("refresh", "match", "invite", "interview", "live_voice")
+LOOPS = ("refresh", "match", "invite", "interview", "live_voice", "retention")
+# Sub-switches that are not loops of their own:
+#   refresh_rolling — the daily sweep enrolls every due profile (off: only pilot campaigns run)
+EXTRA_FLAGS = ("refresh_rolling",)
 AUTONOMY_MODES = ("autopilot", "copilot")
 INTERVIEW_MODES = ("async_text", "async_voice", "live_voice")
 

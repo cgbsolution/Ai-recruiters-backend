@@ -45,3 +45,6 @@ from app.models.talent import (
     TalentSettings,
     Touch,
 )
+
+# File cleanup when a talent-pool profile is deleted by any path (needs the models above).
+import app.talent.retention  # noqa: E402,F401

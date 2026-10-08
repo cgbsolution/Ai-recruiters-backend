@@ -143,6 +143,31 @@ class World:
             self.db.refresh(meta)
         return meta
 
+    def enable(self, org, *loops, quiet_hours=None, **settings):
+        """Switch loops on for `org`. Quiet hours are off unless given as (start, end):
+        the suite must not depend on the hour it runs at."""
+        from app.models.talent import TalentSettings
+
+        row = self.db.query(TalentSettings).filter_by(organization_id=org.id).first()
+        if row is None:
+            row = TalentSettings(organization_id=org.id, flags={}, timezone="Asia/Kolkata", refresh_after_days=180,
+                                 retention_months=24, default_autonomy="copilot")
+            self.db.add(row)
+        row.flags = {**(row.flags or {}), **{loop: True for loop in loops}}
+        row.quiet_hours_start, row.quiet_hours_end = quiet_hours or (0, 0)
+        for k, v in settings.items():
+            setattr(row, k, v)
+        self.db.commit()
+        return row
+
+    def consent(self, profile, *purposes, channel="email", status="granted"):
+        from app.models.talent import ContactConsent
+
+        for purpose in purposes or ("refresh", "jobs", "interview"):
+            self.db.merge(ContactConsent(profile_id=profile.id, channel=channel, purpose=purpose, status=status,
+                                         source="test", granted_at=datetime.utcnow()))
+        self.db.commit()
+
     def job(self, org, title="Backend Engineer", skills=("Python", "PostgreSQL"), **fields):
         job = Job(title=title, department="Engineering", location=fields.pop("location", "Bengaluru"),
                   job_type="Full-time", status=JobStatus.open, organization_id=org.id,
@@ -159,6 +184,53 @@ class World:
 @pytest.fixture
 def world(db):
     return World(db)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_events():
+    """No test ever talks to an Inngest server; `events` below captures instead."""
+    from app.agent import client as agent_client
+
+    agent_client.set_sink(lambda name, data: None)
+    yield
+    agent_client.set_sink(None)
+
+
+@pytest.fixture
+def events():
+    """Capture Inngest events emitted through app.agent.client.emit."""
+    from app.agent import client as agent_client
+
+    captured = []
+    agent_client.set_sink(lambda name, data: captured.append((name, data)))
+    yield captured
+    agent_client.set_sink(None)
+
+
+@pytest.fixture
+def outbox():
+    from app.talent.transports import memory_outbox
+
+    return memory_outbox
+
+
+class CapturingInngest:
+    """A mocked Inngest client that records what step.send_event sends."""
+
+    def __new__(cls):
+        from inngest.experimental import mocked
+
+        class _Client(mocked.Inngest):
+            sent = []
+
+            async def send(self, events, *, skip_middleware=False):
+                events = events if isinstance(events, list) else [events]
+                self.sent.extend(events)
+                return ["0" * 26 for _ in events]
+
+        client = _Client(app_id="talent-test", is_production=False)
+        client.sent = []
+        return client
 
 
 def utcnow():

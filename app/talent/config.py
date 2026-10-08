@@ -82,7 +82,12 @@ class TalentConfig(BaseSettings):
     TALENT_INVITE_REMINDER_DAYS: int = 3
     TALENT_INVITE_CLOSE_DAYS: int = 3
     TALENT_ENROLL_FRACTION: float = 0.4  # share of the bulk budget new enrolments may take per day
-    TALENT_PUBLIC_BASE_URL: str = ""  # candidate links; defaults to FRONTEND_BASE_URL
+    TALENT_PUBLIC_BASE_URL: str = ""  # candidate pages; defaults to FRONTEND_BASE_URL
+    # Public URL of THIS API. The List-Unsubscribe header points here because
+    # mail providers POST the one-click unsubscribe, which a frontend page can't take.
+    TALENT_PUBLIC_API_URL: str = ""
+    # Optional postal address in the footer of outreach email (CAN-SPAM and similar).
+    TALENT_SENDER_POSTAL_ADDRESS: str = ""
 
     # ── Links ────────────────────────────────────────────────────────────────
     TALENT_REFRESH_LINK_DAYS: int = 14

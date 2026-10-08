@@ -126,7 +126,8 @@ class CvVersion(Base):
     file_path = Column(String(500), nullable=True)
     file_hash = Column(String(64), nullable=True)
     source = Column(String(30), nullable=False)  # backfill | refresh_upload | refresh_confirm | reparse
-    parse_status = Column(String(16), nullable=False, default="pending")  # pending | parsed | failed | skipped
+    # staged (uploaded, page not submitted) | pending | parsed | failed | skipped
+    parse_status = Column(String(16), nullable=False, default="pending")
     parsed = Column(JsonB, nullable=True)
     field_confidence = Column(JsonB, nullable=True)
     parse_confidence = Column(Float, nullable=True)
@@ -209,6 +210,7 @@ class Touch(Base):
     sender_domain = Column(String(255), nullable=True)
     provider_message_id = Column(String(255), nullable=True, index=True)
     error = Column(Text, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
     claimed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     sent_at = Column(DateTime, nullable=True)

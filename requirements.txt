@@ -56,5 +56,7 @@ tzdata>=2024.1
 edge-tts>=7.0.0
 
 # ── Talent Agent (app.talent / app.agent) ───────────────────────────────────
+# Durable workflows (cron, sleeps, wait-for-event) for the four loops.
+inngest>=0.5.19,<0.6
 # Matching falls back to numpy cosine when the database has no pgvector.
 numpy>=1.26
