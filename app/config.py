@@ -74,6 +74,8 @@ class Settings(BaseSettings):
     RESUME_AI_CONCURRENCY: int = 4
     RESUME_EXTRACT_WORKERS: int = 2
     RESUME_EXTRACT_TIMEOUT_SECONDS: int = 90
+    # Background processes that compress stored PDFs/DOCX (lowest priority).
+    RESUME_COMPRESS_WORKERS: int = 1
     RESUME_AI_TIMEOUT_SECONDS: int = 120
     # HMAC keys for signed media URLs (app.media) and opaque page-URL refs
     # (app.refs). Optional: when empty they are derived from SECRET_KEY with

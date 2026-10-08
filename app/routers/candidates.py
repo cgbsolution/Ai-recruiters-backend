@@ -101,6 +101,7 @@ from app.schemas.candidate import (
 )
 from app.schemas.resume_metadata import DuplicateCheckResponse
 from app.services import candidate_service
+from app.services.file_compression import schedule_compression
 from app.services.interview_text import feedback_and_question, question_text
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -963,6 +964,7 @@ async def upload_resumes(
         file_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
         with open(file_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
+        schedule_compression(file_path)  # background worker; the stored copy shrinks, its text doesn't change
 
         # Use filename stem as placeholder name until parse completes
         placeholder_name = Path(file.filename).stem
@@ -1173,6 +1175,7 @@ async def replace_resume(
     new_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
     with open(new_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
+    schedule_compression(new_path)
 
     old_path = candidate.resume_path
 

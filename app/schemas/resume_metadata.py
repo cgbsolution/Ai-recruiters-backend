@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ResumeMetadataRead(BaseModel):
@@ -35,7 +35,10 @@ class ResumeMetadataUpdate(BaseModel):
     experience_years: Optional[float] = None
     skills: Optional[List[str]] = None
     location: Optional[str] = None
-    annual_package: Optional[float] = None
+    annual_package: Optional[float] = Field(None, ge=0, le=1000)
+    expected_ctc: Optional[float] = Field(None, ge=0, le=1000)
+    notice_period_days: Optional[int] = Field(None, ge=0, le=365)
+    open_to_relocate: Optional[bool] = None
 
 
 class DuplicateCheckResponse(BaseModel):

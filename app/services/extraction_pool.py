@@ -33,6 +33,22 @@ logger = logging.getLogger(__name__)
 _MAX_TASKS_PER_CHILD = 200
 
 _executor: Optional[concurrent.futures.ProcessPoolExecutor] = None
+_executor_lock = threading.Lock()  # uploads may start the pool from several threads
+
+# A separate, lowest-priority pool for background jobs (compressing stored
+# files): ~1-3 s per resume, so sharing the extraction workers would slow a
+# bulk upload several times over. It catches up behind the parsing instead.
+_background: Optional[concurrent.futures.ProcessPoolExecutor] = None
+
+
+def _init_background_worker() -> None:
+    _init_worker()
+    logging.getLogger("fontTools").setLevel(logging.ERROR)  # "meta NOT subset" per font
+    if hasattr(os, "nice"):
+        try:
+            os.nice(9)  # on top of _init_worker's 10: the lowest priority there is
+        except OSError:
+            pass
 
 
 def _init_worker() -> None:
@@ -73,16 +89,17 @@ def _extract(file_path: str, fast_parse: bool) -> Tuple[str, Optional[dict]]:
 
 def _get_executor() -> concurrent.futures.ProcessPoolExecutor:
     global _executor
-    if _executor is None:
-        _executor = concurrent.futures.ProcessPoolExecutor(
-            max_workers=max(1, settings.RESUME_EXTRACT_WORKERS),
-            # spawn, not fork: forking the multi-threaded API process can
-            # deadlock the child on a lock another thread held at fork time.
-            mp_context=multiprocessing.get_context("spawn"),
-            initializer=_init_worker,
-            max_tasks_per_child=_MAX_TASKS_PER_CHILD,
-        )
-    return _executor
+    with _executor_lock:
+        if _executor is None:
+            _executor = concurrent.futures.ProcessPoolExecutor(
+                max_workers=max(1, settings.RESUME_EXTRACT_WORKERS),
+                # spawn, not fork: forking the multi-threaded API process can
+                # deadlock the child on a lock another thread held at fork time.
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_init_worker,
+                max_tasks_per_child=_MAX_TASKS_PER_CHILD,
+            )
+        return _executor
 
 
 def _discard_executor(executor: concurrent.futures.ProcessPoolExecutor) -> None:
@@ -91,8 +108,9 @@ def _discard_executor(executor: concurrent.futures.ProcessPoolExecutor) -> None:
     file costs the in-flight siblings their worker — extract_text_isolated
     retries those once."""
     global _executor
-    if _executor is executor:
-        _executor = None
+    with _executor_lock:
+        if _executor is executor:
+            _executor = None
     for proc in list((getattr(executor, "_processes", None) or {}).values()):
         try:
             proc.kill()
@@ -131,7 +149,37 @@ async def extract_text_isolated(file_path: str, fast_parse: bool = False) -> Tup
     raise RuntimeError("This file could not be read.")  # unreachable
 
 
+def submit_background(fn, *args) -> None:
+    """Run fn(*args) in a worker process, fire and forget (e.g. compressing a
+    just-saved upload). Failures are logged, never raised to the caller."""
+    def _log_failure(future: concurrent.futures.Future) -> None:
+        exc = future.exception()
+        if exc is not None:
+            logger.info("Background %s failed: %s", getattr(fn, "__name__", "task"), exc)
+
+    global _background
+    try:
+        with _executor_lock:
+            if _background is None:
+                _background = concurrent.futures.ProcessPoolExecutor(
+                    max_workers=max(1, settings.RESUME_COMPRESS_WORKERS),
+                    mp_context=multiprocessing.get_context("spawn"),
+                    initializer=_init_background_worker,
+                    max_tasks_per_child=_MAX_TASKS_PER_CHILD,
+                )
+            pool = _background
+        pool.submit(fn, *args).add_done_callback(_log_failure)
+    except Exception as exc:  # pool shutting down / broken: the file just stays as it is
+        logger.info("Could not queue %s: %s", getattr(fn, "__name__", "task"), exc)
+
+
 def shutdown_extraction_pool() -> None:
-    """Kill the workers on server shutdown, so a stuck file cannot hold up exit."""
+    """Kill the workers on server shutdown, so a stuck file cannot hold up exit.
+    Queued compressions are dropped; those files simply stay uncompressed
+    (python -m app.services.file_compression catches up on them)."""
+    global _background
     if _executor is not None:
         _discard_executor(_executor)
+    if _background is not None:
+        pool, _background = _background, None
+        _discard_executor(pool)

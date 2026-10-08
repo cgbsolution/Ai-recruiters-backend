@@ -101,6 +101,7 @@ from app.schemas.interview import (
     ViolationResponse,
 )
 from app.services import avatar_interview_service as svc
+from app.services.file_compression import schedule_compression
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -871,6 +872,7 @@ async def upload_resume_for_apply(
             pass
         raise HTTPException(status_code=400, detail="Only PDF, DOC, or DOCX files are accepted.")
 
+    schedule_compression(file_path)
     return {"resume_path": file_path}
 
 

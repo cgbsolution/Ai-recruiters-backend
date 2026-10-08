@@ -22,9 +22,13 @@ import time
 from datetime import date
 from typing import Iterable, List, Optional
 
+from app.services.locations import is_plausible_location, place_from_text
+
 logger = logging.getLogger(__name__)
 
-PROFILE_VERSION = 1
+# 2: locations validated against known places; repairs rows the old location
+#    extractor filled with sentence fragments ("And Profitability").
+PROFILE_VERSION = 2
 
 
 # ── Small helpers ────────────────────────────────────────────────────────────
@@ -70,28 +74,57 @@ def work_entries(value) -> List[dict]:
 
 # ── Location ─────────────────────────────────────────────────────────────────
 
-_CITY_ALIASES = {
-    "bangalore": "Bengaluru", "bengaluru": "Bengaluru", "bengalore": "Bengaluru",
-    "gurgaon": "Gurugram", "gurugram": "Gurugram",
-    "bombay": "Mumbai", "navi mumbai": "Navi Mumbai", "calcutta": "Kolkata",
-    "madras": "Chennai", "new delhi": "Delhi", "delhi ncr": "Delhi NCR", "ncr": "Delhi NCR",
-    "greater noida": "Greater Noida", "trivandrum": "Thiruvananthapuram",
-    "poona": "Pune", "mysore": "Mysuru", "baroda": "Vadodara", "vizag": "Visakhapatnam",
-}
-_NOT_A_CITY = {"india", "remote", "na", "n/a", "-", "anywhere"}
-
-
 def normalize_city(location: Optional[str]) -> Optional[str]:
-    """'Noida, Uttar Pradesh, India' -> 'Noida'; 'bangalore' -> 'Bengaluru'."""
-    if not location or not isinstance(location, str):
-        return None
-    for part in re.split(r"[,/|;]|\s-\s", location):
-        part = re.sub(r"\s+", " ", part).strip(" .()").strip()
-        key = part.lower()
-        if not part or key in _NOT_A_CITY or len(part) > 40 or not re.search(r"[a-zA-Z]", part):
-            continue
-        return _CITY_ALIASES.get(key) or part.title()
-    return None
+    """'Noida, Uttar Pradesh, India' -> 'Noida'; 'bangalore' -> 'Bengaluru';
+    a sentence fragment ('And Profitability') -> None. Only real places reach
+    the location filter (app.services.locations)."""
+    return place_from_text(location)
+
+
+# The location pattern of fast-parser version 1, kept only to recognise the
+# values it produced: it matched "location"/"city"/... inside other words
+# ("allocation", "capacity") and took the rest of the line.
+_OLD_LOCATION_PATTERNS = (
+    re.compile(r"(?:location|address|city|based in|residing|resident)\s*[:\-]?\s*([A-Za-z\s,]+?)(?:\n|$|\|)", re.I),
+    re.compile(r"(?:currently\s+(?:in|at|based))\s+([A-Za-z\s,]+?)(?:\n|$|\|)", re.I),
+)
+
+
+def _is_old_location_bug(location: str, text: str) -> bool:
+    if is_plausible_location(location):
+        return False
+    for pattern in _OLD_LOCATION_PATTERNS:
+        for m in pattern.finditer(text):
+            value = m.group(1).strip().strip(",").strip()
+            if 2 < len(value) < 60 and value.title() == location:
+                return True
+    return False
+
+
+def _repair_location(meta) -> None:
+    """Replace a location the old extractor made up from a sentence, and the
+    "based in ..." part of the summary it wrote with it."""
+    from app.services.fast_resume_parser import extract_location
+
+    old = meta.location
+    if not old or not meta.raw_text or not _is_old_location_bug(old, meta.raw_text):
+        return
+    new = extract_location(meta.raw_text)
+    meta.location = new
+    if meta.summary and f"based in {old}" in meta.summary:
+        if new:
+            meta.summary = meta.summary.replace(f"based in {old}", f"based in {new}")
+        else:
+            meta.summary = meta.summary.replace(f" | based in {old}", "").replace(f"based in {old} | ", "")
+
+
+def _drop_junk_skills(meta) -> None:
+    from app.services.fast_resume_parser import is_junk_skill
+
+    skills = json_list(meta.skills)
+    kept = [s for s in skills if not (isinstance(s, str) and is_junk_skill(s))]
+    if len(kept) != len(skills):
+        meta.skills = json.dumps(kept)
 
 
 # ── Education ────────────────────────────────────────────────────────────────
@@ -292,6 +325,13 @@ def _search_text(meta, work: List[dict]) -> str:
 
 def derive_profile(meta, text_changed: bool = True) -> None:
     """Refresh the derived columns of `meta` (an ORM object) in place."""
+    if text_changed:
+        typed_in = set(json_list(meta.recruiter_fields))
+        if "location" not in typed_in:
+            _repair_location(meta)
+        if "skills" not in typed_in:
+            _drop_junk_skills(meta)
+
     work = work_entries(meta.work_experience)
     meta.skills_index = tag_index(json_list(meta.skills))
     meta.certs_index = tag_index(json_list(meta.certifications))
@@ -306,13 +346,14 @@ def derive_profile(meta, text_changed: bool = True) -> None:
     # states — an unrelated write such as a status change never clears them.
     if text_changed:
         text = meta.raw_text or ""
+        typed_in = set(json_list(meta.recruiter_fields))  # a recruiter's value beats the CV's
         for column, value in (
             ("current_ctc", extract_ctc(text)),
             ("expected_ctc", extract_ctc(text, expected=True)),
             ("notice_period_days", extract_notice_days(text)),
             ("open_to_relocate", extract_relocation(text)),
         ):
-            if value is not None:
+            if value is not None and column not in typed_in:
                 setattr(meta, column, value)
     meta.derived_version = PROFILE_VERSION
 

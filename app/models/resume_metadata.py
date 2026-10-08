@@ -7,6 +7,7 @@ updated (not duplicated).  This avoids repeated LLM parsing and enables
 fast cross-job candidate matching.
 """
 
+import json
 from datetime import datetime
 
 from sqlalchemy import (
@@ -60,6 +61,9 @@ class ResumeMetadata(Base):
     # progress for a batch whose in-memory counters were lost.
     batch_id = Column(String(32), nullable=True, index=True)
     parse_mode = Column(String(10), nullable=True)   # "fast" | "ai"
+    # fast_resume_parser.FAST_PARSER_VERSION that produced a "fast" parse: an
+    # identical re-upload reuses the stored parse only if it is current.
+    parser_version = Column(Integer, nullable=True)
 
     # ── Status ────────────────────────────────────────────────────────────────
     parsing_status = Column(
@@ -89,6 +93,10 @@ class ResumeMetadata(Base):
     notice_period_days = Column(Integer, nullable=True)  # 0 = immediate joiner
     open_to_relocate = Column(Boolean, nullable=True)
     derived_version = Column(Integer, nullable=True)
+    # JSON list of fields whose current value a recruiter typed in (the
+    # profile shows "Recruiter" instead of "From CV"). Maintained by the hook
+    # below: a recruiter edit adds the field, any later CV write takes it back.
+    recruiter_fields = Column(Text, nullable=True)
 
     # ── Timestamps ────────────────────────────────────────────────────────────
     parsed_at = Column(DateTime, nullable=True)
@@ -96,18 +104,43 @@ class ResumeMetadata(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+# Fields a recruiter can set by hand (PATCH /resume-database/{id}).
+RECRUITER_EDITABLE = (
+    "candidate_name", "phone", "current_designation", "experience_years", "skills", "location",
+    "annual_package", "expected_ctc", "notice_period_days", "open_to_relocate",
+)
+
+
+def mark_recruiter_edit(session) -> None:
+    """Call before committing a recruiter's manual edit: the fields it changes
+    are then recorded as recruiter-provided rather than read from the CV."""
+    session.info["recruiter_edit"] = True
+
+
 @event.listens_for(Session, "before_flush")
 def _refresh_derived_resume_fields(session, flush_context, instances):
     """Every ORM write of a ResumeMetadata row — bulk upload, re-parse, edit,
     candidate application — refreshes its derived search columns, so no write
     path can leave the search page's filters stale."""
-    from app.services.resume_profile import PROFILE_VERSION, derive_profile
+    from app.services.resume_profile import PROFILE_VERSION, derive_profile, json_list
 
+    recruiter_edit = session.info.pop("recruiter_edit", False)
     with session.no_autoflush:
         for obj in list(session.new) + list(session.dirty):
             if not isinstance(obj, ResumeMetadata) or obj in session.deleted:
                 continue
             state = inspect(obj)
+            if not state.pending:
+                changed = {f for f in RECRUITER_EDITABLE if state.attrs[f].history.has_changes()}
+                if changed:
+                    owned = set(json_list(obj.recruiter_fields))
+                    if recruiter_edit:
+                        # A value a recruiter clears is no longer theirs: the CV may fill it again.
+                        cleared = {f for f in changed if getattr(obj, f) is None}
+                        owned = (owned | changed) - cleared
+                    else:
+                        owned -= changed
+                    obj.recruiter_fields = json.dumps(sorted(owned)) if owned else None
             if state.pending and obj.source is None:
                 # Bulk upload and imports say so explicitly; the other writers
                 # (candidate applications, the public apply form) are applications.

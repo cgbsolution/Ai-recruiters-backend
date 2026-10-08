@@ -21,6 +21,16 @@ import json
 import logging
 from typing import Optional
 
+from app.services.locations import find_city, place_from_text
+
+# Bump when the parser's output changes in a way worth re-parsing for. Bulk
+# re-uploads of an identical file reuse the stored parse only when it was made
+# by this version (app.routers.resume_database._claim_bulk_row).
+# 2: location from labelled lines / the contact header only, validated against
+#    known places ("cost allocation, and profitability" no longer becomes the
+#    location "And Profitability"); skills matched as whole words.
+FAST_PARSER_VERSION = 2
+
 logger = logging.getLogger(__name__)
 
 
@@ -738,14 +748,12 @@ def extract_skills(text: str, skills_section: str = "") -> list[str]:
     search_text = (skills_section + "\n" + text).lower()
     found = set()
 
-    # Step 1: Match against COMMON_SKILLS dictionary
+    # Step 1: Match against COMMON_SKILLS dictionary — as whole words. A plain
+    # substring test found "consul" in "consulting", "excel" in "excellent",
+    # "java" in "javascript". The substring test stays as a cheap pre-filter.
     for skill in COMMON_SKILLS:
-        if len(skill) <= 3:
-            if re.search(r"\b" + re.escape(skill) + r"\b", search_text):
-                found.add(skill)
-        else:
-            if skill in search_text:
-                found.add(skill)
+        if skill in search_text and _skill_pattern(skill).search(search_text):
+            found.add(skill)
 
     # Step 2: Extract items from parenthetical/bracket patterns
     # e.g., "Web Development (JavaScript, React js, Next js, MYSQL)"
@@ -861,6 +869,35 @@ def extract_skills(text: str, skills_section: str = "") -> list[str]:
 
 # ── Skill validation ─────────────────────────────────────────────────────────
 
+_SKILL_PATTERNS: dict = {}
+
+
+def _skill_pattern(skill: str) -> re.Pattern:
+    """Whole-word match; longer names may carry a plural, version or "js"
+    suffix ("audits", "python3", "reactjs")."""
+    pattern = _SKILL_PATTERNS.get(skill)
+    if pattern is None:
+        suffix = r"(?:js|\d{1,2}|e?s)?" if len(skill) > 3 else ""
+        pattern = re.compile(r"(?<![a-z0-9])" + re.escape(skill) + suffix + r"(?![a-z0-9])")
+        _SKILL_PATTERNS[skill] = pattern
+    return pattern
+
+
+# Pieces of sentences and tables that the section/bracket splitting picks up.
+_DURATION_RE = re.compile(r"\d+(?:\.\d+)?\s*\+?\s*(?:years?|yrs?|months?|mos?|weeks?|days?)\b")
+_LEADING_JOINER_RE = re.compile(r"^(?:and|or|&|of|in|to|with|for|the|a|an|at|by)\b")
+_NOT_SKILLS = {
+    "present employer", "current employer", "previous employer", "present", "current", "till date",
+    "to date", "ongoing", "full time", "part time", "internship", "fresher", "notice period",
+}
+
+
+def is_junk_skill(value: str) -> bool:
+    """A duration, a sentence fragment or a table cell, not a skill
+    ("2.5+ Years", "And Cf", "Present Employer")."""
+    s = (value or "").strip().lower()
+    return bool(_DURATION_RE.search(s) or _LEADING_JOINER_RE.match(s) or s in _NOT_SKILLS)
+
 # Indian cities/states that get extracted as "skills"
 _LOCATION_WORDS = {
     "mumbai", "delhi", "bangalore", "bengaluru", "hyderabad", "chennai", "kolkata",
@@ -968,6 +1005,10 @@ _DATE_RE = re.compile(
 def _is_valid_skill(s: str) -> bool:
     """Return True only if s looks like a real technical skill."""
     s = s.strip().lower()
+
+    # ── Durations, sentence fragments, table cells ──
+    if _DURATION_RE.search(s) or _LEADING_JOINER_RE.match(s) or s in _NOT_SKILLS:
+        return False
 
     # ── Pure numbers / date-like ──
     if re.match(r"^\d+$", s):
@@ -1352,38 +1393,58 @@ def extract_certifications(text: str, cert_section: str = "") -> list[str]:
 # Location & Designation Extraction
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_location(text: str) -> Optional[str]:
-    """Extract location from common patterns in resumes."""
-    patterns = [
-        r"(?:location|address|city|based in|residing|resident)\s*[:\-]?\s*([A-Za-z\s,]+?)(?:\n|$|\|)",
-        r"(?:currently\s+(?:in|at|based))\s+([A-Za-z\s,]+?)(?:\n|$|\|)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            loc = match.group(1).strip().strip(",").strip()
-            if 2 < len(loc) < 60:
-                return loc.title()
+_LOCATION_LABEL = re.compile(
+    # A label at the start of a line (or after a separator), followed by ":" or
+    # "-". The old pattern had neither anchor nor word boundary, so it fired
+    # inside "allocation", "capacity", "addressing" and took the rest of the line.
+    r"(?im)(?:^|[|•·,;]\s*)(?:current\s+|present\s+|permanent\s+)?"
+    r"(?:location|address|city|place|residence)\s*[:\-–]\s*([^\n|]{2,160})"
+)
+_LOCATION_PHRASE = re.compile(
+    r"(?i)\b(?:based\s+(?:out\s+of|in|at)|residing\s+(?:at|in)|resident\s+of|"
+    r"currently\s+(?:based|located|living)\s+(?:in|at))\s+([A-Za-z][^\n|;]{1,100})"
+)
+_EMAIL_OR_URL = re.compile(r"\S+@\S+|https?://\S+|www\.\S+", re.IGNORECASE)
 
-    # Fallback: look for known cities in first 20 lines
-    known_cities = [
-        "Mumbai", "Delhi", "Bangalore", "Bengaluru", "Hyderabad", "Chennai",
-        "Kolkata", "Pune", "Ahmedabad", "Jaipur", "Lucknow", "Noida",
-        "Gurgaon", "Gurugram", "Chandigarh", "Indore", "Bhopal", "Kochi",
-        "Coimbatore", "Trivandrum", "Thiruvananthapuram", "Nagpur", "Surat",
-        "Visakhapatnam", "Patna", "Ranchi", "Bhubaneswar", "Mysore",
-        "Mangalore", "Vadodara", "Nashik", "Thane", "Faridabad",
-        "Dubai", "Abu Dhabi", "Sharjah", "Ajman", "Fujairah",
-        "Ras Al Khaimah", "Al Ain", "Riyadh", "Jeddah", "Dammam",
-        "Doha", "Muscat", "Kuwait City", "Manama",
-        "New York", "San Francisco", "Los Angeles", "Chicago", "Houston",
-        "Seattle", "Boston", "Austin", "Denver", "Toronto", "Vancouver",
-        "London", "Manchester", "Birmingham", "Edinburgh",
-        "Singapore", "Sydney", "Melbourne", "Berlin", "Amsterdam",
-    ]
-    first_section = "\n".join(text.split("\n")[:20])
-    for city in known_cities:
-        if re.search(r"\b" + re.escape(city) + r"\b", first_section, re.IGNORECASE):
+
+def _looks_like_name_line(line: str) -> bool:
+    words = line.split()
+    return 0 < len(words) <= 4 and not re.search(r"[\d@:,|]", line)
+
+
+# Header lines that mention a city without it being where the candidate lives:
+# a preference, a college ("Delhi Public School", "Pune University") or prose.
+_NOT_RESIDENCE_LINE = re.compile(
+    r"prefer|relocat|willing|open\s+to|school|college|universit|institute|academy|\biit\b|\bnit\b", re.IGNORECASE
+)
+
+
+def _could_hold_address(line: str) -> bool:
+    if _NOT_RESIDENCE_LINE.search(line):
+        return False
+    # Contact lines are short or separated ("Noida | +91 ..."); prose is neither.
+    return len(line.split()) <= 10 or bool(re.search(r"[|,•·]|\d{6}", line))
+
+
+def extract_location(text: str) -> Optional[str]:
+    """The candidate's city: from a "Location:"/"Address:" line or a "based in"
+    phrase, else from a known city in the contact header (the first lines).
+    Only known places are returned (see app.services.locations) — never a
+    sentence fragment. None when the resume doesn't say."""
+    if not text:
+        return None
+    clean = _EMAIL_OR_URL.sub(" ", text)  # "rahul.pune@gmail.com" is not a location
+    for pattern in (_LOCATION_LABEL, _LOCATION_PHRASE):
+        for match in pattern.finditer(clean):
+            place = place_from_text(match.group(1))
+            if place:
+                return place
+    header = [line for line in clean.split("\n") if line.strip()][:15]
+    if header and _looks_like_name_line(header[0]):
+        header = header[1:]  # the candidate's name ("Anand Kumar")
+    for line in header:
+        city = find_city(line) if _could_hold_address(line) else None
+        if city:
             return city
     return None
 

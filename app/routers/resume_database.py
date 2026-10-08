@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -43,10 +44,12 @@ from app.media import (
     sign_media_url,
 )
 from app.models.organization import Organization
-from app.models.resume_metadata import ResumeMetadata
+from app.models.resume_metadata import ResumeMetadata, mark_recruiter_edit
 from app.models.user import User, UserRole
 from app.schemas.resume_metadata import ResumeMetadataUpdate
 from app.services import resume_search
+from app.services.fast_resume_parser import FAST_PARSER_VERSION
+from app.services.file_compression import schedule_compression
 from app.services.resume_search import NOT_UNPARSED_PLACEHOLDER as _NOT_UNPARSED_PLACEHOLDER
 
 logger = logging.getLogger(__name__)
@@ -270,6 +273,9 @@ def _claim_bulk_row(meta_id: int, file_path: str, batch_id: str, parse_mode: str
             # Choosing AI mode means wanting the AI parse: a regex-parsed copy
             # is re-parsed rather than reused.
             and (parse_mode != "ai" or c.parse_mode == "ai")
+            # A regex parse made by an older parser is redone, so parser fixes
+            # (e.g. locations) reach files that are uploaded again.
+            and (c.parse_mode == "ai" or c.parser_version == FAST_PARSER_VERSION)
         ]
         if reusable:
             target = max(reusable, key=lambda c: c.id)
@@ -283,6 +289,7 @@ def _claim_bulk_row(meta_id: int, file_path: str, batch_id: str, parse_mode: str
             target.updated_at = datetime.utcnow()
             db.commit()
             _remove_unused_resume_files(stale)
+            schedule_compression(file_path)
             return "replaced"
 
         meta.parsing_status = "processing"
@@ -291,6 +298,19 @@ def _claim_bulk_row(meta_id: int, file_path: str, batch_id: str, parse_mode: str
         return None
     finally:
         db.close()
+
+
+# How the regex parser writes its summary ("Name | 4 years experience |
+# based in Pune | Skills: ..."); an LLM summary is prose.
+_FAST_SUMMARY_RE = re.compile(r"(?:^|\| )(?:\d+(?:\.\d+)? years experience|based in |Skills: )")
+
+
+def _was_ai_parsed(row: ResumeMetadata) -> bool:
+    """Whether a stored parse came from the LLM. Rows from before parse_mode
+    was recorded are judged by their summary's shape."""
+    if row.parse_mode:
+        return row.parse_mode == "ai"
+    return bool(row.summary) and not _FAST_SUMMARY_RE.search(row.summary)
 
 
 def _file_sha256(stored_path: Optional[str]) -> Optional[str]:
@@ -356,7 +376,7 @@ def _save_parsed_once(db: Session, meta_id: int, file_path: str, batch_id: str, 
         and new_hash is not None
         and target.file_hash == new_hash
         and parse_mode == "fast"
-        and target.parse_mode != "fast"
+        and _was_ai_parsed(target)
         and target.parsing_status == "completed"
     )
     if keep_existing_parse:
@@ -386,6 +406,7 @@ def _save_parsed_once(db: Session, meta_id: int, file_path: str, batch_id: str, 
     target.file_hash = new_hash
     target.batch_id = batch_id
     target.parse_mode = parse_mode
+    target.parser_version = FAST_PARSER_VERSION if parse_mode == "fast" else None
     target.parsing_status = "completed"
     target.parsing_error = None
     target.parsed_at = datetime.utcnow()
@@ -491,6 +512,8 @@ async def _process_bulk_item(meta_id: int, file_path: str, batch_id: str, parse_
             outcome = await asyncio.to_thread(
                 _save_parsed, meta_id, file_path, batch_id, parse_mode, raw_text, fields
             )
+        if outcome != "failed":
+            schedule_compression(file_path)
     except Exception as exc:
         if isinstance(exc, (RuntimeError, ValueError)):
             logger.warning("Bulk parse failed for resume %s (%s): %s", meta_id, os.path.basename(file_path), exc)
@@ -1126,16 +1149,19 @@ def update_resume_metadata(
     if not meta:
         raise HTTPException(status_code=404, detail="Resume not found")
 
-    update_data = body.model_dump(exclude_none=True)
+    # Fields sent as null are cleared (e.g. a notice period set back to "Not
+    # stated"); fields left out are untouched.
+    update_data = body.model_dump(exclude_unset=True)
 
     # skills is stored as a JSON string in the DB
     if "skills" in update_data:
-        update_data["skills"] = json.dumps(update_data["skills"])
+        update_data["skills"] = json.dumps(update_data["skills"] or [])
 
     for field, value in update_data.items():
         setattr(meta, field, value)
 
     meta.updated_at = datetime.utcnow()
+    mark_recruiter_edit(db)
     db.commit()
     db.refresh(meta)
 
@@ -1673,6 +1699,7 @@ async def import_with_file(
         # The row was not stored, so its file must not linger
         safe_unlink_upload(file_path, ("resumes",))
         raise HTTPException(status_code=500, detail="Import failed. Please try again.")
+    schedule_compression(file_path)
     return {"status": "imported", "id": meta.id}
 
 
@@ -1728,6 +1755,7 @@ def _serialize_meta(meta: ResumeMetadata, include_text: bool = False) -> dict:
         "open_to_relocate": meta.open_to_relocate,
         "highest_education": meta.highest_education,
         "parse_quality": meta.parse_quality,
+        "recruiter_fields": _parse_json(meta.recruiter_fields),
         "parsing_error": meta.parsing_error,
         "resume_file_path": meta.resume_file_path,
         "resume_file_url": sign_media_url(meta.resume_file_path),

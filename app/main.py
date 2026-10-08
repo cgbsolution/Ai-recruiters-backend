@@ -213,6 +213,8 @@ _raw_migrations = [
         "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS notice_period_days INTEGER",
         "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS open_to_relocate BOOLEAN",
         "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS derived_version INTEGER",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS recruiter_fields TEXT",
+        "ALTER TABLE resume_metadata ADD COLUMN IF NOT EXISTS parser_version INTEGER",
         "CREATE INDEX IF NOT EXISTS ix_resume_metadata_pipeline_status ON resume_metadata (pipeline_status)",
         "CREATE INDEX IF NOT EXISTS ix_resume_metadata_city ON resume_metadata (city)",
 ]

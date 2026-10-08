@@ -218,6 +218,10 @@ REQUIRED_COLUMNS = REQUIRED_COLUMNS + [
     ("resume_metadata", "notice_period_days", "INTEGER", None),
     ("resume_metadata", "open_to_relocate", "BOOLEAN", None),
     ("resume_metadata", "derived_version", "INTEGER", None),
+    # Migration: o9p0q1r2s3t4_resume_recruiter_fields
+    ("resume_metadata", "recruiter_fields", "TEXT", None),
+    # Migration: p0q1r2s3t4u5_resume_parser_version
+    ("resume_metadata", "parser_version", "INTEGER", None),
 ]
 
 # Indexes to create (safe with IF NOT EXISTS)

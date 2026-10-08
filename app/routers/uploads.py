@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from app.auth import get_current_user
 from app.config import settings
 from app.media import UPLOAD_ROOT, safe_upload_name
+from app.services.file_compression import schedule_compression
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
@@ -36,5 +37,6 @@ async def upload_jd(file: UploadFile = File(...)):
 
     with open(path, "wb") as f:
         f.write(content)
+    schedule_compression(path)
 
     return {"filename": filename, "url": f"/uploads/jd/{filename}"}
