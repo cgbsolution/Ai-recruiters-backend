@@ -13,10 +13,9 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.models.job import Job
-from app.models.organization import Organization
 from app.models.talent import AccessToken, InterviewBooking, JobMatch, TalentInterview
 from app.talent import scheduling, tokens
-from app.talent.settings import get_job_settings, get_settings, org_zone
+from app.talent.settings import get_job_settings, get_settings, org_zone, page_brand
 
 AI_DISCLOSURE = (
     "This first-round interview is run by an AI interviewer, not a person. It asks questions about your experience "
@@ -44,7 +43,6 @@ def state(db: Session, interview: TalentInterview, now: Optional[datetime] = Non
     now = now or datetime.utcnow()
     match = db.get(JobMatch, interview.match_id)
     job = db.get(Job, match.job_id)
-    org = db.get(Organization, job.organization_id)
     js = get_job_settings(db, job.id, job.organization_id)
     zone = org_zone(get_settings(db, job.organization_id))
     offered = (db.query(InterviewBooking).filter(InterviewBooking.interview_id == interview.id,
@@ -53,7 +51,7 @@ def state(db: Session, interview: TalentInterview, now: Optional[datetime] = Non
     opens, closes = scheduling.join_window(interview)
     can_start = interview.status == "scheduled" and opens is not None and opens <= now <= closes
     return {
-        "organization": org.name if org else "", "job_title": job.title, "status": interview.status,
+        **page_brand(db, job.organization_id), "job_title": job.title, "status": interview.status,
         "mode": interview.mode, "question_count": js.question_count, "time_limit_minutes": js.time_limit_minutes,
         "slots": [{"id": str(b.id), "label": scheduling.label(b.starts_at, zone), "starts_at": b.starts_at.isoformat()}
                   for b in offered],

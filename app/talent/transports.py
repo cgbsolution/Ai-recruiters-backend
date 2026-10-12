@@ -89,6 +89,14 @@ def sender_domain() -> str:
     return addr.rsplit("@", 1)[1].lower() if "@" in addr else "localhost"
 
 
+def wire_bytes(mime: EmailMessage) -> bytes:
+    """The message as SMTP must carry it: CRLF line endings. smtplib converts
+    line endings only for str; given bytes it sends them as they are, and
+    as_bytes() alone ends lines with a bare LF, which strict servers refuse
+    ("line too long" / bare LF rejected since the 2023 SMTP-smuggling fixes)."""
+    return mime.as_bytes(policy=mime.policy.clone(linesep="\r\n"))
+
+
 def build_mime(permit: ContactPermit, msg: OutgoingEmail) -> EmailMessage:
     em = EmailMessage()
     em["From"] = formataddr((msg.from_name, sender_address()))
@@ -143,7 +151,7 @@ class SmtpTransport:
                 raise TransientSendError(f"before DATA: {type(exc).__name__}") from exc
             # From here the server may have the message: never report "not sent" for a dropped connection.
             try:
-                code, resp = server.data(mime.as_bytes())
+                code, resp = server.data(wire_bytes(mime))
             except smtplib.SMTPDataError as exc:
                 if exc.smtp_code >= 500:
                     raise PermanentSendError(f"message refused ({exc.smtp_code})") from exc

@@ -60,6 +60,29 @@ def _deny(reason: str) -> ContactDecision:
     return ContactDecision(False, reason)
 
 
+_REASON_TEXT = {
+    "no_consent": "No consent recorded for this kind of message",
+    "consent_withdrawn": "The candidate withdrew consent",
+    "consent_denied": "The candidate declined these messages",
+    "suppressed": "On the do-not-contact list (unsubscribed or complained)",
+    "email_invalid": "The email address is invalid or can't receive mail",
+    "email_placeholder": "No real email address on the CV",
+    "email_no_mx": "The email domain can't receive mail",
+    "unreachable": "Emails to this address keep bouncing",
+    "no_phone": "No phone number on the profile",
+    "profile_missing": "The profile no longer exists",
+}
+
+
+def describe(reason: str) -> str:
+    """A refusal reason in words a recruiter can act on."""
+    if reason in _REASON_TEXT:
+        return _REASON_TEXT[reason]
+    if reason.startswith("email_"):
+        return f"The email address can't be used ({reason[6:].replace('_', ' ')})"
+    return reason.replace("_", " ")
+
+
 def is_suppressed(db: Session, email: Optional[str] = None, phone: Optional[str] = None) -> bool:
     hashes = [h for h in (identity.suppression_hash("email", email), identity.suppression_hash("phone", phone)) if h]
     if not hashes:

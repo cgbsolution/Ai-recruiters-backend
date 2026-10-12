@@ -28,8 +28,7 @@ from app.models.talent import AccessToken, CampaignMember, ContactConsent, CvVer
 from app.talent import caps, consent, cv, outbox, tokens
 from app.talent.audit import audit
 from app.talent.campaigns import ACTIVE_MEMBER, finish_member
-from app.talent.settings import consent_text, get_settings
-from app.talent.templates import brand_context
+from app.talent.settings import consent_text, get_settings, page_brand
 from app.talent.transports import whatsapp_template_for
 
 KINDS = {1: "refresh_touch_1", 2: "refresh_touch_2", 3: "refresh_touch_3"}
@@ -109,7 +108,6 @@ def page_data(db: Session, row: AccessToken) -> dict:
     profile = db.get(ResumeMetadata, row.profile_id)
     if profile is None:
         raise LinkError()
-    org = db.get(Organization, profile.organization_id)
     settings_row = get_settings(db, profile.organization_id)
     consents = {(c.channel, c.purpose): c.status for c in
                 db.query(ContactConsent).filter(ContactConsent.profile_id == profile.id)}
@@ -118,11 +116,8 @@ def page_data(db: Session, row: AccessToken) -> dict:
                                    CvVersion.parse_status == "staged", CvVersion.received_at >= row.created_at)
         .order_by(CvVersion.version_no.desc()).first()
     )
-    brand = brand_context(org.name if org else "", name=settings_row.brand_name, logo_url=settings_row.brand_logo_url,
-                          color=settings_row.brand_color)
     return {
-        "organization": brand["name"],
-        "brand": {"logo_url": brand["logo_url"], "color": brand["color"]},
+        **page_brand(db, profile.organization_id),
         "ask_every_months": max(1, round(int(settings_row.refresh_after_days or 90) / 30)),
         "first_name": outbox.first_name(profile),
         "fields": {

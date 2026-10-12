@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from datetime import datetime
 from typing import Iterable, List, Optional, Tuple
 
 # Field paths the rank / embedding input may contain. Anything not listed here
@@ -153,11 +154,40 @@ def _clean(value, names, counts, limit: int = 400):
     return (scrub_text(str(value), names, counts) or "")[:limit] or None
 
 
+_MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov",
+                                        "dec"), 1)}
+_PRESENT = re.compile(r"^\s*(present|current|now|till\s*date|to\s*date|ongoing)\b", re.IGNORECASE)
+
+
+def _is_present(value) -> bool:
+    return bool(value) and bool(_PRESENT.match(str(value)))
+
+
 def _ym(value) -> Optional[str]:
+    """YYYY-MM from the date forms the parsers store: "2021-01" (Claude),
+    "Jan 2021", "January 2021", "Jan'21", "01/2021" or "2021" (the regex
+    parser). Only "YYYY-MM" used to be read, so roles parsed by the regex
+    parser reached ranking without dates ("work history has no dates")."""
     if not value:
         return None
-    m = re.match(r"^\s*(\d{4})(?:-(\d{1,2}))?", str(value))
-    return f"{m.group(1)}-{int(m.group(2) or 1):02d}" if m else None
+    s = str(value).strip()
+    m = re.match(r"^(\d{4})(?:[-/](\d{1,2}))?\b", s)
+    if m:
+        year, month = int(m.group(1)), int(m.group(2) or 1)
+    elif m := re.match(r"^(\d{1,2})[-/](\d{4})\b", s):
+        month, year = int(m.group(1)), int(m.group(2))
+    elif m := re.match(r"^([A-Za-z]{3,9})\.?\s*['‘’]?\s*(\d{4}|\d{2})\b", s):
+        month = _MONTHS.get(m.group(1)[:3].lower())
+        if month is None:
+            return None
+        year = int(m.group(2))
+        if year < 100:  # Jan'21 → 2021, Jan'98 → 1998
+            year += 2000 if year <= datetime.utcnow().year % 100 else 1900
+    else:
+        return None
+    if not (1950 <= year <= 2100 and 1 <= month <= 12):
+        return None
+    return f"{year}-{month:02d}"
 
 
 def _degree_and_field(entry) -> Optional[str]:
@@ -217,12 +247,13 @@ def build_rank_input(parsed: dict, candidate_name: Optional[str] = None) -> Tupl
             if value:
                 entry[key] = value
                 fields.add(f"work_history[].{key}")
+        current = not w.get("end_date") or _is_present(w.get("end_date"))
         for key, src in (("start", "start_date"), ("end", "end_date")):
-            value = _ym(w.get(src))
+            value = None if key == "end" and current else _ym(w.get(src))
             if value:
                 entry[key] = value
                 fields.add(f"work_history[].{key}")
-        if not w.get("end_date") and entry.get("start"):
+        if current and entry.get("start"):
             entry["end"] = "present"
         description = _clean(w.get("description"), names, counts, 1200)
         if description:

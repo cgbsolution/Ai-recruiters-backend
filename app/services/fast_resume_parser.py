@@ -29,7 +29,9 @@ from app.services.locations import find_city, place_from_text
 # 2: location from labelled lines / the contact header only, validated against
 #    known places ("cost allocation, and profitability" no longer becomes the
 #    location "And Profitability"); skills matched as whole words.
-FAST_PARSER_VERSION = 2
+# 3: the bracket around a role's dates no longer sticks to the company name
+#    ("Acme Pvt Ltd (Jan 2021 - Present)" gave the company "Acme Pvt Ltd (").
+FAST_PARSER_VERSION = 3
 
 logger = logging.getLogger(__name__)
 
@@ -1140,9 +1142,11 @@ def extract_work_experience(text: str, experience_section: str = "") -> list[dic
             end = date_match.group(2).strip()
 
             # Extract title and company from surrounding text
-            rest = line[:date_match.start()].strip().rstrip("-–—|").strip()
+            # Brackets and separators around the dates belong to neither the
+            # title nor the company ("Acme Pvt Ltd (Jan 2021 - Present)").
+            rest = line[:date_match.start()].strip().rstrip("-–—|([{,:").strip()
             if not rest:
-                rest = line[date_match.end():].strip().lstrip("-–—|").strip()
+                rest = line[date_match.end():].strip().lstrip("-–—|)]},:").strip()
 
             # Clean the rest text
             rest = re.sub(r"\s+", " ", rest).strip()

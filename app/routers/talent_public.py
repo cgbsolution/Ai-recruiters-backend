@@ -17,12 +17,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.organization import Organization
 from app.models.resume_metadata import ResumeMetadata
 from app.ratelimit import SlidingWindowCounter
 from app.services.file_safety import UnsafeFile
 from app.talent import consent, data_export, deliverability, refresh, retention, tokens
 from app.talent.audit import audit
+from app.talent.settings import page_brand
 
 router = APIRouter()
 
@@ -265,8 +265,7 @@ def _profile_for(db: Session, raw: str, purpose: str) -> ResumeMetadata:
 @router.get("/unsubscribe/{token}")
 def unsubscribe_state(token: str, db: Session = Depends(get_db)):
     profile = _profile_for(db, token, "unsubscribe")
-    org = db.get(Organization, profile.organization_id)
-    return {"organization": org.name if org else "", "suppressed": consent.is_suppressed(
+    return {**page_brand(db, profile.organization_id), "suppressed": consent.is_suppressed(
         db, email=profile.candidate_email)}
 
 

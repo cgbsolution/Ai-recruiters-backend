@@ -25,7 +25,7 @@ from app.models.talent import AccessToken, CampaignMember, JobMatch, Touch
 from app.talent import approvals, caps, campaigns, consent, outbox, tokens
 from app.talent.audit import audit
 from app.talent.match_loop import ordered_matches
-from app.talent.settings import get_job_settings, loop_enabled
+from app.talent.settings import get_job_settings, loop_enabled, page_brand
 
 INVITABLE = ("ranked", "needs_refresh")
 DONE_REFRESHING = ("responded", "no_response", "skipped", "opted_out", "bounced", "cancelled")
@@ -160,16 +160,13 @@ def page_data(db: Session, row: AccessToken) -> dict:
         raise LinkError()
     job = db.get(Job, match.job_id)
     profile = db.get(ResumeMetadata, match.profile_id)
-    from app.models.organization import Organization
-
-    org = db.get(Organization, job.organization_id)
-    touch = (db.query(Touch).filter(Touch.profile_id == profile.id, Touch.template.in_(("invite", "invite_reminder")))
+    touch =(db.query(Touch).filter(Touch.profile_id == profile.id, Touch.template.in_(("invite", "invite_reminder")))
              .order_by(Touch.created_at.desc()).first())
     if touch is not None and touch.opened_at is None:
         touch.opened_at = datetime.utcnow()
         db.commit()
     return {
-        "organization": org.name if org else "", "first_name": outbox.first_name(profile),
+        **page_brand(db, profile.organization_id), "first_name": outbox.first_name(profile),
         "job": {"title": job.title, "location": job.location, "department": job.department,
                 "type": job.job_type, "summary": _role_summary(db, job),
                 "experience": f"{job.experience_min or 0}-{job.experience_max or ''} years".replace("- years", "+ years")},

@@ -45,6 +45,19 @@ def get_settings(db: Session, organization_id: Optional[int]) -> TalentSettings:
     return row
 
 
+def page_brand(db: Session, organization_id: Optional[int]) -> dict:
+    """What a candidate page shows as the sender: the same name, logo and colour
+    as the organization's emails (so a page never names a different company)."""
+    from app.models.organization import Organization
+    from app.talent.templates import brand_context
+
+    org = db.get(Organization, organization_id) if organization_id is not None else None
+    row = get_settings(db, organization_id)
+    brand = brand_context(org.name if org else "", name=row.brand_name, logo_url=row.brand_logo_url,
+                          color=row.brand_color)
+    return {"organization": brand["name"], "brand": {"logo_url": brand["logo_url"], "color": brand["color"]}}
+
+
 def get_or_create_settings(db: Session, organization_id: int) -> TalentSettings:
     row = db.query(TalentSettings).filter(TalentSettings.organization_id == organization_id).first()
     if row is None:

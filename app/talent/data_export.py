@@ -12,10 +12,10 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models.job import Job
-from app.models.organization import Organization
 from app.models.resume_metadata import ResumeMetadata
 from app.models.talent import AuditLog, CvVersion, JobMatch, TalentInterview, Touch
 from app.talent.consent import consent_summary
+from app.talent.settings import page_brand
 
 
 def _plain(value: Any) -> Any:
@@ -40,7 +40,6 @@ def _json(text):
 
 
 def summary(db: Session, profile: ResumeMetadata) -> dict:
-    org = db.get(Organization, profile.organization_id)
     versions = db.query(CvVersion).filter(CvVersion.profile_id == profile.id).order_by(CvVersion.version_no).all()
     touches = db.query(Touch).filter(Touch.profile_id == profile.id, Touch.sent_at.isnot(None)) \
         .order_by(Touch.sent_at.desc()).limit(50).all()
@@ -53,7 +52,7 @@ def summary(db: Session, profile: ResumeMetadata) -> dict:
         .join(Job, Job.id == JobMatch.job_id).filter(JobMatch.profile_id == profile.id).all()
     )
     return _plain({
-        "organization": org.name if org else "",
+        **page_brand(db, profile.organization_id),
         "profile": {
             "name": profile.candidate_name, "email": profile.candidate_email, "phone": profile.phone,
             "current_designation": profile.current_designation, "current_company": profile.current_company,

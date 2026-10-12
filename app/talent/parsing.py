@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from datetime import date
 from typing import List, Optional, Tuple
 
+import anthropic
+
 from app.talent import claude
 from app.talent.config import talent_config
 from app.talent.prompts import CV_PARSE_SCHEMA, CV_PARSE_SYSTEM, CV_PARSE_VERSION
@@ -135,10 +137,22 @@ def user_content(text: str, previous: Optional[dict]) -> str:
     return claude.joined(parts)
 
 
+def _blank_to_none(value):
+    """Text the schema returns as "" when the CV doesn't state it → None, as the
+    rest of the pipeline expects; empty strings in plain lists are dropped."""
+    if isinstance(value, dict):
+        return {k: _blank_to_none(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_blank_to_none(v) for v in value if not (isinstance(v, str) and not v.strip())]
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
 def from_result(result: claude.ClaudeResult) -> Optional[ParseResult]:
     if result.refused or not result.data:
         return None
-    data = result.data
+    data = _blank_to_none(result.data)
     confidence = {k: _clamp01(v) for k, v in (data.get("field_confidence") or {}).items()}
     overall = round(sum(confidence.values()) / len(confidence), 3) if confidence else 0.0
     return ParseResult(parsed=to_version_schema(data), field_confidence=confidence, confidence=overall,
@@ -158,6 +172,11 @@ async def parse_cv(text: str, previous: Optional[dict] = None, profile_id: Optio
             prompt_version=CV_PARSE_VERSION, max_tokens=8000, organization_id=organization_id,
         )
     except claude.ClaudeUnavailable:
+        return None
+    except anthropic.BadRequestError as exc:
+        # A request the API will never accept (e.g. a schema limit): retrying can't
+        # help, so fall back to the regex parse instead of leaving the CV unread.
+        logger.error("Claude CV parse refused the request (%s); using the regex parse", exc.request_id or "no id")
         return None
     parsed = from_result(result)
     if parsed is not None and parsed.changes_summary:

@@ -16,8 +16,10 @@ from app.talent import cv_pipeline, embeddings
         inngest.TriggerEvent(event="talent/refresh.responded"),
         inngest.TriggerEvent(event="talent/cv.version.pending"),
     ],
-    idempotency="event.data.cv_version_id",
-    concurrency=[inngest.Concurrency(limit=4)],
+    # One run per version at a time; no 24 h idempotency key: Inngest counts a
+    # FAILED run too, so the sweep's retry of a stuck version was ignored for a
+    # day. Re-running is safe — process() skips a version that isn't pending.
+    concurrency=[inngest.Concurrency(limit=1, key="event.data.cv_version_id"), inngest.Concurrency(limit=4)],
     retries=4,
 )
 async def refresh_respond(ctx: inngest.Context) -> dict:

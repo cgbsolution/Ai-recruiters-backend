@@ -20,7 +20,7 @@ from app.models.user import User
 from app.refs import JobId, encode_ref
 from app.routers.talent_jobs import _emit, _job, _match_or_404, _match_out
 from app.talent import approvals as approvals_service
-from app.talent import invites, match_loop, scheduling
+from app.talent import consent, invites, match_loop, scheduling
 from app.talent.access import talent_org
 from app.talent.audit import user_actor
 
@@ -90,6 +90,9 @@ def invite_one(match_id: str, org_id: int = Depends(talent_org), user: User = De
     m = _match_or_404(db, org_id, match_id)
     if m.status not in invites.INVITABLE + ("approval_pending",):
         raise HTTPException(status_code=409, detail="This candidate has already been invited or closed")
+    decision = consent.can_contact(db, m.profile_id, "email", "jobs")
+    if not decision.allowed:  # the send would be refused anyway: say why now
+        raise HTTPException(status_code=409, detail=f"Can't invite: {consent.describe(decision.reason)}.")
     invites.invite_now(db, m, user)
     return {"queued": _emit("talent/invite.send", {"match_id": str(m.id)})}
 

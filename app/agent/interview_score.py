@@ -13,8 +13,11 @@ from app.talent import interview_transcripts, scoring
     fn_id="interview-score",
     name="Loop D · score an interview",
     trigger=inngest.TriggerEvent(event="talent/interview.completed"),
-    idempotency="event.data.interview_id",
-    concurrency=[inngest.Concurrency(limit=4)],
+    # One run per interview at a time; no 24 h idempotency key, which also
+    # swallowed retries and the documented re-score after a prompt change.
+    # Re-running is safe — score_interview skips an interview already scored
+    # with the current prompt version.
+    concurrency=[inngest.Concurrency(limit=1, key="event.data.interview_id"), inngest.Concurrency(limit=4)],
     retries=4,
 )
 async def interview_score(ctx: inngest.Context) -> dict:

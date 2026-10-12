@@ -21,7 +21,7 @@ from app.models.resume_metadata import ResumeMetadata
 from app.models.talent import JobMatch, TalentJobSettings
 from app.models.user import User
 from app.refs import JobId, encode_ref
-from app.talent import backfill, match_loop, matching
+from app.talent import backfill, consent, match_loop, matching
 from app.talent.access import require_talent_admin, talent_org
 from app.talent.audit import audit, user_actor
 from app.talent.settings import AUTONOMY_MODES, INTERVIEW_MODES, get_job_settings
@@ -212,7 +212,14 @@ def list_matches(
     out = [_match_out(m, p, i + 1) for i, (m, p) in enumerate(rows)]
     if status:
         out = [o for o in out if o["status"] == status]
-    return {"total": len(out), "items": out[:limit]}
+    page = out[:limit]
+    # Whether an invite could reach them: planning skips anyone the consent gate
+    # refuses, and without the reason the recruiter just saw no approvals.
+    for item in page:
+        decision = consent.can_contact(db, item["profile_id"], "email", "jobs")
+        item["contact"] = {"allowed": decision.allowed,
+                           "reason": None if decision.allowed else consent.describe(decision.reason)}
+    return {"total": len(out), "items": page}
 
 
 class RatingRequest(BaseModel):
