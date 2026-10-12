@@ -4,7 +4,7 @@ An always-on agent over the Resume Database. It runs four loops:
 
 | Loop | What it does | Switch |
 |---|---|---|
-| **A · Refresh** | Asks candidates to re-confirm their profile every 6 months (3 messages at most, stops on any answer, opt-out or bounce; someone who doesn't answer is not asked again until the next window) | `refresh` (+ `refresh_rolling`) |
+| **A · Refresh** | Asks candidates to update their profile every 3 months by default (Settings: 30–730 days; 3 messages at most, stops on any answer, opt-out or bounce; someone who doesn't answer is not asked again until the next window) | `refresh` (+ `refresh_rolling`) |
 | **B · Match** | When a job is created or changed: SQL filter → vector similarity → Claude rerank of redacted profiles | `match` |
 | **C · Invite** | Invites the top matches. **Copilot** jobs wait for a recruiter's approval; **autopilot** jobs invite automatically | `invite` |
 | **D · Interview** | Offers times, sends reminders, runs an async (text or voice) AI interview, scores it against a rubric with quotes, builds a shortlist order | `interview` (+ `live_voice`) |
@@ -153,6 +153,8 @@ UPDATE talent_settings SET flags = flags || '{"refresh": false}'::jsonb WHERE or
 **A candidate says they keep getting messages.** Audit view → filter by their profile id. Every message, skip reason and consent change is there.
 
 **Matching looks wrong for a job.** Job page → Settings: set explicit must-haves, budget, notice and locations; *Run matching*. "Show how this was scored" lists exactly what the model saw. Rate matches; the precision@10 report tracks quality.
+
+**Profile-update emails.** Branded per organization under *Talent Agent → Settings → Email branding*: sender name, logo (an https image link), button colour, sign-off and an opening paragraph in the organization's own words; *Preview* renders all three messages. Each email shows the candidate what is on file (role, top skills, last updated) and links to their personal page, where they confirm or edit their details and can upload a newer CV (PDF or DOCX, checked and virus-scanned before it is stored). Replies by email are not processed: a link is tied to one profile, while a reply's From address can be forged.
 
 **A newer resume for someone already in the database.** Whatever the upload path (Resume Database, upload to a job, the refresh page), the profile keeps its id and every job candidate linked to it moves to the new file in the same transaction; with the agent tracking the profile, the change becomes its new current CV version (the old file stays as history until its retention date). The old file is deleted only when nothing references it, and the File Manager refuses to delete a resume that is still in use. To repair job links broken before this existed: `python -m app.services.resume_links repair` (dry run), then `... repair --apply`.
 

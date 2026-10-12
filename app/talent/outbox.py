@@ -18,6 +18,7 @@ Every send, skip and failure is written to audit_log in the same transaction.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -36,7 +37,7 @@ from app.talent.audit import audit
 from app.talent.config import talent_config
 from app.talent.consent import can_contact
 from app.talent.settings import get_settings, loop_enabled, next_send_window
-from app.talent.templates import TEMPLATE_PURPOSE, render
+from app.talent.templates import TEMPLATE_PURPOSE, brand_context, render
 from app.talent.transports import (
     OutgoingEmail,
     OutgoingWhatsApp,
@@ -128,13 +129,34 @@ def _campaign_sent_today(db: Session, campaign_id, now: datetime) -> int:
     ).scalar() or 0
 
 
+def _profile_summary(profile: ResumeMetadata) -> dict:
+    """Shown in the profile-update email: the candidate's own data, to their own address."""
+    try:
+        skills = json.loads(profile.skills) if isinstance(profile.skills, str) else (profile.skills or [])
+    except ValueError:
+        skills = []
+    names = [str(s.get("name") if isinstance(s, dict) else s).strip() for s in skills]
+    updated = profile.last_verified_at or profile.created_at
+    return {
+        "profile_role": (profile.current_designation or "").strip()[:120] or None,
+        "profile_skills": [n[:40] for n in names if n][:5],
+        "profile_updated": updated.strftime("%B %Y") if updated else None,
+    }
+
+
 def _context(db: Session, profile: ResumeMetadata, campaign: Campaign, touch: Touch,
              action: Optional[Tuple[str, str]], extra: Optional[dict]) -> dict:
     org = db.get(Organization, campaign.organization_id)
+    row = get_settings(db, campaign.organization_id)
+    brand = brand_context(org.name if org else "Our recruitment team", name=row.brand_name,
+                          logo_url=row.brand_logo_url, color=row.brand_color, signature=row.email_signature,
+                          message=row.refresh_message)
     unsub = tokens.issue(db, profile.id, "unsubscribe", ref_id=str(touch.id))
     my_data = tokens.issue(db, profile.id, "my_data", ref_id=str(touch.id))
     ctx = {
-        "org_name": org.name if org else "Our recruitment team",
+        "org_name": brand["name"],
+        "brand": brand,
+        **_profile_summary(profile),
         "first_name": first_name(profile),
         "unsubscribe_url": tokens.page_url("unsubscribe", unsub),
         "one_click_unsubscribe_url": tokens.api_unsubscribe_url(unsub),

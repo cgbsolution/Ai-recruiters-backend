@@ -64,12 +64,20 @@ class TalentSettings(Base):
     timezone = Column(String(64), nullable=False, default="Asia/Kolkata")
     quiet_hours_start = Column(Integer, nullable=False, default=21)  # local hour sending stops
     quiet_hours_end = Column(Integer, nullable=False, default=9)  # local hour sending resumes
-    refresh_after_days = Column(Integer, nullable=False, default=180)
+    refresh_after_days = Column(Integer, nullable=False, default=90)  # ask to update every 3 months
     retention_months = Column(Integer, nullable=False, default=24)
     default_autonomy = Column(String(10), nullable=False, default="copilot")
     sender_domain = Column(String(255), nullable=True)
     # Text shown on the candidate pages next to each consent checkbox.
     consent_text = Column(Text, nullable=True)
+    # Email branding (app.talent.templates): sender name, logo, button colour,
+    # sign-off and an optional paragraph of the organization's own words for
+    # the profile-update email. Empty = the organization's name and defaults.
+    brand_name = Column(String(120), nullable=True)
+    brand_logo_url = Column(String(500), nullable=True)
+    brand_color = Column(String(7), nullable=True)
+    email_signature = Column(String(300), nullable=True)
+    refresh_message = Column(Text, nullable=True)
     updated_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

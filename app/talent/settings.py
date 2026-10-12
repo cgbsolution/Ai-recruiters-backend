@@ -39,7 +39,7 @@ def get_settings(db: Session, organization_id: Optional[int]) -> TalentSettings:
     if row is None:
         row = TalentSettings(
             organization_id=organization_id, flags={}, timezone="Asia/Kolkata", quiet_hours_start=21,
-            quiet_hours_end=9, refresh_after_days=180, retention_months=24, default_autonomy="copilot",
+            quiet_hours_end=9, refresh_after_days=90, retention_months=24, default_autonomy="copilot",
             consent_text=None,
         )
     return row
@@ -96,7 +96,7 @@ def next_send_window(row: TalentSettings, now_utc: Optional[datetime] = None) ->
 
 
 def freshness_window(row: TalentSettings) -> timedelta:
-    return timedelta(days=int(row.refresh_after_days or 180))
+    return timedelta(days=int(row.refresh_after_days or 90))
 
 
 def get_job_settings(db: Session, job_id: int, organization_id: Optional[int] = None) -> TalentJobSettings:

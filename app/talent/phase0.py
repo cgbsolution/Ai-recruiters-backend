@@ -96,7 +96,7 @@ def backfill(
             org_settings = settings_cache.get(r.organization_id)
             if org_settings is None:
                 org_settings = settings_cache[r.organization_id] = get_settings(db, r.organization_id)
-            window = timedelta(days=int(org_settings.refresh_after_days or 180))
+            window = timedelta(days=int(org_settings.refresh_after_days or 90))
             status = identity.classify_email(r.candidate_email, check_mx=check_mx)
             fresh = classify_freshness(status, r.phone, r.last_verified_at, r.created_at, now, window)
             if r.verification_status in _AGENT_OWNED:

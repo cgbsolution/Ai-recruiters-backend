@@ -25,7 +25,7 @@ import socket
 import uuid
 from dataclasses import dataclass, field
 from email.message import EmailMessage
-from email.utils import formataddr, make_msgid
+from email.utils import formataddr, make_msgid, parseaddr
 from typing import Dict, List, Optional
 
 from app.config import settings
@@ -75,7 +75,13 @@ class OutgoingWhatsApp:
 
 
 def sender_address() -> str:
-    return (settings.EMAIL_FROM or settings.SMTP_USER or "no-reply@localhost").strip()
+    """The From / envelope address. EMAIL_FROM counts only when it is an
+    address: elsewhere in the app it is a display name ("Anytimehire.ai"),
+    which as MAIL FROM every server refuses."""
+    configured = (settings.EMAIL_FROM or "").strip()
+    if "@" in configured:
+        return parseaddr(configured)[1] or configured
+    return (settings.SMTP_USER or "no-reply@localhost").strip()
 
 
 def sender_domain() -> str:

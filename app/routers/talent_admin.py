@@ -18,10 +18,11 @@ from sqlalchemy.orm import Session
 from app.auth import get_current_user
 from app.config import settings as app_settings
 from app.database import get_db
+from app.models.organization import Organization
 from app.models.resume_metadata import ResumeMetadata
 from app.models.talent import AuditLog, Campaign
 from app.models.user import User
-from app.talent import caps, campaigns, consent, deliverability, identity, phase0, retention
+from app.talent import caps, campaigns, consent, deliverability, identity, phase0, retention, templates
 from app.talent import settings as talent_settings
 from app.talent.access import require_talent_admin, talent_org
 from app.talent.audit import audit, user_actor
@@ -121,8 +122,17 @@ def _settings_out(db: Session, org_id: int) -> dict:
         "models": {"parse": talent_config.TALENT_PARSE_MODEL, "rerank": talent_config.TALENT_RERANK_MODEL,
                    "scorer": talent_config.TALENT_SCORER_MODEL, "interview": talent_config.TALENT_INTERVIEW_MODEL},
         "embedding_provider": talent_config.EMBEDDING_PROVIDER or None,
+        "branding": {"brand_name": row.brand_name, "brand_logo_url": row.brand_logo_url,
+                     "brand_color": row.brand_color, "email_signature": row.email_signature,
+                     "refresh_message": row.refresh_message,
+                     "default_name": _org_name(db, org_id), "default_color": templates.DEFAULT_COLOR},
         "warnings": warnings,
     }
+
+
+def _org_name(db: Session, org_id: int) -> str:
+    org = db.get(Organization, org_id)
+    return org.name if org else "Our recruitment team"
 
 
 class SettingsUpdate(BaseModel):
@@ -136,6 +146,36 @@ class SettingsUpdate(BaseModel):
     sender_domain: Optional[str] = None
     consent_text: Optional[str] = None
     send_ramp: Optional[List[Dict[str, int]]] = None
+    brand_name: Optional[str] = None
+    brand_logo_url: Optional[str] = None
+    brand_color: Optional[str] = None
+    email_signature: Optional[str] = None
+    refresh_message: Optional[str] = None
+
+
+def _apply_branding(row, changes: dict) -> None:
+    """Validate and store email branding; an empty value restores the default."""
+    if "brand_name" in changes:
+        row.brand_name = templates.clean_line(changes["brand_name"], 120)
+    if "brand_logo_url" in changes:
+        url = (changes["brand_logo_url"] or "").strip() or None
+        if url and not templates.valid_logo_url(url):
+            raise HTTPException(status_code=400, detail="The logo must be an https:// link to an image.")
+        row.brand_logo_url = url
+    if "brand_color" in changes:
+        color = (changes["brand_color"] or "").strip() or None
+        if color and not templates.valid_color(color):
+            raise HTTPException(status_code=400, detail="The colour must look like #465FFF.")
+        row.brand_color = color.lower() if color else None
+    if "email_signature" in changes:
+        text = "\n".join(filter(None, (templates.clean_line(line, 300) for line in
+                                       (changes["email_signature"] or "").splitlines())))
+        row.email_signature = text[:300] or None
+    if "refresh_message" in changes:
+        text = (changes["refresh_message"] or "").strip()
+        if len(text) > 800:
+            raise HTTPException(status_code=400, detail="Keep the message under 800 characters.")
+        row.refresh_message = text or None
 
 
 @router.get("/settings", summary="Talent Agent settings, loop switches and configuration warnings")
@@ -187,6 +227,7 @@ def update_talent_settings(
         row.sender_domain = domain
     if "consent_text" in changes:
         row.consent_text = (changes["consent_text"] or "").strip()[:4000] or None
+    _apply_branding(row, changes)
     if changes.get("send_ramp"):
         ramp = sorted(({"from_day": int(s["from_day"]), "cap": int(s["cap"])} for s in changes["send_ramp"]),
                       key=lambda s: s["from_day"])
@@ -199,6 +240,26 @@ def update_talent_settings(
           organization_id=org_id, detail={"changed": sorted(changes), "flags": changes.get("flags")})
     db.commit()
     return _settings_out(db, org_id)
+
+
+@router.get("/settings/email-preview", summary="Preview the profile-update email with this organization's branding")
+def email_preview(
+    touch: int = Query(1, ge=1, le=3),
+    org_id: int = Depends(talent_org),
+    db: Session = Depends(get_db),
+):
+    row = talent_settings.get_settings(db, org_id)
+    brand = templates.brand_context(_org_name(db, org_id), name=row.brand_name, logo_url=row.brand_logo_url,
+                                    color=row.brand_color, signature=row.email_signature,
+                                    message=row.refresh_message)
+    sample = {
+        "org_name": brand["name"], "brand": brand, "first_name": "Asha",
+        "profile_role": "Senior Data Engineer", "profile_skills": ["Python", "Kafka", "Spark", "SQL", "AWS"],
+        "profile_updated": "July 2026", "action_url": "#", "unsubscribe_url": "#", "my_data_url": "#",
+    }
+    subject, text, html = templates.render(f"refresh_touch_{touch}", sample)
+    return {"subject": subject, "from_name": brand["name"], "text": text, "html": html,
+            "refresh_after_days": row.refresh_after_days}
 
 
 # ── Segments, campaigns, funnel ─────────────────────────────────────────────
