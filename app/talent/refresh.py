@@ -13,7 +13,6 @@ that app.agent.refresh_respond then parses and embeds.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import uuid
 from datetime import datetime
@@ -22,6 +21,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.media import UPLOAD_ROOT, resume_upload_problem, safe_upload_name
+from app.services.file_safety import UnsafeFile, store_resume_upload
 from app.models.organization import Organization
 from app.models.resume_metadata import CANDIDATE_CONFIRMABLE, ResumeMetadata, mark_candidate_confirmation
 from app.models.talent import AccessToken, CampaignMember, ContactConsent, CvVersion, Touch
@@ -34,7 +34,7 @@ from app.talent.transports import whatsapp_template_for
 KINDS = {1: "refresh_touch_1", 2: "refresh_touch_2", 3: "refresh_touch_3"}
 JOB_SEARCH_STATUSES = ("active", "open", "not_looking")
 MAX_UPLOADS_PER_LINK = 3
-RESUME_EXTS = {".pdf", ".doc", ".docx"}
+RESUME_EXTS = {".pdf", ".docx"}  # public upload: no legacy .doc
 
 
 class LinkError(Exception):
@@ -155,20 +155,23 @@ def attach_cv(db: Session, row: AccessToken, upload) -> CvVersion:
         raise ValueError("too many uploads from this link")
     safe = safe_upload_name(upload.filename, RESUME_EXTS)
     if safe is None:
-        raise ValueError("not a PDF, DOC or DOCX file")
+        raise ValueError("Please upload a PDF or DOCX file.")
     stem, ext = safe
     folder = os.path.join(UPLOAD_ROOT, "resumes")
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, f"{datetime.utcnow():%Y%m%d%H%M%S%f}_refresh_{stem}{ext}")
-    digest = hashlib.sha256()
-    with open(path, "xb") as out:
-        while chunk := upload.file.read(1024 * 1024):
-            digest.update(chunk)
-            out.write(chunk)
     profile = db.get(ResumeMetadata, row.profile_id)
+    try:
+        # A public page: PDF / DOCX only, checked (and virus-scanned) before it's stored.
+        file_hash = store_resume_upload(upload, path, allow_doc=False)
+    except UnsafeFile as exc:
+        audit(db, actor="candidate", action="cv.upload_refused", subject_type="profile", subject_id=profile.id,
+              organization_id=profile.organization_id, profile_id=profile.id, detail={"reason": exc.reason[:160]})
+        db.commit()
+        raise
     # Staged until the candidate submits the page; only then is it parsed and used.
     version = cv.new_version(db, profile, source="refresh_upload", file_path=path.replace("\\", "/"),
-                             file_hash=digest.hexdigest())
+                             file_hash=file_hash)
     version.parse_status = "staged"
     audit(db, actor="candidate", action="cv.uploaded", subject_type="cv_version", subject_id=version.id,
           organization_id=profile.organization_id, profile_id=profile.id, detail={"via": "refresh_page"})

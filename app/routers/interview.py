@@ -102,6 +102,7 @@ from app.schemas.interview import (
 )
 from app.services import avatar_interview_service as svc
 from app.services.file_compression import schedule_compression
+from app.services.file_safety import UnsafeFile, store_resume_upload
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -817,8 +818,6 @@ async def upload_resume_for_apply(
     db: Session = Depends(get_db),
 ):
     """Save a resume file to disk and return the path. No candidate record is created."""
-    from app.config import settings
-
     _get_token_or_404(token, db)  # validate token
 
     allowed = {
@@ -841,36 +840,12 @@ async def upload_resume_for_apply(
     safe_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{stem}{ext}"
     file_path = os.path.join(upload_dir, safe_name)
 
-    max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
-    total = 0
-    with open(file_path, "wb") as f:
-        while chunk := await file.read(65536):
-            total += len(chunk)
-            if total > max_bytes:
-                break
-            f.write(chunk)
-    if total == 0 or total > max_bytes:
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass
-        if total == 0:
-            raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-        raise HTTPException(
-            status_code=413,
-            detail=f"Resume is too large (max {settings.MAX_UPLOAD_SIZE_MB} MB).",
-        )
-
-    # The declared content type is the client's word; check the real leading
-    # bytes (PDF, DOCX zip, legacy DOC) before a parser ever opens the file.
-    with open(file_path, "rb") as fh:
-        head = fh.read(8)
-    if not head.startswith((b"%PDF", b"PK\x03\x04", b"\xd0\xcf\x11\xe0")):
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass
-        raise HTTPException(status_code=400, detail="Only PDF, DOC, or DOCX files are accepted.")
+    # Size, real type (from the bytes, not the client's word), dangerous
+    # content and — when configured — antivirus, before the file is stored.
+    try:
+        await asyncio.to_thread(store_resume_upload, file, file_path)
+    except UnsafeFile as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.reason)
 
     schedule_compression(file_path)
     return {"resume_path": file_path}

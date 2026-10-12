@@ -73,3 +73,16 @@ def rerank_responder(params) -> dict:
         "strengths": [{"strength": f"Uses {s}", "evidence": s} for s in skills[:2]],
         "risk_flags": [] if "kafka" in lower else [{"flag": "Short tenures", "evidence": ""}],
     }
+
+
+def pdf_bytes() -> bytes:
+    """A small real PDF (uploads are opened and inspected before they're stored)."""
+    import io
+
+    import pikepdf
+
+    buf = io.BytesIO()
+    pdf = pikepdf.new()
+    pdf.add_blank_page()
+    pdf.save(buf)
+    return buf.getvalue()

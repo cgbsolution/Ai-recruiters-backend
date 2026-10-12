@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import require_roles
 from app.database import get_db
-from app.media import UPLOAD_ROOT, sign_media_url
+from app.media import UPLOAD_ROOT, resume_file_in_use, sign_media_url
 from app.models.user import UserRole
 
 logger = logging.getLogger(__name__)
@@ -167,8 +167,17 @@ def list_files(folder: str, page: int = 1, page_size: int = 50):
     )
 
 
+def _resume_in_use(db: Session, folder: str, dir_path: str, file_path: str) -> bool:
+    """A resume a candidate or Resume Database row still points at: deleting it
+    here left jobs showing "not found"."""
+    if folder != "resumes":
+        return False
+    name = os.path.relpath(file_path, dir_path).replace(os.sep, "/")
+    return resume_file_in_use(db, f"uploads/resumes/{name}")
+
+
 @router.delete("/files/{folder}/{filename:path}")
-def delete_file(folder: str, filename: str):
+def delete_file(folder: str, filename: str, db: Session = Depends(get_db)):
     """Delete a single file from an upload folder."""
     dir_path = _validate_folder(folder)
     # Same resolver as bulk-delete, and `{filename:path}` so nested names match:
@@ -177,6 +186,9 @@ def delete_file(folder: str, filename: str):
     file_path = _resolve_in_folder(dir_path, filename)
     if not file_path or not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail="File not found")
+    if _resume_in_use(db, folder, dir_path, file_path):
+        raise HTTPException(status_code=409, detail="This resume is still used by a candidate or the Resume "
+                                                    "Database. Delete that record instead.")
 
     os.remove(file_path)
     logger.info("File deleted: %s/%s", folder, filename)
@@ -184,11 +196,12 @@ def delete_file(folder: str, filename: str):
 
 
 @router.post("/files/bulk-delete")
-def bulk_delete_files(body: BulkDeleteRequest):
-    """Delete multiple files from an upload folder."""
+def bulk_delete_files(body: BulkDeleteRequest, db: Session = Depends(get_db)):
+    """Delete multiple files from an upload folder (resumes still in use are kept)."""
     dir_path = _validate_folder(body.folder)
     deleted = []
     not_found = []
+    in_use = []
 
     for filename in body.filenames:
         # Names are relative to the folder ("file.pdf", or for screenshots
@@ -198,6 +211,9 @@ def bulk_delete_files(body: BulkDeleteRequest):
         if not file_path or not os.path.isfile(file_path):
             not_found.append(filename)
             continue
+        if _resume_in_use(db, body.folder, dir_path, file_path):
+            in_use.append(filename)
+            continue
 
         try:
             os.remove(file_path)
@@ -206,5 +222,6 @@ def bulk_delete_files(body: BulkDeleteRequest):
             logger.warning("Failed to delete %s: %s", file_path, e)
             not_found.append(filename)
 
-    logger.info("Bulk delete in %s: %d deleted, %d not found", body.folder, len(deleted), len(not_found))
-    return {"deleted": deleted, "not_found": not_found, "deleted_count": len(deleted)}
+    logger.info("Bulk delete in %s: %d deleted, %d not found, %d in use", body.folder, len(deleted),
+                len(not_found), len(in_use))
+    return {"deleted": deleted, "not_found": not_found, "in_use": in_use, "deleted_count": len(deleted)}

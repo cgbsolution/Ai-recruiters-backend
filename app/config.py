@@ -59,6 +59,12 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "uploads/jd"
     RESUME_UPLOAD_DIR: str = "uploads/resumes"
     MAX_UPLOAD_SIZE_MB: int = 10
+    # Antivirus for uploaded resumes (app.services.file_safety): a clamd server,
+    # e.g. "clamav" in Dokploy (docker-compose.clamav.dokploy.yml). When set,
+    # every resume is scanned and refused if the scanner can't be reached.
+    CLAMAV_HOST: str = ""
+    CLAMAV_PORT: int = 3310
+    CLAMAV_TIMEOUT_SECONDS: int = 30
     APP_ENV: str = "development"
     SECRET_KEY: str = "change-me-in-production"
     # Idle timeout: a login token lives this long and the frontend renews it

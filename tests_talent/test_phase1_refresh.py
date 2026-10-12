@@ -16,6 +16,7 @@ from app.models.talent import (
 from app.talent import caps, campaigns, consent, deliverability, outbox, refresh, tokens
 from app.talent.transports import MemoryTransport, PermanentSendError, TransientSendError, UnknownSendError, \
     _memory_transport
+from tests_talent import fakes
 from tests_talent.conftest import CapturingInngest
 
 
@@ -328,13 +329,21 @@ def test_refresh_page_confirm_flow(client, world, db, outbox, events):
     assert page["fields"]["current_designation"] == "Engineer" and page["fields"]["current_ctc"] == 6
     assert db.query(Touch).one().opened_at is not None
 
-    pdf = b"%PDF-1.4 new cv"
+    pdf = fakes.pdf_bytes()
     r = client.post(f"/talent/public/refresh/{token}/cv", files={"file": ("cv.pdf", pdf, "application/pdf")})
     assert r.status_code == 200
     staged = db.query(CvVersion).filter_by(source="refresh_upload").one()
     assert staged.parse_status == "staged"
     bad = client.post(f"/talent/public/refresh/{token}/cv", files={"file": ("x.pdf", b"MZ evil", "application/pdf")})
     assert bad.status_code == 400
+    scripted = client.post(f"/talent/public/refresh/{token}/cv",
+                           files={"file": ("cv.pdf", b"%PDF-1.4 not really a pdf", "application/pdf")})
+    assert scripted.status_code == 400 and "damaged" in scripted.json()["detail"]
+    old_doc = client.post(f"/talent/public/refresh/{token}/cv",
+                          files={"file": ("cv.doc", b"\xd0\xcf\x11\xe0" + b"\x00" * 600, "application/msword")})
+    assert old_doc.status_code == 400
+    assert db.query(CvVersion).filter_by(source="refresh_upload").count() == 1  # refused files left nothing
+    assert db.query(AuditLog).filter_by(action="cv.upload_refused").count() >= 1
 
     body = {"fields": {"current_designation": "Senior Engineer", "current_company": "Newco", "current_ctc": 9,
                        "expected_ctc": 14, "notice_period_days": 30, "job_search_status": "active",

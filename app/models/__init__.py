@@ -48,3 +48,5 @@ from app.models.talent import (
 
 # File cleanup when a talent-pool profile is deleted by any path (needs the models above).
 import app.talent.retention  # noqa: E402,F401
+# Job candidates follow their profile's current resume when it is replaced.
+import app.services.resume_links  # noqa: E402,F401

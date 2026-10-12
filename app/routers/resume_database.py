@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import time
 import uuid
 from datetime import datetime
@@ -43,6 +42,7 @@ from app.media import (
     safe_upload_name,
     sign_media_url,
 )
+from app.services.file_safety import UnsafeFile, store_resume_upload
 from app.models.organization import Organization
 from app.models.resume_metadata import ResumeMetadata, mark_recruiter_edit
 from app.models.user import User, UserRole
@@ -236,8 +236,9 @@ def _replace_older_copies(db: Session, target: ResumeMetadata, losers: list, new
 
     if not losers:
         return []
+    # …and to the new file: they would otherwise keep showing the old resume.
     db.query(Candidate).filter(Candidate.resume_metadata_id.in_([m.id for m in losers])).update(
-        {"resume_metadata_id": target.id}, synchronize_session=False
+        {"resume_metadata_id": target.id, "resume_path": new_file}, synchronize_session=False
     )
     stale = [m.resume_file_path for m in losers if m.resume_file_path and m.resume_file_path != new_file]
     for m in losers:
@@ -583,17 +584,9 @@ async def requeue_unfinished_bulk_rows() -> int:
 
 
 def _save_upload_with_hash(upload: UploadFile, file_path: str) -> str:
-    """Write the upload to `file_path` (never overwriting) and return the
-    SHA-256 of its bytes."""
-    digest = hashlib.sha256()
-    with open(file_path, "xb") as out:
-        while True:
-            chunk = upload.file.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-            out.write(chunk)
-    return digest.hexdigest()
+    """Write the upload to `file_path` (never overwriting) once it passes the
+    safety checks, and return the SHA-256 of its bytes. Raises UnsafeFile."""
+    return store_resume_upload(upload, file_path)
 
 
 def _store_bulk_uploads(db: Session, files: List[UploadFile], batch_id: str, parse_mode: str,
@@ -632,6 +625,9 @@ def _store_bulk_uploads(db: Session, files: List[UploadFile], batch_id: str, par
             db.flush()
             meta_id = meta.id
             db.commit()
+        except UnsafeFile as exc:  # refused and already deleted
+            skipped.append({"file": name, "reason": exc.reason})
+            continue
         except Exception as exc:
             db.rollback()
             logger.error("Could not store bulk resume %s: %s", name, exc)
@@ -1666,8 +1662,10 @@ async def import_with_file(
     if problem:
         return {"status": "skipped", "reason": problem}
     file_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    try:
+        await asyncio.to_thread(store_resume_upload, file, file_path)
+    except UnsafeFile as exc:
+        return {"status": "skipped", "reason": exc.reason}
 
     try:
         meta = ResumeMetadata(

@@ -20,6 +20,7 @@ from app.database import get_db
 from app.models.organization import Organization
 from app.models.resume_metadata import ResumeMetadata
 from app.ratelimit import SlidingWindowCounter
+from app.services.file_safety import UnsafeFile
 from app.talent import consent, data_export, deliverability, refresh, retention, tokens
 from app.talent.audit import audit
 
@@ -66,6 +67,8 @@ def refresh_upload(token: str, file: UploadFile = File(...), db: Session = Depen
     _throttle(token)
     try:
         version = refresh.attach_cv(db, row, file)
+    except UnsafeFile as exc:  # refused for safety (or the virus scanner is down: 503)
+        raise HTTPException(status_code=exc.status_code, detail=exc.reason)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "cv_version_id": str(version.id)}

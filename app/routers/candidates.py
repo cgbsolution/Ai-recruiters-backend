@@ -44,18 +44,6 @@ def _get_candidate_with_org_check(db: Session, candidate_id: int, user: User) ->
     return authorize_candidate(db, candidate_id, user)
 
 
-def _scope_resume_metadata(query, org_id: Optional[int]):
-    """Restrict a ResumeMetadata query to one tenant — never global.
-
-    ResumeMetadata is per organization, and email lookups without this filter
-    matched (and overwrote) other tenants' parsed resumes. Rows with no
-    organization match only when the owning tenant itself is unknown (a global
-    super admin's job-less upload)."""
-    if org_id is None:
-        return query.filter(ResumeMetadata.organization_id.is_(None))
-    return query.filter(ResumeMetadata.organization_id == org_id)
-
-
 def _require_whatsapp_allowed(db: Session, user: User) -> None:
     """403 unless WhatsApp notifications are enabled for the caller's organization.
 
@@ -103,6 +91,8 @@ from app.schemas.resume_metadata import DuplicateCheckResponse
 from app.services import candidate_service
 from app.services.file_compression import schedule_compression
 from app.services.interview_text import feedback_and_question, question_text
+from app.services.file_safety import UnsafeFile, store_resume_upload
+from app.services.resume_links import find_profile
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
@@ -285,10 +275,7 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None, org_
                     existing.candidate_stage = "Candidates"
 
                     # Update ResumeMetadata for existing candidate (org-scoped)
-                    ex_meta = _scope_resume_metadata(
-                        db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == real_email),
-                        _org_id,
-                    ).first()
+                    ex_meta = find_profile(db, _org_id, real_email, include_shared_inboxes=True)
                     if not ex_meta:
                         ex_meta = ResumeMetadata(candidate_email=real_email, organization_id=_org_id)
                         db.add(ex_meta)
@@ -338,10 +325,7 @@ async def _parse_one(candidate_id: int, file_path: str, job_id: int | None, org_
             # ── Upsert ResumeMetadata (org-scoped) ────────────────────────────
             meta = None
             if parsed_email and not parsed_email.endswith("@resume.local"):
-                meta = _scope_resume_metadata(
-                    db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == parsed_email),
-                    _org_id,
-                ).first()
+                meta = find_profile(db, _org_id, parsed_email, include_shared_inboxes=True)
 
             if not meta:
                 # Prefer the real parsed email; otherwise use the (possibly rewritten)
@@ -962,8 +946,11 @@ async def upload_resumes(
 
         safe_name = _stored_resume_name(file)
         file_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
-        with open(file_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+        try:
+            await asyncio.to_thread(store_resume_upload, file, file_path)
+        except UnsafeFile as exc:
+            skipped_files.append(f"{file.filename} ({exc.reason})")
+            continue
         schedule_compression(file_path)  # background worker; the stored copy shrinks, its text doesn't change
 
         # Use filename stem as placeholder name until parse completes
@@ -1088,10 +1075,7 @@ async def _reparse_for_existing_candidate(candidate_id: int, file_path: str) -> 
             # Upsert ResumeMetadata keyed by the candidate's existing email
             meta = None
             if candidate.email and not candidate.email.endswith("@resume.local"):
-                meta = _scope_resume_metadata(
-                    db.query(ResumeMetadata).filter(ResumeMetadata.candidate_email == candidate.email),
-                    _org_id,
-                ).first()
+                meta = find_profile(db, _org_id, candidate.email, include_shared_inboxes=True)
             if not meta:
                 meta = ResumeMetadata(
                     candidate_email=candidate.email,
@@ -1173,8 +1157,10 @@ async def replace_resume(
 
     safe_name = _stored_resume_name(file)
     new_path = os.path.join(RESUME_UPLOAD_DIR, safe_name)
-    with open(new_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    try:
+        await asyncio.to_thread(store_resume_upload, file, new_path)
+    except UnsafeFile as exc:
+        raise HTTPException(status_code=exc.status_code, detail=f"Resume rejected: {exc.reason}")
     schedule_compression(new_path)
 
     old_path = candidate.resume_path

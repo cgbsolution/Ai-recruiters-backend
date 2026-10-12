@@ -98,6 +98,7 @@ Event payloads carry **ids only** (`app.agent.client.emit` refuses anything else
 | `TALENT_INVITE_REMINDER_DAYS` / `TALENT_INVITE_CLOSE_DAYS` | `3` / `3` | |
 | `TALENT_*_LINK_DAYS` | 14 / 10 / 14 / 30 | Refresh, invite, interview, my-data link lifetimes |
 | `TALENT_AUDIO_MAX_MB` | `15` | |
+| `CLAMAV_HOST` / `CLAMAV_PORT` / `CLAMAV_TIMEOUT_SECONDS` | — / `3310` / `30` | Virus scanning of every uploaded resume (clamd). Set: uploads are refused while the scanner is unreachable |
 
 Existing settings it uses: `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY` (voice answers), `SMTP_*`, `EMAIL_FROM`, `WHATSAPP_*`, `GOOGLE_*` (panel calendars), `SECRET_KEY`.
 
@@ -130,10 +131,11 @@ UPDATE talent_settings SET flags = flags || '{"refresh": false}'::jsonb WHERE or
 1. **Migrations** — `alembic upgrade head` (the Dockerfile already runs it). Revisions `q1r2s3t4u5v6`, `r2s3t4u5v6w7`, `s3t4u5v6w7x8`. They are purely additive.
 2. **pgvector (optional, recommended)** — if the database server has the extension available, the migration enables it and embeddings use `vector(1024)`. Without it they are `double precision[]` and Stage 2 runs in numpy over the Stage-1 pool (fine at 40K). After installing pgvector later: `python -m app.talent.vectors upgrade` (then `... status`).
 3. **Embeddings with Ollama (optional, free)** — deploy `docker-compose.ollama.dokploy.yml` as a Dokploy Compose service (it pulls `bge-m3`), then set `EMBEDDING_PROVIDER=ollama` and `OLLAMA_BASE_URL=http://ollama:11434` on the API and the worker. Profile text never leaves your servers. CPU-only it is slow but one-off: about 2.4 profiles/s on a 4-core laptop CPU (40K in ~5 h, capped at 2 CPUs so live interviews stay responsive); after that only new or changed CVs are embedded. The Settings page warns if Ollama is unreachable or the model is missing.
-4. **Worker** — run `uvicorn app.agent.worker:app --port 8001` (Procfile `worker`). It does not import `app.main`, so it runs no migrations, sweepers or bulk-upload queue.
-5. **Inngest** — Inngest Cloud or self-hosted: set `INNGEST_EVENT_KEY` and `INNGEST_SIGNING_KEY` on **both** the API (it sends events) and the worker, and register `https://<worker>/api/inngest` as the app URL. Locally: `npx inngest-cli@latest dev -u http://localhost:8001/api/inngest` with `INNGEST_DEV=1`.
-6. **Email** — Gmail/Workspace SMTP is not suitable for thousands of messages a day. Use a provider with bounce and complaint webhooks (SES, SendGrid, Postmark…). Put a small adapter in front of `POST /talent/public/webhooks/deliverability` that maps its events to `{"events":[{"id","type":"bounce|complaint|delivered|unsubscribe","bounce_type":"hard|soft","message_id"}]}`, signed with `TALENT_DELIVERABILITY_WEBHOOK_SECRET` (`X-Talent-Signature` = hex HMAC-SHA256 of the body). Set up SPF, DKIM and DMARC for the sender domain, and set `TALENT_PUBLIC_API_URL` so one-click unsubscribe works.
-7. **Turn it on** — `TALENT_AGENT_ENABLED=true`, then per organization in the UI.
+4. **Antivirus (recommended)** — deploy `docker-compose.clamav.dokploy.yml` as a Dokploy Compose service and set `CLAMAV_HOST=clamav` on the API and the worker. Every resume upload is already checked for dangerous content (PDF scripts and embedded files, Word macros, remote templates, zip bombs, encrypted files — `app/services/file_safety.py`); ClamAV adds signature-based virus scanning. The Settings page warns while it isn't configured.
+5. **Worker** — run `uvicorn app.agent.worker:app --port 8001` (Procfile `worker`). It does not import `app.main`, so it runs no migrations, sweepers or bulk-upload queue.
+6. **Inngest** — Inngest Cloud or self-hosted: set `INNGEST_EVENT_KEY` and `INNGEST_SIGNING_KEY` on **both** the API (it sends events) and the worker, and register `https://<worker>/api/inngest` as the app URL. Locally: `npx inngest-cli@latest dev -u http://localhost:8001/api/inngest` with `INNGEST_DEV=1`.
+7. **Email** — Gmail/Workspace SMTP is not suitable for thousands of messages a day. Use a provider with bounce and complaint webhooks (SES, SendGrid, Postmark…). Put a small adapter in front of `POST /talent/public/webhooks/deliverability` that maps its events to `{"events":[{"id","type":"bounce|complaint|delivered|unsubscribe","bounce_type":"hard|soft","message_id"}]}`, signed with `TALENT_DELIVERABILITY_WEBHOOK_SECRET` (`X-Talent-Signature` = hex HMAC-SHA256 of the body). Set up SPF, DKIM and DMARC for the sender domain, and set `TALENT_PUBLIC_API_URL` so one-click unsubscribe works.
+8. **Turn it on** — `TALENT_AGENT_ENABLED=true`, then per organization in the UI.
 
 ## Runbooks
 
@@ -151,6 +153,8 @@ UPDATE talent_settings SET flags = flags || '{"refresh": false}'::jsonb WHERE or
 **A candidate says they keep getting messages.** Audit view → filter by their profile id. Every message, skip reason and consent change is there.
 
 **Matching looks wrong for a job.** Job page → Settings: set explicit must-haves, budget, notice and locations; *Run matching*. "Show how this was scored" lists exactly what the model saw. Rate matches; the precision@10 report tracks quality.
+
+**A newer resume for someone already in the database.** Whatever the upload path (Resume Database, upload to a job, the refresh page), the profile keeps its id and every job candidate linked to it moves to the new file in the same transaction; with the agent tracking the profile, the change becomes its new current CV version (the old file stays as history until its retention date). The old file is deleted only when nothing references it, and the File Manager refuses to delete a resume that is still in use. To repair job links broken before this existed: `python -m app.services.resume_links repair` (dry run), then `... repair --apply`.
 
 **Inngest outage.** Nothing is lost: candidate pages, approvals and bookings keep working (they write the database directly). Events not delivered are caught up by the daily sweep (lost refresh starts, pending CV versions). Interview reminders for interviews booked during the outage may be missed — check *Interviews*.
 

@@ -86,6 +86,7 @@ def _smtp_ok() -> bool:
 
 
 def _settings_out(db: Session, org_id: int) -> dict:
+    from app.services import file_safety
     from app.talent import claude, embeddings
 
     row = talent_settings.get_settings(db, org_id)
@@ -102,6 +103,9 @@ def _settings_out(db: Session, org_id: int) -> dict:
         warnings.append("EMBEDDING_PROVIDER is not set: matching uses keyword similarity instead of vectors.")
     elif embeddings.provider() == "ollama" and (problem := embeddings.ollama_problem()):
         warnings.append(problem)
+    if not file_safety.antivirus_configured():
+        warnings.append("CLAMAV_HOST is not set: uploaded resumes are checked for dangerous content but not "
+                        "virus-scanned.")
     if not claude.available():
         warnings.append("ANTHROPIC_API_KEY is not set: no AI parsing, ranking or interview scoring.")
     if talent_config.TALENT_EMAIL_TRANSPORT == "smtp" and not _smtp_ok():

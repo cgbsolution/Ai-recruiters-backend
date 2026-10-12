@@ -1,0 +1,35 @@
+# ClamAV — virus scanning for uploaded resumes — Dokploy deployment.
+#
+# Deploy as: Create Service → Compose → Provider "Raw" → paste this file.
+# Compose Type: "Docker Compose" (container_name is needed for the fixed DNS name).
+#
+# Afterwards, set on the Backend-api service (and the Talent Agent worker):
+#   CLAMAV_HOST=clamav
+# From then on every resume upload (Resume Database, job uploads, candidate
+# applications, the Talent Agent refresh page) is scanned before it is stored,
+# and refused if the scanner can't be reached (app.services.file_safety).
+#
+# Sizing: the virus signatures need ~1.5 GB RAM (briefly ~3 GB while an update
+# loads) and ~1 GB of disk. The first start downloads them and takes a few
+# minutes; the image updates them daily (freshclam) and has its own healthcheck.
+
+services:
+  clamav:
+    image: clamav/clamav:stable
+    # Fixed name so other Dokploy services can reach it as clamav:3310.
+    container_name: clamav
+    restart: unless-stopped
+    mem_limit: 3g
+    volumes:
+      # Signatures survive redeploys, so restarts don't re-download them.
+      - clamav_db:/var/lib/clamav
+    # No `ports:` — reachable only inside dokploy-network.
+    networks:
+      - dokploy-network
+
+volumes:
+  clamav_db:
+
+networks:
+  dokploy-network:
+    external: true

@@ -202,6 +202,19 @@ def test_pairing_code_stops_working_when_the_interview_ends(client, world):
     assert client.post(f"/secondary-cam/connect/{code}/heartbeat").status_code == 404
 
 
+def _real_pdf() -> bytes:
+    """Uploads are opened and inspected (app.services.file_safety): a real PDF."""
+    import io
+
+    import pikepdf
+
+    buf = io.BytesIO()
+    pdf = pikepdf.new()
+    pdf.add_blank_page()
+    pdf.save(buf)
+    return buf.getvalue()
+
+
 def test_public_apply_neither_overwrites_records_nor_reuses_uploads(client, world):
     db = SessionLocal()
     try:
@@ -218,7 +231,7 @@ def test_public_apply_neither_overwrites_records_nor_reuses_uploads(client, worl
     assert not_pdf.status_code == 400
 
     up = client.post(f"/interview/{world.tok_a}/upload-resume",
-                     files={"file": ("cv.pdf", b"%PDF-1.4 probe", "application/pdf")})
+                     files={"file": ("cv.pdf", _real_pdf(), "application/pdf")})
     assert up.status_code == 200, up.text
     path = up.json()["resume_path"]
 
