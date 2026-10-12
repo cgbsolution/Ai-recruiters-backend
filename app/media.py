@@ -342,7 +342,9 @@ _SECURITY_HEADERS = {
 }
 
 
-@router.api_route("/media/{rel:path}", methods=["GET", "HEAD"], summary="Serve a signed upload")
+# Not in the OpenAPI schema: it is reached only through signed links, and a
+# GET+HEAD route there logged "Duplicate Operation ID serve_media..." on boot.
+@router.api_route("/media/{rel:path}", methods=["GET", "HEAD"], summary="Serve a signed upload", include_in_schema=False)
 async def serve_media(rel: str, exp: int = 0, sig: str = "", dl: int = 0, format: str = "original"):
     canonical = to_upload_relpath("uploads/" + rel)
     signed_fmt = format if format and format != "original" else None

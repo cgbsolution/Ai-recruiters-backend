@@ -941,11 +941,15 @@ def get_stats(db: Session = Depends(get_db), user: User = Depends(get_current_us
     completed = db.query(func.count(ResumeMetadata.id)).filter(
         *base_filters, ResumeMetadata.parsing_status == "completed",
     ).scalar() or 0
+    # Uploads still parsing and uploads that failed are placeholder rows (no
+    # email yet), which base_filters leaves out — count them here, or a bulk
+    # upload's failures never show up (and can't be retried or cleaned up).
+    org_filter = [ResumeMetadata.organization_id == org_id] if org_id is not None else []
     pending = db.query(func.count(ResumeMetadata.id)).filter(
-        *base_filters, ResumeMetadata.parsing_status.in_(["pending", "processing"]),
+        *org_filter, ResumeMetadata.parsing_status.in_(["pending", "processing"]),
     ).scalar() or 0
     failed = db.query(func.count(ResumeMetadata.id)).filter(
-        *base_filters, ResumeMetadata.parsing_status == "failed",
+        *org_filter, ResumeMetadata.parsing_status == "failed",
     ).scalar() or 0
 
     return {
@@ -1296,6 +1300,61 @@ def cleanup_stale_records(
     # Delete their files (unless still referenced elsewhere) after the response
     background_tasks.add_task(_remove_unused_resume_files, file_paths)
     return {"deleted": deleted_count, "message": f"Removed {deleted_count} stale placeholder record(s)."}
+
+
+# ── Retry failed (after a reader fix, e.g. legacy .doc support) ───────────────
+
+def _reset_failed_rows(org_id: Optional[int], batch_id: str) -> Tuple[list, int]:
+    """Failed rows whose file is still on disk -> pending, in a new batch, each
+    in the parse mode it was uploaded with. Returns (queue items, files gone)."""
+    db = SessionLocal()
+    try:
+        query = db.query(ResumeMetadata).filter(
+            ResumeMetadata.parsing_status == "failed",
+            ResumeMetadata.resume_file_path.isnot(None),
+        )
+        if org_id is not None:
+            query = query.filter(ResumeMetadata.organization_id == org_id)
+        items, missing = [], 0
+        for meta in query.order_by(ResumeMetadata.id).all():
+            if not resolve_upload_file(meta.resume_file_path, ("resumes",)):
+                missing += 1
+                continue
+            mode = meta.parse_mode if meta.parse_mode in ("fast", "ai") else "fast"
+            meta.parsing_status = "pending"
+            meta.parsing_error = None
+            meta.batch_id = batch_id
+            meta.parse_mode = mode
+            items.append((meta.id, meta.resume_file_path, batch_id, mode))
+        db.commit()
+        return items, missing
+    finally:
+        db.close()
+
+
+@router.post(
+    "/retry-failed",
+    summary="Read every failed resume again",
+    description=(
+        "Re-queues failed resumes whose file is still stored — useful after the "
+        "readers improve (legacy Word .doc, damaged DOCX/PDF). Each is parsed in "
+        "the mode it was uploaded with. Track it with GET /batch/{batch_id}."
+    ),
+)
+async def retry_failed_resumes(
+    db: Session = Depends(get_db),
+    user: User = Depends(_require_resume_admin),
+):
+    _check_resume_db_permission(user, db)
+    _ensure_bulk_worker()
+    batch_id = uuid.uuid4().hex[:12]
+    items, missing = await asyncio.to_thread(_reset_failed_rows, get_org_id(user), batch_id)
+    if items:
+        modes = {mode for *_, mode in items}
+        _new_batch(batch_id, len(items), modes.pop() if len(modes) == 1 else "mixed", user.organization_id)
+        for item in items:
+            _bulk_queue.put_nowait(item)
+    return {"batch_id": batch_id if items else None, "queued": len(items), "missing_files": missing}
 
 
 # ── Re-parse single resume (hybrid: regex + LLM correction) ──────────────────
