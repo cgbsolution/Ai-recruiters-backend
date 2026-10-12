@@ -8,7 +8,8 @@ from app.agent.interview_score import interview_score, shortlist_build
 from app.agent.invite_plan import invite_plan
 from app.agent.invite_send import invite_send
 from app.agent.live_voice_sync import live_voice_sync
-from app.agent.match_job import match_job
+from app.agent.heartbeat import agent_heartbeat
+from app.agent.match_job import match_job, match_job_on_edit
 from app.agent.refresh_dead_letter import refresh_dead_letter
 from app.agent.refresh_reengage import refresh_reengage
 from app.agent.refresh_respond import refresh_respond
@@ -25,6 +26,7 @@ FUNCTIONS = [
     refresh_dead_letter,
     # Loop B — match
     match_job,
+    match_job_on_edit,
     cv_backfill,
     # Loop C — rank and invite
     invite_plan,
@@ -40,4 +42,6 @@ FUNCTIONS = [
     live_voice_sync,
     # Retention
     retention_sweep,
+    # Health: lets the app warn when the worker isn't running
+    agent_heartbeat,
 ]

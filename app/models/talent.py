@@ -304,8 +304,11 @@ class TalentJobSettings(Base):
     panel_user_ids = Column(JsonB, nullable=True)  # users whose Google calendars are offered
     # Sort order from app.talent.scoring.build_shortlist: [{"match_id", "composite", "rank"}]
     shortlist = Column(JsonB, nullable=True)
-    match_status = Column(String(20), nullable=True)  # idle | running | done | failed
+    match_status = Column(String(20), nullable=True)  # queued | running | done | failed | skipped
     match_error = Column(Text, nullable=True)
+    # Live progress of the current / last run (app.talent.match_loop):
+    # {stage: queued|filtering|ranking|scoring|done|failed|skipped, pool, total, scored, ...}
+    match_progress = Column(JsonB, nullable=True)
     last_matched_at = Column(DateTime, nullable=True)
     embedding_model = Column(String(80), nullable=True)
     embedded_text_hash = Column(String(64), nullable=True)
@@ -435,6 +438,17 @@ class InterviewBooking(Base):
     ends_at = Column(DateTime, nullable=False)
     status = Column(String(12), nullable=False, default="offered")  # offered | booked | released
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class AgentHeartbeat(Base):
+    """When a part of the agent last proved it can run (app.talent.heartbeat):
+    "worker" is written by a cron function every 10 minutes, so a stale row
+    means Inngest isn't reaching the worker and no loop is running."""
+
+    __tablename__ = "talent_agent_heartbeats"
+
+    name = Column(String(40), primary_key=True)
+    last_seen_at = Column(DateTime, nullable=False)
 
 
 class TalentBatchRun(Base):

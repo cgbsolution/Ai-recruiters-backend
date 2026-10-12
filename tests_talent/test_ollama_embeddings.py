@@ -100,3 +100,21 @@ def test_settings_warning_for_ollama(monkeypatch):
 
     monkeypatch.setattr(httpx, "get", down)
     assert "not reachable" in embeddings.ollama_problem()
+
+
+def test_settings_page_reuses_a_recent_ollama_check(monkeypatch):
+    monkeypatch.setattr(embeddings.talent_config, "EMBEDDING_PROVIDER", "ollama")
+    monkeypatch.setattr(embeddings.talent_config, "EMBEDDING_MODEL", "")
+    monkeypatch.setattr(embeddings, "_ollama_checked", {})
+    calls = []
+
+    def tags(url, timeout=None):
+        calls.append(url)
+        return _Resp(payload={"models": [{"name": "bge-m3:latest"}]})
+
+    monkeypatch.setattr(httpx, "get", tags)
+    assert embeddings.ollama_problem(max_age=60) is None
+    assert embeddings.ollama_problem(max_age=60) is None
+    assert len(calls) == 1  # the second page load didn't ask Ollama again
+    assert embeddings.ollama_problem() is None
+    assert len(calls) == 2  # without max_age it always checks

@@ -22,7 +22,7 @@ from app.models.organization import Organization
 from app.models.resume_metadata import ResumeMetadata
 from app.models.talent import AuditLog, Campaign
 from app.models.user import User
-from app.talent import caps, campaigns, consent, deliverability, identity, phase0, retention, templates
+from app.talent import caps, campaigns, consent, deliverability, heartbeat, identity, phase0, retention, templates
 from app.talent import settings as talent_settings
 from app.talent.access import require_talent_admin, talent_org
 from app.talent.audit import audit, user_actor
@@ -97,12 +97,14 @@ def _settings_out(db: Session, org_id: int) -> dict:
         warnings.append("TALENT_AGENT_ENABLED is off: no loop runs, whatever the switches below say.")
     if not talent_config.INNGEST_EVENT_KEY and not talent_config.inngest_is_dev:
         warnings.append("INNGEST_EVENT_KEY is not set: the loops cannot be scheduled.")
+    elif talent_config.TALENT_AGENT_ENABLED and (worker := heartbeat.worker_problem(db)):
+        warnings.append(worker)
     if not talent_config.TALENT_PUBLIC_API_URL:
         warnings.append("TALENT_PUBLIC_API_URL is not set: one-click unsubscribe (a Gmail/Yahoo bulk-sender "
                         "requirement) falls back to the unsubscribe page.")
     if not embeddings.enabled():
         warnings.append("EMBEDDING_PROVIDER is not set: matching uses keyword similarity instead of vectors.")
-    elif embeddings.provider() == "ollama" and (problem := embeddings.ollama_problem()):
+    elif embeddings.provider() == "ollama" and (problem := embeddings.ollama_problem(max_age=60)):
         warnings.append(problem)
     if not file_safety.antivirus_configured():
         warnings.append("CLAMAV_HOST is not set: uploaded resumes are checked for dangerous content but not "

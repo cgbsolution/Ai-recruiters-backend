@@ -21,7 +21,7 @@ from app.models.resume_metadata import ResumeMetadata
 from app.models.talent import JobMatch, TalentJobSettings
 from app.models.user import User
 from app.refs import JobId, encode_ref
-from app.talent import backfill, consent, match_loop, matching
+from app.talent import backfill, consent, heartbeat, match_loop, matching
 from app.talent.access import require_talent_admin, talent_org
 from app.talent.audit import audit, user_actor
 from app.talent.settings import AUTONOMY_MODES, INTERVIEW_MODES, get_job_settings
@@ -46,7 +46,25 @@ def _settings_out(js: TalentJobSettings) -> dict:
     return {k: getattr(js, k) for k in (
         "autonomy_mode", "top_k", "interview_mode", "question_count", "time_limit_minutes", "slot_minutes",
         "budget_max_ctc", "max_notice_days", "relocation_ok", "locations", "must_haves", "nice_to_haves", "rubric",
-        "panel_user_ids", "match_status", "match_error", "last_matched_at")}
+        "panel_user_ids", "match_status", "match_error", "last_matched_at", "match_progress")}
+
+
+STUCK_AFTER_SECONDS = 180
+
+
+def _match_state(db: Session, js: TalentJobSettings) -> dict:
+    """What the job page needs to show a run honestly: live progress, whether
+    the worker is alive, and — if a run has sat queued for minutes — why."""
+    worker = heartbeat.worker_status(db)
+    hint = None
+    progress = js.match_progress or {}
+    if js.match_status == "queued" and progress.get("requested_at"):
+        waited = (datetime.utcnow() - datetime.fromisoformat(progress["requested_at"])).total_seconds()
+        if waited > STUCK_AFTER_SECONDS:
+            hint = heartbeat.worker_problem(db) or (
+                "The worker is checking in but hasn't picked this run up. Check that the worker is synced in Inngest "
+                "and look at the match-job runs in the Inngest dashboard.")
+    return {"worker": {"ok": worker["ok"], "last_seen_at": worker["last_seen_at"]}, "stuck_hint": hint}
 
 
 # ── Jobs ────────────────────────────────────────────────────────────────────
@@ -85,7 +103,7 @@ def get_job(job_id: JobId, org_id: int = Depends(talent_org), user: User = Depen
             "department": job.department, "experience_min": job.experience_min, "experience_max": job.experience_max,
             "status": job.status.value if hasattr(job.status, "value") else str(job.status),
             "settings": _settings_out(js), "skills": req.skills, "effective_must_haves": req.must_haves,
-            "matches": counts}
+            "matches": counts, **_match_state(db, js)}
 
 
 class JobSettingsUpdate(BaseModel):
@@ -170,12 +188,19 @@ def update_job_settings(
 def run_matching(job_id: JobId, org_id: int = Depends(talent_org), user: User = Depends(get_current_user),
                  db: Session = Depends(get_db)):
     job = _job(db, job_id, user, org_id)
-    js = get_job_settings(db, job.id, job.organization_id)
-    js.match_status = "queued"
+    reason = match_loop.request(db, job.id)
+    if reason:  # say why now, instead of a run that never starts
+        raise HTTPException(status_code=409, detail=match_loop.explain(reason))
     audit(db, actor=user_actor(user), action="match.requested", subject_type="job", subject_id=job.id,
-          organization_id=org_id)
-    db.commit()
-    return {"queued": _emit("talent/match.requested", {"job_id": job.id})}
+          organization_id=org_id, commit=True)
+    if not _emit("talent/match.requested", {"job_id": job.id}):
+        js = get_job_settings(db, job.id, job.organization_id)
+        js.match_status = "failed"
+        js.match_error = "The request couldn't be handed to the background worker (Inngest is unreachable or not configured)."
+        js.match_progress = {**(js.match_progress or {}), "stage": "failed"}
+        db.commit()
+        raise HTTPException(status_code=503, detail=js.match_error)
+    return {"queued": True}
 
 
 # ── Matches ─────────────────────────────────────────────────────────────────

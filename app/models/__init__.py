@@ -27,6 +27,7 @@ from app.models.observer import ObserverToken
 from app.models.client_event import ClientEvent
 from app.models.talent import (
     AccessToken,
+    AgentHeartbeat,
     AuditLog,
     Campaign,
     CampaignMember,

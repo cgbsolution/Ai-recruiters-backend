@@ -20,6 +20,7 @@ import hashlib
 import logging
 import math
 import re
+import time
 import uuid
 from datetime import datetime
 from typing import List, Optional
@@ -74,19 +75,29 @@ def _hash_vectors(texts: List[str]) -> List[List[float]]:
     return out
 
 
-def ollama_problem() -> Optional[str]:
-    """For the settings page: why Ollama embeddings would fail right now, or None."""
+_ollama_checked: dict = {}  # (base, model) -> (monotonic time, problem)
+
+
+def ollama_problem(max_age: float = 0) -> Optional[str]:
+    """For the settings page: why Ollama embeddings would fail right now, or None.
+    With ``max_age`` (seconds), a result that recent is reused instead of asking
+    Ollama again, so the page doesn't wait on the network every time it loads."""
     import httpx
 
     base, model = talent_config.OLLAMA_BASE_URL.rstrip("/"), model_name()
+    seen = _ollama_checked.get((base, model))
+    if max_age and seen and time.monotonic() - seen[0] < max_age:
+        return seen[1]
     try:
         names = [m.get("name", "") for m in httpx.get(f"{base}/api/tags", timeout=3).json().get("models", [])]
     except Exception:
-        return f"Ollama is not reachable at {base}: profile embeddings will fail."
-    wanted = model if ":" in model else f"{model}:latest"
-    if wanted not in names and model not in names:
-        return f"Ollama has no model {model!r}: run `ollama pull {model}` on the Ollama server."
-    return None
+        problem = f"Ollama is not reachable at {base}: profile embeddings will fail."
+    else:
+        wanted = model if ":" in model else f"{model}:latest"
+        problem = (f"Ollama has no model {model!r}: run `ollama pull {model}` on the Ollama server."
+                   if wanted not in names and model not in names else None)
+    _ollama_checked[(base, model)] = (time.monotonic(), problem)
+    return problem
 
 
 def _ollama_vectors(texts: List[str], model: str, dim: int) -> List[List[float]]:

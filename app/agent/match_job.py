@@ -1,7 +1,10 @@
-"""Loop B · match — on job.created / job.updated (debounced per job) or a
-recruiter's "run matching": Stage 1 SQL filter → Stage 2 vectors → Stage 3
-Claude rerank in chunks of 10 → top K, stale strong matches queued for a
-refresh. Ends with talent/match.completed, which starts Loop C."""
+"""Loop B · match — Stage 1 SQL filter → Stage 2 vectors → Stage 3 Claude
+rerank in chunks of 10 → top K, stale strong matches queued for a refresh.
+Ends with talent/match.completed, which starts Loop C.
+
+Two entry points: a recruiter's "Run matching" (talent/match.requested) runs
+at once; job edits (talent/job.updated) settle for 2 minutes first, so a burst
+of edits matches once — that debounce used to delay the button too."""
 
 from datetime import timedelta
 
@@ -24,11 +27,7 @@ async def _on_failure(ctx: inngest.Context) -> None:
 @inngest_client.create_function(
     fn_id="match-job",
     name="Loop B · match a job",
-    trigger=[
-        inngest.TriggerEvent(event="talent/job.updated"),
-        inngest.TriggerEvent(event="talent/match.requested"),
-    ],
-    debounce=inngest.Debounce(key="event.data.job_id", period=timedelta(minutes=2)),
+    trigger=inngest.TriggerEvent(event="talent/match.requested"),
     concurrency=[inngest.Concurrency(limit=1, key="event.data.job_id"), inngest.Concurrency(limit=3)],
     retries=3,
     on_failure=_on_failure,
@@ -49,3 +48,19 @@ async def match_job(ctx: inngest.Context) -> dict:
     await ctx.step.send_event("matched", events)
     return {"pool": started["pool"], "reranked": len(items), **{k: v for k, v in done.items() if k != "needs_refresh"},
             "needs_refresh": len(done["needs_refresh"])}
+
+
+@inngest_client.create_function(
+    fn_id="match-job-on-edit",
+    name="Loop B · match after a job edit",
+    trigger=inngest.TriggerEvent(event="talent/job.updated"),
+    debounce=inngest.Debounce(key="event.data.job_id", period=timedelta(minutes=2)),
+    retries=2,
+)
+async def match_job_on_edit(ctx: inngest.Context) -> dict:
+    job_id = int(ctx.event.data["job_id"])
+    reason = await ctx.step.run("request", run_db, match_loop.request, job_id)
+    if reason:
+        return {"skip": reason}
+    await ctx.step.send_event("requested", [inngest.Event(name="talent/match.requested", data={"job_id": job_id})])
+    return {"requested": True}

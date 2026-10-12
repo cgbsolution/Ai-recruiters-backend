@@ -191,11 +191,14 @@ async def score_chunk(job_id: int, items: List[dict]) -> dict:
     profiles are skipped on the retry by their input hash)."""
     from app.agent.common import run_db
 
+    from app.talent import match_loop
+
     prepared = await run_db(prepare, job_id, items)
     todo = [i for i in prepared["items"] if not i["skip"]]
     if not claude.available():
         for item in todo:
             await run_db(store, job_id, prepared["organization_id"], item, None, prepared["must_haves"])
+        await run_db(match_loop.chunk_scored, job_id, len(items))
         return {"scored": 0, "skipped": len(prepared["items"]), "reason": "ai_unavailable"}
 
     sem = asyncio.Semaphore(max(1, int(talent_config.TALENT_RERANK_CONCURRENCY)))
@@ -224,4 +227,5 @@ async def score_chunk(job_id: int, items: List[dict]) -> dict:
     await asyncio.gather(*(one(i) for i in todo))
     if transient:
         raise transient[0]
+    await run_db(match_loop.chunk_scored, job_id, len(items))  # only once the chunk succeeded
     return {"scored": len(todo), "skipped": len(prepared["items"]) - len(todo)}
