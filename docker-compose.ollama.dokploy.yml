@@ -1,0 +1,70 @@
+# Ollama — self-hosted embeddings for the Talent Agent — Dokploy deployment.
+#
+# Deploy as: Create Service → Compose → Provider "Raw" → paste this file.
+# Compose Type: "Docker Compose" (container_name is needed for the fixed DNS name).
+#
+# Afterwards, set on the Backend-api service AND the Talent Agent worker:
+#   EMBEDDING_PROVIDER=ollama
+#   OLLAMA_BASE_URL=http://ollama:11434
+# then Talent Agent → Matching readiness → "Embed profiles" (one-time backfill).
+#
+# Sizing: bge-m3 needs ~1.5 GB RAM and about 1.2 GB of disk. Embedding is
+# CPU-heavy, so the container is capped (OLLAMA_CPUS, default 2) to keep live
+# interviews responsive while the one-time backfill runs. For scale: a 4-core
+# laptop CPU embeds ~2.4 profiles/s (40,000 in ~5 h); afterwards only new or
+# changed CVs are embedded, a second or two each.
+#
+# Local dev uses the Ollama desktop app instead (OLLAMA_BASE_URL defaults to
+# http://localhost:11434; run `ollama pull bge-m3` once).
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    # Fixed name so other Dokploy services can reach it as http://ollama:11434.
+    container_name: ollama
+    restart: unless-stopped
+    cpus: "${OLLAMA_CPUS:-2}"
+    mem_limit: 4g
+    environment:
+      - OLLAMA_KEEP_ALIVE=15m
+    volumes:
+      # Downloaded models live here — survives redeploys.
+      - ollama_data:/root/.ollama
+    # No `ports:` — reachable only inside dokploy-network.
+    # Never expose 11434 publicly: Ollama has no authentication.
+    networks:
+      - dokploy-network
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # One-shot model download. Runs on every deploy; a model already in the
+  # ollama_data volume is only verified, so re-runs are quick.
+  ollama-init:
+    image: curlimages/curl:latest
+    container_name: ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - dokploy-network
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo ">> pulling bge-m3"
+        curl -sS --fail -X POST http://ollama:11434/api/pull \
+          -H "content-type: application/json" -d '{"model":"bge-m3","stream":false}'
+        echo
+        echo "✅ ollama-init done"
+
+volumes:
+  ollama_data:
+
+networks:
+  dokploy-network:
+    external: true

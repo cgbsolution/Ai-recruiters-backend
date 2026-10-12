@@ -2,6 +2,7 @@
 Embeddings for Stage 2 of matching. Anthropic has no embeddings endpoint, so
 the provider is chosen with EMBEDDING_PROVIDER:
 
+    ollama   self-hosted at OLLAMA_BASE_URL, default bge-m3 (1024 dims, 8K context, multilingual) — no API key
     voyage   VOYAGE_API_KEY, default model voyage-3.5 (1024 dims) — Anthropic's recommended partner
     gemini   GEMINI_API_KEY, default gemini-embedding-001 at 1024 dims
     openai   OPENAI_API_KEY, default text-embedding-3-small at 1024 dims
@@ -35,8 +36,8 @@ from app.talent.redaction import embedding_text
 
 logger = logging.getLogger("app.talent.embeddings")
 
-_DEFAULT_MODELS = {"voyage": "voyage-3.5", "gemini": "gemini-embedding-001", "openai": "text-embedding-3-small",
-                   "hash": "hash-1024"}
+_DEFAULT_MODELS = {"ollama": "bge-m3", "voyage": "voyage-3.5", "gemini": "gemini-embedding-001",
+                   "openai": "text-embedding-3-small", "hash": "hash-1024"}
 BATCH = 64
 
 
@@ -73,6 +74,47 @@ def _hash_vectors(texts: List[str]) -> List[List[float]]:
     return out
 
 
+def ollama_problem() -> Optional[str]:
+    """For the settings page: why Ollama embeddings would fail right now, or None."""
+    import httpx
+
+    base, model = talent_config.OLLAMA_BASE_URL.rstrip("/"), model_name()
+    try:
+        names = [m.get("name", "") for m in httpx.get(f"{base}/api/tags", timeout=3).json().get("models", [])]
+    except Exception:
+        return f"Ollama is not reachable at {base}: profile embeddings will fail."
+    wanted = model if ":" in model else f"{model}:latest"
+    if wanted not in names and model not in names:
+        return f"Ollama has no model {model!r}: run `ollama pull {model}` on the Ollama server."
+    return None
+
+
+def _ollama_vectors(texts: List[str], model: str, dim: int) -> List[List[float]]:
+    import httpx
+
+    base = talent_config.OLLAMA_BASE_URL.rstrip("/")
+    try:
+        resp = httpx.post(
+            f"{base}/api/embed",
+            json={"model": model, "input": texts, "truncate": True, "keep_alive": "15m",
+                  "options": {"num_ctx": int(talent_config.OLLAMA_NUM_CTX)}},
+            timeout=float(talent_config.OLLAMA_TIMEOUT_SECONDS),
+        )
+    except httpx.ConnectError as exc:
+        raise RuntimeError(f"Ollama is not reachable at {base}") from exc
+    if resp.status_code == 404:
+        raise RuntimeError(f"Ollama has no model {model!r}: run `ollama pull {model}` on the Ollama server")
+    resp.raise_for_status()
+    vectors_out = resp.json()["embeddings"]
+    if len(vectors_out) != len(texts):
+        raise RuntimeError(f"Ollama returned {len(vectors_out)} vectors for {len(texts)} texts")
+    if vectors_out and len(vectors_out[0]) != dim:
+        # Storing them would break every comparison against the 1024-wide column.
+        raise ValueError(f"Ollama model {model!r} makes {len(vectors_out[0])}-number vectors but EMBEDDING_DIM is "
+                         f"{dim}: use a {dim}-dimension model such as bge-m3 or mxbai-embed-large")
+    return vectors_out
+
+
 def embed_texts(texts: List[str], kind: str = "document") -> List[List[float]]:
     """kind: document (profiles) | query (jobs) — some providers embed them differently."""
     p, model, dim = provider(), model_name(), int(talent_config.EMBEDDING_DIM)
@@ -80,6 +122,8 @@ def embed_texts(texts: List[str], kind: str = "document") -> List[List[float]]:
         return []
     if p == "hash":
         return _hash_vectors(texts)
+    if p == "ollama":
+        return _ollama_vectors(texts, model, dim)
     if p == "voyage":
         import httpx
 

@@ -75,10 +75,12 @@ Event payloads carry **ids only** (`app.agent.client.emit` refuses anything else
 | `TALENT_LLM_REFUSAL_FALLBACK` | `true` | Server-side refusal fallback on realtime calls |
 | `TALENT_RERANK_CONCURRENCY` | `4` | Parallel rerank calls per chunk |
 | `TALENT_RERANK_POOL` | `200` | Profiles kept by Stage 2 |
-| `EMBEDDING_PROVIDER` | — | `voyage` \| `gemini` \| `openai` \| `hash` (tests only). Unset: keyword similarity |
-| `EMBEDDING_MODEL` | per provider | `voyage-3.5`, `gemini-embedding-001`, `text-embedding-3-small` |
+| `EMBEDDING_PROVIDER` | — | `ollama` (self-hosted, no API key) \| `voyage` \| `gemini` \| `openai` \| `hash` (tests only). Unset: keyword similarity |
+| `EMBEDDING_MODEL` | per provider | `bge-m3`, `voyage-3.5`, `gemini-embedding-001`, `text-embedding-3-small` — must make 1024-number vectors |
 | `EMBEDDING_DIM` | `1024` | Must match the column (`vector(1024)`) |
 | `VOYAGE_API_KEY` | — | |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server for `EMBEDDING_PROVIDER=ollama`; in Dokploy `http://ollama:11434` |
+| `OLLAMA_NUM_CTX` / `OLLAMA_TIMEOUT_SECONDS` | `4096` / `600` | Context per text; timeout per batch of 64 |
 | `TALENT_EMAIL_TRANSPORT` | `smtp` | `smtp` (existing `SMTP_*`), `memory` (tests), `disabled` |
 | `TALENT_SEND_RAMP` | `500,2000,5000` | Daily caps per sender domain, one step every `TALENT_SEND_RAMP_STEP_DAYS` (7) |
 | `TALENT_BULK_SHARE` | `0.7` | Share of a day's cap refresh mail may use (the rest: invites, reminders) |
@@ -127,10 +129,11 @@ UPDATE talent_settings SET flags = flags || '{"refresh": false}'::jsonb WHERE or
 
 1. **Migrations** — `alembic upgrade head` (the Dockerfile already runs it). Revisions `q1r2s3t4u5v6`, `r2s3t4u5v6w7`, `s3t4u5v6w7x8`. They are purely additive.
 2. **pgvector (optional, recommended)** — if the database server has the extension available, the migration enables it and embeddings use `vector(1024)`. Without it they are `double precision[]` and Stage 2 runs in numpy over the Stage-1 pool (fine at 40K). After installing pgvector later: `python -m app.talent.vectors upgrade` (then `... status`).
-3. **Worker** — run `uvicorn app.agent.worker:app --port 8001` (Procfile `worker`). It does not import `app.main`, so it runs no migrations, sweepers or bulk-upload queue.
-4. **Inngest** — Inngest Cloud or self-hosted: set `INNGEST_EVENT_KEY` and `INNGEST_SIGNING_KEY` on **both** the API (it sends events) and the worker, and register `https://<worker>/api/inngest` as the app URL. Locally: `npx inngest-cli@latest dev -u http://localhost:8001/api/inngest` with `INNGEST_DEV=1`.
-5. **Email** — Gmail/Workspace SMTP is not suitable for thousands of messages a day. Use a provider with bounce and complaint webhooks (SES, SendGrid, Postmark…). Put a small adapter in front of `POST /talent/public/webhooks/deliverability` that maps its events to `{"events":[{"id","type":"bounce|complaint|delivered|unsubscribe","bounce_type":"hard|soft","message_id"}]}`, signed with `TALENT_DELIVERABILITY_WEBHOOK_SECRET` (`X-Talent-Signature` = hex HMAC-SHA256 of the body). Set up SPF, DKIM and DMARC for the sender domain, and set `TALENT_PUBLIC_API_URL` so one-click unsubscribe works.
-6. **Turn it on** — `TALENT_AGENT_ENABLED=true`, then per organization in the UI.
+3. **Embeddings with Ollama (optional, free)** — deploy `docker-compose.ollama.dokploy.yml` as a Dokploy Compose service (it pulls `bge-m3`), then set `EMBEDDING_PROVIDER=ollama` and `OLLAMA_BASE_URL=http://ollama:11434` on the API and the worker. Profile text never leaves your servers. CPU-only it is slow but one-off: about 2.4 profiles/s on a 4-core laptop CPU (40K in ~5 h, capped at 2 CPUs so live interviews stay responsive); after that only new or changed CVs are embedded. The Settings page warns if Ollama is unreachable or the model is missing.
+4. **Worker** — run `uvicorn app.agent.worker:app --port 8001` (Procfile `worker`). It does not import `app.main`, so it runs no migrations, sweepers or bulk-upload queue.
+5. **Inngest** — Inngest Cloud or self-hosted: set `INNGEST_EVENT_KEY` and `INNGEST_SIGNING_KEY` on **both** the API (it sends events) and the worker, and register `https://<worker>/api/inngest` as the app URL. Locally: `npx inngest-cli@latest dev -u http://localhost:8001/api/inngest` with `INNGEST_DEV=1`.
+6. **Email** — Gmail/Workspace SMTP is not suitable for thousands of messages a day. Use a provider with bounce and complaint webhooks (SES, SendGrid, Postmark…). Put a small adapter in front of `POST /talent/public/webhooks/deliverability` that maps its events to `{"events":[{"id","type":"bounce|complaint|delivered|unsubscribe","bounce_type":"hard|soft","message_id"}]}`, signed with `TALENT_DELIVERABILITY_WEBHOOK_SECRET` (`X-Talent-Signature` = hex HMAC-SHA256 of the body). Set up SPF, DKIM and DMARC for the sender domain, and set `TALENT_PUBLIC_API_URL` so one-click unsubscribe works.
+7. **Turn it on** — `TALENT_AGENT_ENABLED=true`, then per organization in the UI.
 
 ## Runbooks
 

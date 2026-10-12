@@ -100,6 +100,8 @@ def _settings_out(db: Session, org_id: int) -> dict:
                         "requirement) falls back to the unsubscribe page.")
     if not embeddings.enabled():
         warnings.append("EMBEDDING_PROVIDER is not set: matching uses keyword similarity instead of vectors.")
+    elif embeddings.provider() == "ollama" and (problem := embeddings.ollama_problem()):
+        warnings.append(problem)
     if not claude.available():
         warnings.append("ANTHROPIC_API_KEY is not set: no AI parsing, ranking or interview scoring.")
     if talent_config.TALENT_EMAIL_TRANSPORT == "smtp" and not _smtp_ok():

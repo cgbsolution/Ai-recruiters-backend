@@ -48,12 +48,17 @@ class TalentConfig(BaseSettings):
     TALENT_RERANK_POOL: int = 200  # Stage 2 keeps this many for the Claude rerank
 
     # ── Embeddings (Anthropic has no embeddings endpoint) ────────────────────
-    # "" = off (Stage 2 falls back to keyword similarity) | voyage | gemini | openai
-    # | hash (deterministic local vectors — tests/dev only, no semantic meaning)
+    # "" = off (Stage 2 falls back to keyword similarity) | ollama | voyage | gemini
+    # | openai | hash (deterministic local vectors — tests/dev only, no semantic meaning)
     EMBEDDING_PROVIDER: str = ""
     EMBEDDING_MODEL: str = ""  # default per provider, see app.talent.embeddings
     EMBEDDING_DIM: int = 1024
     VOYAGE_API_KEY: str = ""
+    # Self-hosted Ollama (EMBEDDING_PROVIDER=ollama): free, and profile text never
+    # leaves your servers. In Dokploy: http://ollama:11434 (docker-compose.ollama.dokploy.yml).
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_NUM_CTX: int = 4096  # tokens per text; embedding text is capped at 8,000 characters
+    OLLAMA_TIMEOUT_SECONDS: int = 600  # one batch of 64 profiles on a CPU-only server
 
     # ── Sending ──────────────────────────────────────────────────────────────
     # email: smtp (existing SMTP_* settings) | memory (tests) | disabled
