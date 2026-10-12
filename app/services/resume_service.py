@@ -1,7 +1,8 @@
 """
 Resume parsing and fit-score calculation.
 
-PDF text extraction uses pdfplumber; DOCX uses python-docx.
+PDF text extraction uses pdfplumber (PDFium for damaged files); DOCX is read from
+its XML parts; legacy .doc through olefile.
 LLM calls are delegated to ai_service helpers (provider-agnostic).
 
 Uses an enterprise-grade ATS engine prompt for deterministic,
@@ -11,6 +12,7 @@ production-quality resume parsing and JD fit scoring.
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -66,17 +68,9 @@ def extract_text_from_pdf(file_path: str) -> str:
     text at all (e.g. image-only / purely scanned PDFs).
     """
     try:
-        import pdfplumber
-        text_parts = []
-        with pdfplumber.open(file_path) as pdf:
-            for page in pdf.pages[:MAX_PDF_PAGES]:
-                try:
-                    page_text = page.dedupe_chars(tolerance=1).extract_text() or ""
-                except Exception:
-                    page_text = page.extract_text() or ""
-                if page_text.strip():
-                    text_parts.append(page_text)
-        result = "\n".join(text_parts).strip().replace("\x00", "")
+        result = _pdfplumber_text(file_path)
+        if not result:
+            result = _pdf_text_pdfium(file_path) or ""
         if not result:
             raise RuntimeError(
                 "No text could be extracted from this PDF. "
@@ -89,36 +83,309 @@ def extract_text_from_pdf(file_path: str) -> str:
     except ImportError:
         raise RuntimeError("pdfplumber is not installed. Run: pip install pdfplumber")
     except Exception as exc:
+        # Damaged files ("Unexpected EOF" from incomplete downloads, "No /Root
+        # object"): let qpdf rebuild the structure, else try PDFium.
+        recovered = _pdf_text_repaired(file_path) or _pdf_text_pdfium(file_path)
+        if recovered:
+            logger.info("PDF read after repair (pdfminer failed: %s): %s", exc, file_path)
+            return recovered
         # These messages reach API responses; the parser's own text (which
         # includes server file paths) goes to the log only.
         logger.warning("PDF extraction failed for %s: %s", file_path, exc)
         raise RuntimeError("Could not read this PDF file. It may be damaged or password-protected.") from exc
 
 
+def _pdfplumber_text(source) -> str:
+    """Text of a PDF (path or file object) via pdfplumber, page by page."""
+    import pdfplumber
+
+    text_parts = []
+    with pdfplumber.open(source) as pdf:
+        for page in pdf.pages[:MAX_PDF_PAGES]:
+            try:
+                page_text = page.dedupe_chars(tolerance=1).extract_text() or ""
+            except Exception:
+                page_text = page.extract_text() or ""
+            if page_text.strip():
+                text_parts.append(page_text)
+    return "\n".join(text_parts).strip().replace("\x00", "")
+
+
+def _pdf_text_repaired(file_path: str) -> Optional[str]:
+    """qpdf (via pikepdf) reconstructs a PDF's cross-reference table and
+    trailer by scanning the file — it recovers truncated downloads that both
+    pdfminer and PDFium reject. The repaired copy is read in memory; the stored
+    file is left as it is."""
+    import io
+
+    try:
+        import pikepdf
+
+        with pikepdf.open(file_path) as pdf:
+            if len(pdf.pages) > MAX_PDF_PAGES * 4:
+                return None
+            repaired = io.BytesIO()
+            pdf.save(repaired)
+        repaired.seek(0)
+        return _pdfplumber_text(repaired) or None
+    except Exception:
+        return None
+
+
+def _pdf_text_pdfium(file_path: str) -> Optional[str]:
+    """Last reader for PDFs the others give up on. PDFium (Chrome's PDF
+    engine) tolerates other kinds of damage. None if it can't."""
+    try:
+        import pypdfium2 as pdfium
+
+        pdf = pdfium.PdfDocument(file_path)
+        try:
+            parts = []
+            for i in range(min(len(pdf), MAX_PDF_PAGES)):
+                page = pdf[i]
+                textpage = page.get_textpage()
+                parts.append(textpage.get_text_range())
+                textpage.close()
+                page.close()
+        finally:
+            pdf.close()
+    except Exception:
+        return None
+    text = "\n".join(parts).replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+    return _tidy_lines(text) or None
+
+
 def extract_text_from_docx(file_path: str) -> str:
-    """Extract plain text from a DOCX file using python-docx."""
+    """Text of a .docx: body, tables, text boxes, headers and footers.
+
+    Reads the WordprocessingML parts directly. python-docx (used before) only
+    returned top-level body paragraphs — dropping every table-based resume
+    layout and the header with the name/contact block — and failed the whole
+    file when any part, even an embedded picture, had a bad checksum ("Bad
+    CRC-32 for file 'word/media/image1.png'" on foundit exports).
+    """
+    import zipfile
+
     check_docx_is_safe(file_path)
     try:
-        from docx import Document
-        doc = Document(file_path)
-        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-        return "\n".join(paragraphs)
-    except ImportError:
-        raise RuntimeError("python-docx is not installed. Run: pip install python-docx")
+        with zipfile.ZipFile(file_path) as zf:
+            names = set(zf.namelist())
+            main = _docx_main_part(zf, names)
+            if main is None:
+                raise RuntimeError("Could not read this Word file. Please upload a .docx or PDF.")
+            headers = sorted(n for n in names if re.fullmatch(r"word/header\d*\.xml", n))
+            footers = sorted(n for n in names if re.fullmatch(r"word/footer\d*\.xml", n))
+            chunks = []
+            for part in headers + [main] + footers:
+                try:
+                    chunks.append(_wordml_text(zf.read(part)))
+                except Exception:
+                    if part == main:
+                        raise
+                    # a damaged header/footer costs only that part
+        text = "\n".join(c for c in chunks if c.strip())
+    except RuntimeError:
+        raise
     except Exception as exc:
         logger.warning("DOCX extraction failed for %s: %s", file_path, exc)
         raise RuntimeError("Could not read this Word file. Please upload a .docx or PDF.") from exc
+    return _tidy_lines(text)
+
+
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+
+def _docx_main_part(zf, names: set) -> Optional[str]:
+    """The main document part named by the package relationships (it is not
+    always word/document.xml)."""
+    try:
+        rels = zf.read("_rels/.rels").decode("utf-8", errors="replace")
+        m = re.search(r'Target="/?([^"]+)"[^>]*Type="[^"]*/officeDocument"|'
+                      r'Type="[^"]*/officeDocument"[^>]*Target="/?([^"]+)"', rels)
+        if m:
+            target = m.group(1) or m.group(2)
+            if target in names:
+                return target
+    except KeyError:
+        pass
+    return "word/document.xml" if "word/document.xml" in names else None
+
+
+def _wordml_text(xml: bytes) -> str:
+    """Paragraph text of one WordprocessingML part, in document order. Text
+    boxes are read once (their mc:Fallback copy is skipped); deleted text in
+    tracked changes and field codes are not text."""
+    from lxml import etree
+
+    # No entity expansion / network: the XML comes from an untrusted upload.
+    parser = etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False)
+    root = etree.fromstring(xml, parser)
+    w = "{%s}" % _W_NS
+    fallback = "{%s}Fallback" % _MC_NS
+    lines, stack, skip = [], [], 0
+    for event, el in etree.iterwalk(root, events=("start", "end")):
+        tag = el.tag
+        if tag == fallback:
+            skip += 1 if event == "start" else -1
+            continue
+        if skip:
+            continue
+        if tag == w + "p":
+            if event == "start":
+                stack.append([])
+            elif stack:
+                line = "".join(stack.pop()).strip()
+                if line:
+                    lines.append(line)
+        elif event == "start" and stack:
+            if tag == w + "t":
+                stack[-1].append(el.text or "")
+            elif tag == w + "tab":
+                stack[-1].append("\t")
+            elif tag in (w + "br", w + "cr"):
+                stack[-1].append("\n")
+    return "\n".join(lines)
+
+
+def extract_text_from_doc(file_path: str) -> str:
+    """Text of a legacy Word 97-2003 binary .doc.
+
+    These were failing with "not a Word file, content type is ...themeManager+xml":
+    Word 2007+ embeds the document theme as a small zip package inside the
+    binary file, Python's zipfile finds that, and the DOCX reader then opened
+    the theme instead of the document. The text is read from the WordDocument
+    stream through its piece table ([MS-DOC] 2.8 / 2.9), using olefile.
+    """
+    import olefile
+
+    unreadable = "Could not read this Word (.doc) file. It may be damaged or from a very old Word version."
+    try:
+        with olefile.OleFileIO(file_path) as ole:
+            if not ole.exists("WordDocument"):
+                raise RuntimeError(unreadable)
+            word = ole.openstream("WordDocument").read()
+            if len(word) < 0x200 or _u16(word, 0) != 0xA5EC:  # FIB magic
+                raise RuntimeError(unreadable)
+            flags = _u16(word, 0x0A)
+            if flags & 0x0100:  # fEncrypted
+                raise RuntimeError("This Word file is password-protected. Please upload an unprotected copy or a PDF.")
+            table_name = "1Table" if flags & 0x0200 else "0Table"  # fWhichTblStm
+            if not ole.exists(table_name):
+                raise RuntimeError(unreadable)
+            table = ole.openstream(table_name).read()
+
+        # FIB: FibBase(32) | csw + fibRgW | cslw + fibRgLw | cbRgFcLcb + fibRgFcLcb
+        pos = 32
+        pos += 2 + _u16(word, pos) * 2
+        pos += 2 + _u16(word, pos) * 4
+        if _u16(word, pos) < 34:  # too old to carry fcClx (Word 6/95)
+            raise RuntimeError(unreadable)
+        pos += 2
+        fc_clx, lcb_clx = _u32(word, pos + 33 * 8), _u32(word, pos + 33 * 8 + 4)
+        clx = table[fc_clx:fc_clx + lcb_clx]
+
+        i = 0
+        while i < len(clx) and clx[i] == 0x01:  # Prc entries (formatting) — skip
+            i += 3 + _u16(clx, i + 1)
+        if i >= len(clx) or clx[i] != 0x02:  # Pcdt
+            raise RuntimeError(unreadable)
+        lcb = _u32(clx, i + 1)
+        plc = clx[i + 5:i + 5 + lcb]
+        n = (lcb - 4) // 12
+        cps = [_u32(plc, 4 * k) for k in range(n + 1)]
+        parts = []
+        for k in range(n):
+            chars = cps[k + 1] - cps[k]
+            if chars <= 0 or chars > 2_000_000:
+                continue
+            fc = _u32(plc, 4 * (n + 1) + 8 * k + 2)
+            if fc & 0x40000000:  # compressed: 8-bit cp1252 at fc/2
+                start = (fc & 0x3FFFFFFF) // 2
+                parts.append(word[start:start + chars].decode("cp1252", errors="replace"))
+            else:  # UTF-16LE
+                parts.append(word[fc:fc + 2 * chars].decode("utf-16-le", errors="replace"))
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        logger.warning("DOC extraction failed for %s: %s", file_path, exc)
+        raise RuntimeError(unreadable) from exc
+    return _tidy_lines(_strip_word_controls("".join(parts)))
+
+
+def _u16(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset:offset + 2], "little")
+
+
+def _u32(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset:offset + 4], "little")
+
+
+_WORD_CONTROL_MAP = {
+    "\r": "\n", "\x0b": "\n", "\x0c": "\n", "\x0e": "\n",  # paragraph / line / page / column breaks
+    "\x07": "\t",  # table cell and row ends
+    "\x1e": "-", "\xa0": " ",
+}
+
+
+def _strip_word_controls(text: str) -> str:
+    """Binary Word text -> plain text: keep each field's displayed result,
+    drop its instruction ("HYPERLINK mailto:..."), map breaks, drop anchors."""
+    out, fields = [], []  # fields: True while in a field's instruction part
+    for ch in text:
+        if ch == "\x13":
+            fields.append(True)
+        elif ch == "\x14":
+            if fields:
+                fields[-1] = False
+        elif ch == "\x15":
+            if fields:
+                fields.pop()
+        elif any(fields):
+            continue
+        elif ch in _WORD_CONTROL_MAP:
+            out.append(_WORD_CONTROL_MAP[ch])
+        elif ch == "\n" or ch == "\t" or ord(ch) >= 0x20:
+            out.append(ch)
+    return "".join(out)
+
+
+def _tidy_lines(text: str) -> str:
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.replace("\x00", "").split("\n")]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _sniff_kind(file_path: str) -> Optional[str]:
+    """What the file really is, from its first bytes — extensions lie (a .doc
+    that is really a .docx, a .docx saved as Word 97-2003...)."""
+    try:
+        with open(file_path, "rb") as fh:
+            head = fh.read(1024)
+    except OSError:
+        return None
+    if head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return "doc"
+    if head.startswith(b"PK\x03\x04"):
+        return "docx"
+    if b"%PDF" in head:  # the header may follow a few junk bytes
+        return "pdf"
+    return None
 
 
 def extract_text(file_path: str) -> str:
-    """Dispatch to the correct extractor based on file extension."""
+    """Dispatch on what the file really is (its first bytes), falling back to
+    the extension."""
+    kind = _sniff_kind(file_path)
     ext = Path(file_path).suffix.lower()
-    if ext == ".pdf":
+    if kind is None:
+        kind = {".pdf": "pdf", ".docx": "docx", ".doc": "doc"}.get(ext)
+    if kind == "pdf":
         return extract_text_from_pdf(file_path)
-    elif ext in (".doc", ".docx"):
+    if kind == "docx":
         return extract_text_from_docx(file_path)
-    else:
-        raise ValueError(f"Unsupported file type: {ext}")
+    if kind == "doc":
+        return extract_text_from_doc(file_path)
+    raise ValueError(f"Unsupported file type: {ext}")
 
 
 # ── LLM-backed Resume Parsing ─────────────────────────────────────────────────

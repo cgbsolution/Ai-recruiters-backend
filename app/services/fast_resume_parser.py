@@ -287,36 +287,15 @@ def extract_text_from_file(file_path: str) -> Optional[str]:
 
     Returns None for purely image/scanned PDFs (no embedded text layer).
     """
-    import os
-    from app.services.resume_service import MAX_PDF_PAGES, check_docx_is_safe
-    ext = os.path.splitext(file_path)[1].lower()
+    # One reader for every upload path: the Resume Database, job applications
+    # and re-parses all go through app.services.resume_service.extract_text
+    # (legacy .doc, damaged DOCX/PDF handling lives there).
+    from app.services.resume_service import extract_text
+
     try:
-        if ext == ".pdf":
-            import pdfplumber
-            with pdfplumber.open(file_path) as pdf:
-                parts: list[str] = []
-                for page in pdf.pages[:MAX_PDF_PAGES]:
-                    try:
-                        deduped = page.dedupe_chars(tolerance=1)
-                        parts.append(deduped.extract_text() or "")
-                    except Exception:
-                        # dedupe_chars can fail on malformed pages — fall back
-                        # to the raw extraction rather than losing the page.
-                        parts.append(page.extract_text() or "")
-            result = "\n".join(parts).strip().replace("\x00", "")
-            if not result:
-                logger.warning(
-                    "PDF yielded no text (likely scanned/image-only): %s", file_path
-                )
-                return None
-            return result
-        elif ext in (".doc", ".docx"):
-            from docx import Document
-            check_docx_is_safe(file_path)  # zip-bomb guard (raises → logged below)
-            doc = Document(file_path)
-            return "\n".join(p.text for p in doc.paragraphs)
+        return extract_text(file_path) or None
     except Exception as e:
-        logger.error("Text extraction failed for %s: %s", file_path, e)
+        logger.warning("Text extraction failed for %s: %s", file_path, e)
     return None
 
 
