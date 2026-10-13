@@ -97,6 +97,9 @@ def _settings_out(db: Session, org_id: int) -> dict:
         warnings.append("TALENT_AGENT_ENABLED is off: no loop runs, whatever the switches below say.")
     if not talent_config.INNGEST_EVENT_KEY and not talent_config.inngest_is_dev:
         warnings.append("INNGEST_EVENT_KEY is not set: the loops cannot be scheduled.")
+    elif not talent_config.INNGEST_SIGNING_KEY and not talent_config.inngest_is_dev:
+        warnings.append("INNGEST_SIGNING_KEY is not set: the worker can't start in production, so nothing runs. "
+                        "Copy the signing key from Inngest Cloud → Manage → Signing Key into the API's environment.")
     elif talent_config.TALENT_AGENT_ENABLED and (worker := heartbeat.worker_problem(db)):
         warnings.append(worker)
     if not talent_config.TALENT_PUBLIC_API_URL:

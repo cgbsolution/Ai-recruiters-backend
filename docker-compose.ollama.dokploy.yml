@@ -3,7 +3,7 @@
 # Deploy as: Create Service → Compose → Provider "Raw" → paste this file.
 # Compose Type: "Docker Compose" (container_name is needed for the fixed DNS name).
 #
-# Afterwards, set on the Backend-api service AND the Talent Agent worker:
+# Afterwards, set on the Backend-api service (the Talent Agent worker runs inside it):
 #   EMBEDDING_PROVIDER=ollama
 #   OLLAMA_BASE_URL=http://ollama:11434
 # then Talent Agent → Matching readiness → "Embed profiles" (one-time backfill).

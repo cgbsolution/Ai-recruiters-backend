@@ -532,8 +532,9 @@ app.include_router(observer.router, tags=["Live Observer"])
 app.include_router(client_events.router, tags=["Client Telemetry"])
 app.include_router(media.router)
 # Talent Agent (app.talent): admin API, the candidate pages' API (magic links, no login)
-# and — only with TALENT_SERVE_IN_API — the Inngest endpoint. By default the
-# Inngest functions run in their own process: uvicorn app.agent.worker:app.
+# and the Inngest endpoint /api/inngest. By default the Inngest functions run in
+# their own process (app.agent.worker, started next to the API by start.sh) and
+# the API forwards /api/inngest to it; TALENT_SERVE_IN_API serves them in-process.
 app.include_router(talent_admin.router, prefix="/talent", tags=["Talent Agent"])
 app.include_router(talent_jobs.router, prefix="/talent", tags=["Talent Agent"])
 app.include_router(talent_pipeline.router, prefix="/talent", tags=["Talent Agent"])
@@ -555,6 +556,10 @@ if _talent_config.TALENT_SERVE_IN_API:
             "Talent Agent functions NOT served (%s). Set INNGEST_SIGNING_KEY, or INNGEST_DEV=1 locally.",
             type(_exc).__name__,
         )
+elif _talent_config.TALENT_EMBEDDED_WORKER:
+    from app.agent import proxy as _agent_proxy  # noqa: E402
+
+    app.include_router(_agent_proxy.router)
 
 
 @app.on_event("startup")

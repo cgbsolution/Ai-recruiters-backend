@@ -29,6 +29,13 @@ class TalentConfig(BaseSettings):
     # `uvicorn app.agent.worker:app` as its own process so agent work never
     # competes with live interviews for the API's event loop.
     TALENT_SERVE_IN_API: bool = False
+    # The container's start.sh runs the worker as a second process next to the
+    # API (127.0.0.1:8001), and the API forwards /api/inngest to it — so one
+    # deployment, one URL to sync in Inngest, and agent work still off the API's
+    # event loop. Set false when the worker is deployed as its own service
+    # (then sync that service's /api/inngest instead).
+    TALENT_EMBEDDED_WORKER: bool = True
+    TALENT_WORKER_URL: str = "http://127.0.0.1:8001"
 
     # ── Claude ───────────────────────────────────────────────────────────────
     # Model per task. Change these, not code. Effort applies to models that
