@@ -71,6 +71,7 @@ Event payloads carry **ids only** (`app.agent.client.emit` refuses anything else
 | `TALENT_SERVE_IN_API` | `false` | Serve the functions inside the API process itself (not recommended: agent work then shares the API's event loop with live interviews) |
 | `TALENT_EMBEDDED_WORKER` | `true` | `start.sh` runs the worker as a second process in the API container and the API forwards `/api/inngest` to it. `false` when the worker is deployed as its own service |
 | `TALENT_WORKER_URL` | `http://127.0.0.1:8001` | Where the API forwards `/api/inngest` |
+| `INNGEST_MAX_CONCURRENCY` | `5` | Your Inngest plan's per-function concurrency limit (Hobby: 5). Cloud refuses to sync functions that ask for more; raise it on a paid plan (refresh sends want 25, invite sends 20) |
 | `TALENT_PARSE_MODEL` / `TALENT_RERANK_MODEL` / `TALENT_SCORER_MODEL` / `TALENT_INTERVIEW_MODEL` | `claude-opus-5-5` | Model per task |
 | `TALENT_PARSE_EFFORT` / `_RERANK_` / `_SCORER_` / `_INTERVIEW_EFFORT` | `low` / `medium` / `high` / `low` | `output_config.effort` (sent only to models that accept it) |
 | `TALENT_LLM_TIMEOUT_SECONDS` | `180` | |

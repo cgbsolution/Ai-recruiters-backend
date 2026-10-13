@@ -35,6 +35,9 @@ class TalentConfig(BaseSettings):
     # event loop. Set false when the worker is deployed as its own service
     # (then sync that service's /api/inngest instead).
     TALENT_EMBEDDED_WORKER: bool = True
+    # The Inngest plan's per-function concurrency limit (Hobby: 5). Inngest Cloud
+    # refuses to sync a function that asks for more; raise this on a paid plan.
+    INNGEST_MAX_CONCURRENCY: int = 5
     TALENT_WORKER_URL: str = "http://127.0.0.1:8001"
 
     # ── Claude ───────────────────────────────────────────────────────────────

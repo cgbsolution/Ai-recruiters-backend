@@ -8,7 +8,7 @@ from datetime import timedelta
 import inngest
 
 from app.agent.client import inngest_client
-from app.agent.common import run_db, step_until_settled
+from app.agent.common import concurrency, run_db, step_until_settled
 from app.talent import invites
 from app.talent.config import talent_config
 
@@ -24,7 +24,7 @@ def _answered(match_id: str) -> str:
     name="Loop C · invite a candidate",
     trigger=inngest.TriggerEvent(event="talent/invite.send"),
     idempotency="event.data.match_id",
-    concurrency=[inngest.Concurrency(limit=20)],
+    concurrency=[concurrency(20)],
     retries=4,
 )
 async def invite_send(ctx: inngest.Context) -> dict:

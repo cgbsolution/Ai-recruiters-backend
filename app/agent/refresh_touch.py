@@ -9,7 +9,7 @@ from datetime import timedelta
 import inngest
 
 from app.agent.client import inngest_client
-from app.agent.common import run_db, step_until_settled, stop_filter
+from app.agent.common import concurrency, run_db, step_until_settled, stop_filter
 from app.talent import refresh
 from app.talent.config import talent_config
 
@@ -22,7 +22,7 @@ FINAL_WAIT = timedelta(days=4)
     name="Loop A · refresh touch sequence",
     trigger=inngest.TriggerEvent(event="talent/refresh.member.dispatched"),
     idempotency="event.data.key",
-    concurrency=[inngest.Concurrency(limit=25)],
+    concurrency=[concurrency(25)],
     retries=4,
 )
 async def refresh_touch(ctx: inngest.Context) -> dict:

@@ -29,6 +29,12 @@ def _with_session(fn: Callable, *args, **kwargs):
         db.close()
 
 
+def concurrency(limit: int) -> inngest.Concurrency:
+    """A function-wide concurrency limit, capped at what the Inngest plan allows
+    (INNGEST_MAX_CONCURRENCY) — Cloud refuses to sync a function that asks for more."""
+    return inngest.Concurrency(limit=max(1, min(limit, talent_config.INNGEST_MAX_CONCURRENCY)))
+
+
 async def run_db(fn: Callable, *args, **kwargs) -> Any:
     """Run `fn(db, *args)` on a thread with a fresh session."""
     return await asyncio.to_thread(_with_session, fn, *args, **kwargs)
