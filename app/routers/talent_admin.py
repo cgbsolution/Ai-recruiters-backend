@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
+import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user
@@ -116,6 +117,8 @@ def _settings_out(db: Session, org_id: int, request: Optional[Request] = None) -
                         "virus-scanned.")
     if not claude.available():
         warnings.append("ANTHROPIC_API_KEY is not set: no AI parsing, ranking or interview scoring.")
+    elif talent_config.TALENT_AGENT_ENABLED and (ai_problem := claude.account_problem()):
+        warnings.append(ai_problem)  # e.g. out of credit: checked with the free token-count call
     if talent_config.TALENT_EMAIL_TRANSPORT == "smtp" and not _smtp_ok():
         warnings.append("SMTP is not configured: email sends will wait.")
     return {
@@ -581,12 +584,13 @@ def retention_report(org_id: int = Depends(talent_org), db: Session = Depends(ge
 
 # ── Audit view ──────────────────────────────────────────────────────────────
 
-@router.get("/audit", summary="Audit log, filterable by candidate, action and actor")
+@router.get("/audit", summary="Audit log, filterable by candidate, action, actor, text and time")
 def get_audit(
     profile_id: Optional[int] = None,
-    action: Optional[str] = None,
-    actor: Optional[str] = None,
+    action: Optional[List[str]] = Query(None, description="Repeat for several; each matches as a prefix"),
+    actor: Optional[List[str]] = Query(None, description="Repeat for several"),
     subject_type: Optional[str] = None,
+    q: Optional[str] = Query(None, max_length=80, description="Text in the action, subject or subject id"),
     since: Optional[datetime] = None,
     until: Optional[datetime] = None,
     page: int = Query(1, ge=1),
@@ -594,25 +598,47 @@ def get_audit(
     org_id: int = Depends(talent_org),
     db: Session = Depends(get_db),
 ):
-    q = db.query(AuditLog).filter(AuditLog.organization_id == org_id)
+    base = db.query(AuditLog).filter(AuditLog.organization_id == org_id)
     if profile_id is not None:
-        q = q.filter(AuditLog.profile_id == profile_id)
-    if action:
-        q = q.filter(AuditLog.action.startswith(action, autoescape=True))
-    if actor:
-        q = q.filter(AuditLog.actor == actor)
+        base = base.filter(AuditLog.profile_id == profile_id)
     if subject_type:
-        q = q.filter(AuditLog.subject_type == subject_type)
+        base = base.filter(AuditLog.subject_type == subject_type)
     if since:
-        q = q.filter(AuditLog.at >= since)
+        base = base.filter(AuditLog.at >= since)
     if until:
-        q = q.filter(AuditLog.at < until)
-    total = q.count()
-    rows = q.order_by(AuditLog.at.desc(), AuditLog.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
-    actions = [a for (a,) in db.query(AuditLog.action).filter(AuditLog.organization_id == org_id).distinct().limit(300)]
-    actors = [a for (a,) in db.query(AuditLog.actor).filter(AuditLog.organization_id == org_id).distinct().limit(300)]
+        base = base.filter(AuditLog.at < until)
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        base = base.filter(sa.or_(AuditLog.action.ilike(like), AuditLog.subject_type.ilike(like),
+                                  AuditLog.subject_id.ilike(like)))
+    actions = [a for a in (action or []) if a]
+    actors = [a for a in (actor or []) if a]
+    by_action = sa.or_(*[AuditLog.action.startswith(a, autoescape=True) for a in actions]) if actions else None
+    by_actor = AuditLog.actor.in_(actors) if actors else None
+
+    query = base
+    if by_action is not None:
+        query = query.filter(by_action)
+    if by_actor is not None:
+        query = query.filter(by_actor)
+    total = query.count()
+    rows = query.order_by(AuditLog.at.desc(), AuditLog.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
+
+    # Facet counts: each filter's options counted under every *other* filter.
+    action_q = base.filter(by_actor) if by_actor is not None else base
+    actor_q = base.filter(by_action) if by_action is not None else base
+    action_counts = dict(action_q.with_entities(AuditLog.action, sa.func.count()).group_by(AuditLog.action)
+                         .order_by(sa.func.count().desc()).limit(300).all())
+    actor_counts = dict(actor_q.with_entities(AuditLog.actor, sa.func.count()).group_by(AuditLog.actor)
+                        .order_by(sa.func.count().desc()).limit(300).all())
+    for a in actions:  # a picked option stays listed even when its count drops to 0
+        action_counts.setdefault(a, 0)
+    for a in actors:
+        actor_counts.setdefault(a, 0)
     return {
-        "total": total, "page": page, "page_size": page_size, "actions": sorted(actions), "actors": sorted(actors),
+        "total": total, "page": page, "page_size": page_size,
+        "actions": sorted(action_counts), "actors": sorted(actor_counts),
+        "action_counts": action_counts, "actor_counts": actor_counts,
         "items": [{"id": r.id, "at": r.at, "actor": r.actor, "action": r.action, "subject_type": r.subject_type,
                    "subject_id": r.subject_id, "profile_id": r.profile_id, "detail": r.detail} for r in rows],
     }

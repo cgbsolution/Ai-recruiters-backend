@@ -195,7 +195,9 @@ async def score_chunk(job_id: int, items: List[dict]) -> dict:
 
     prepared = await run_db(prepare, job_id, items)
     todo = [i for i in prepared["items"] if not i["skip"]]
-    if not claude.available():
+    # No key, or an earlier chunk of this run found the account can't be used
+    # (no credit, bad key): don't make calls that can only fail.
+    if not claude.available() or await run_db(match_loop.current_ai_problem, job_id):
         for item in todo:
             await run_db(store, job_id, prepared["organization_id"], item, None, prepared["must_haves"])
         await run_db(match_loop.chunk_scored, job_id, len(items))
@@ -203,9 +205,13 @@ async def score_chunk(job_id: int, items: List[dict]) -> dict:
 
     sem = asyncio.Semaphore(max(1, int(talent_config.TALENT_RERANK_CONCURRENCY)))
     transient: List[Exception] = []
+    blocked: List[str] = []  # an account-level problem: the rest of the chunk skips Claude
 
     async def one(item: dict) -> None:
         async with sem:
+            if blocked:
+                await run_db(store, job_id, prepared["organization_id"], item, None, prepared["must_haves"])
+                return
             try:
                 result = await claude.structured(
                     feature="talent_rerank", system=RERANK_SYSTEM,
@@ -218,6 +224,9 @@ async def score_chunk(job_id: int, items: List[dict]) -> dict:
                 if _retryable(exc):
                     transient.append(exc)
                     return
+                problem = claude.account_problem_from(exc)
+                if problem and not blocked:
+                    blocked.append(problem)
                 logger.warning("Rerank failed for a profile (%s)", type(exc).__name__)
                 await run_db(store, job_id, prepared["organization_id"], item, None, prepared["must_haves"],
                              f"ai_error:{type(exc).__name__}")
@@ -225,6 +234,8 @@ async def score_chunk(job_id: int, items: List[dict]) -> dict:
         await run_db(store, job_id, prepared["organization_id"], item, result, prepared["must_haves"])
 
     await asyncio.gather(*(one(i) for i in todo))
+    if blocked:
+        await run_db(match_loop.ai_problem, job_id, blocked[0])
     if transient:
         raise transient[0]
     await run_db(match_loop.chunk_scored, job_id, len(items))  # only once the chunk succeeded

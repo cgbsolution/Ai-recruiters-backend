@@ -83,6 +83,7 @@ def list_jobs(org_id: int = Depends(talent_org), db: Session = Depends(get_db)):
         s = settings.get(j.id)
         out.append({
             "id": j.id, "ref": encode_ref("job", j.id), "title": j.title, "location": j.location,
+            "department": j.department,
             "status": j.status.value if hasattr(j.status, "value") else str(j.status),
             "autonomy_mode": s.autonomy_mode if s else None, "match_status": s.match_status if s else None,
             "last_matched_at": s.last_matched_at if s else None, "matches": counts.get(j.id, {}),

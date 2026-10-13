@@ -92,6 +92,52 @@ def client():
     return _client
 
 
+BILLING_URL = "console.anthropic.com → Settings → Billing"
+
+
+def account_problem_from(exc: BaseException) -> Optional[str]:
+    """When an error means *no* Claude call can succeed (no credit, bad key,
+    model not allowed), say so in words a recruiter can pass on; else None."""
+    import anthropic
+
+    if isinstance(exc, anthropic.AuthenticationError):
+        return "ANTHROPIC_API_KEY is invalid or revoked, so Claude can't score, interview or parse CVs."
+    if isinstance(exc, anthropic.PermissionDeniedError):
+        return "The Anthropic key isn't allowed to use this model, so Claude can't score, interview or parse CVs."
+    if isinstance(exc, anthropic.BadRequestError) and "credit balance" in str(exc).lower():
+        return ("The Anthropic account is out of credit, so Claude can't score matches, run interviews or parse "
+                f"CVs. Add credit at {BILLING_URL}.")
+    return None
+
+
+_account_checked: dict = {}  # model -> (monotonic time, problem)
+
+
+def account_problem(max_age: float = 600) -> Optional[str]:
+    """For the settings page: can this key call Claude right now? Uses the free
+    token-count endpoint (no tokens billed), reused for `max_age` seconds."""
+    import time
+
+    import anthropic
+
+    if not available():
+        return None  # the settings page reports the missing key separately
+    model = talent_config.TALENT_RERANK_MODEL
+    seen = _account_checked.get(model)
+    if seen and time.monotonic() - seen[0] < max_age:
+        return seen[1]
+    try:
+        anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, max_retries=1, timeout=10).messages.count_tokens(
+            model=model, messages=[{"role": "user", "content": "ok"}])
+        problem = None
+    except anthropic.APIStatusError as exc:
+        problem = account_problem_from(exc)
+    except Exception:  # noqa: BLE001 — network trouble isn't an account problem; check again next time
+        return None
+    _account_checked[model] = (time.monotonic(), problem)
+    return problem
+
+
 def request_params(*, system: str, user: Any, schema: dict, model: str, effort: str, max_tokens: int,
                    for_batch: bool = False) -> dict:
     """Messages API parameters for one structured call (shared with the Batch API path)."""

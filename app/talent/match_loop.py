@@ -67,6 +67,12 @@ def request(db: Session, job_id: int, now: Optional[datetime] = None) -> Optiona
     if reason:
         return reason
     js = get_job_settings(db, job.id, job.organization_id)
+    if js.match_status == "running":
+        # A run is under way: it keeps its live progress on screen, and the
+        # new run (queued behind it, one per job) takes over when it starts.
+        js.match_progress = {**(js.match_progress or {}), "rerun_requested": True}
+        db.commit()
+        return None
     js.match_status, js.match_error = "queued", None
     js.match_progress = {"stage": "queued", "requested_at": (now or datetime.utcnow()).isoformat()}
     db.commit()
@@ -88,7 +94,8 @@ def start(db: Session, job_id: int) -> dict:
         return {"skip": reason}
     js = get_job_settings(db, job.id, job.organization_id)
     js.match_status, js.match_error = "running", None
-    _progress(js, stage="filtering", started_at=datetime.utcnow().isoformat(), pool=None, total=None, scored=0)
+    _progress(js, stage="filtering", started_at=datetime.utcnow().isoformat(), pool=None, total=None, scored=0,
+              ai_error=None, rerun_requested=None)
     db.commit()
     req = matching.requirements(db, job, js)
     pool = matching.stage1(db, job, req)
@@ -99,6 +106,24 @@ def start(db: Session, job_id: int) -> dict:
     db.commit()
     return {"pool": len(pool), "items": [{"profile_id": r["profile_id"], "stage1_score": r["stage1_score"],
                                           "vector_score": r["vector_score"]} for r in ranked]}
+
+
+def ai_problem(db: Session, job_id: int, message: str) -> None:
+    """Claude can't be called at all (no credit, bad key): the run goes on
+    without AI scores, and the job page says why."""
+    job = db.get(Job, job_id)
+    if job is None:
+        return
+    js = get_job_settings(db, job.id, job.organization_id)
+    _progress(js, ai_error=message)
+    db.commit()
+
+
+def current_ai_problem(db: Session, job_id: int) -> Optional[str]:
+    job = db.get(Job, job_id)
+    if job is None:
+        return None
+    return (get_job_settings(db, job.id, job.organization_id).match_progress or {}).get("ai_error")
 
 
 def chunk_scored(db: Session, job_id: int, count: int) -> None:

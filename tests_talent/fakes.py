@@ -36,6 +36,7 @@ def install(monkeypatch, responder) -> FakeClaude:
     fake = FakeClaude(responder)
     monkeypatch.setattr(claude.settings, "ANTHROPIC_API_KEY", "sk-test")
     monkeypatch.setattr(claude, "_client", fake)
+    monkeypatch.setattr(claude, "account_problem", lambda max_age=600: None)  # never call Anthropic from tests
     return fake
 
 
