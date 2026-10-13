@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -86,7 +86,7 @@ def _smtp_ok() -> bool:
     return bool(app_settings.SMTP_HOST and app_settings.SMTP_USER and app_settings.SMTP_PASS)
 
 
-def _settings_out(db: Session, org_id: int) -> dict:
+def _settings_out(db: Session, org_id: int, request: Optional[Request] = None) -> dict:
     from app.services import file_safety
     from app.talent import claude, embeddings
 
@@ -95,7 +95,9 @@ def _settings_out(db: Session, org_id: int) -> dict:
     warnings = []
     if not talent_config.TALENT_AGENT_ENABLED:
         warnings.append("TALENT_AGENT_ENABLED is off: no loop runs, whatever the switches below say.")
-    if not talent_config.INNGEST_EVENT_KEY and not talent_config.inngest_is_dev:
+    if dev_problem := heartbeat.dev_mode_problem(request.url.hostname if request is not None else None):
+        warnings.append(dev_problem)  # the real cause behind "never checked in"
+    elif not talent_config.INNGEST_EVENT_KEY and not talent_config.inngest_is_dev:
         warnings.append("INNGEST_EVENT_KEY is not set: the loops cannot be scheduled.")
     elif not talent_config.INNGEST_SIGNING_KEY and not talent_config.inngest_is_dev:
         warnings.append("INNGEST_SIGNING_KEY is not set: the worker can't start in production, so nothing runs. "
@@ -184,8 +186,8 @@ def _apply_branding(row, changes: dict) -> None:
 
 
 @router.get("/settings", summary="Talent Agent settings, loop switches and configuration warnings")
-def get_talent_settings(org_id: int = Depends(talent_org), db: Session = Depends(get_db)):
-    out = _settings_out(db, org_id)
+def get_talent_settings(request: Request, org_id: int = Depends(talent_org), db: Session = Depends(get_db)):
+    out = _settings_out(db, org_id, request)
     db.commit()
     return out
 
@@ -193,6 +195,7 @@ def get_talent_settings(org_id: int = Depends(talent_org), db: Session = Depends
 @router.put("/settings", summary="Change Talent Agent settings and loop switches")
 def update_talent_settings(
     body: SettingsUpdate,
+    request: Request,
     org_id: int = Depends(talent_org),
     user: User = Depends(require_talent_admin),
     db: Session = Depends(get_db),
@@ -244,7 +247,7 @@ def update_talent_settings(
     audit(db, actor=user_actor(user), action="settings.updated", subject_type="organization", subject_id=org_id,
           organization_id=org_id, detail={"changed": sorted(changes), "flags": changes.get("flags")})
     db.commit()
-    return _settings_out(db, org_id)
+    return _settings_out(db, org_id, request)
 
 
 @router.get("/settings/email-preview", summary="Preview the profile-update email with this organization's branding")

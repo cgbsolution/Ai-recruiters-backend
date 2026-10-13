@@ -11,6 +11,7 @@ missing or stale, naming the URL to sync.
 
 from __future__ import annotations
 
+import ipaddress
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -49,6 +50,30 @@ def sync_url() -> str:
         base = talent_config.TALENT_PUBLIC_API_URL.rstrip("/") or "https://<your API address>"
         return f"{base}/api/inngest"
     return "https://<your worker address>/api/inngest"
+
+
+def on_a_server(hostname: Optional[str]) -> bool:
+    """Reached on a real domain — not localhost, a private address or the test client.
+    `hostname` without the port (request.url.hostname)."""
+    host = (hostname or "").strip("[]").lower()
+    if host in ("", "localhost", "testserver") or host.endswith(".local"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return not (ip.is_loopback or ip.is_private)
+
+
+def dev_mode_problem(host: Optional[str]) -> Optional[str]:
+    """INNGEST_DEV left on a deployed server (a copied local .env): the worker
+    then waits for a local dev server, Inngest Cloud can't sync it, and every
+    event the API sends goes nowhere."""
+    if not (talent_config.inngest_is_dev and on_a_server(host)):
+        return None
+    return ("INNGEST_DEV is set on this server, so the Talent Agent runs in local-development mode: Inngest Cloud "
+            "can't sync it and nothing runs. Remove INNGEST_DEV from the server's environment (keep "
+            f"INNGEST_EVENT_KEY and INNGEST_SIGNING_KEY), redeploy, then sync {sync_url()} in Inngest Cloud.")
 
 
 def worker_problem(db: Session, now: Optional[datetime] = None) -> Optional[str]:

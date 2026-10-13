@@ -104,3 +104,33 @@ def test_settings_warns_when_the_signing_key_is_missing(client, world, db, monke
     warnings = client.get("/talent/settings", headers=h).json()["warnings"]
     assert not any("INNGEST_SIGNING_KEY" in w for w in warnings)
     assert any("never checked in" in w for w in warnings)
+
+
+def test_settings_names_inngest_dev_left_on_a_server(client, world, db):
+    """A local .env copied to production (INNGEST_DEV=1) shows as the real cause,
+    not only as "the worker never checked in"."""
+    db.query(AgentHeartbeat).delete()
+    db.commit()
+    h = world.headers(world.user(world.org()))
+    on_server = client.get("/talent/settings", headers={**h, "host": "api.example.com"}).json()["warnings"]
+    assert any(w.startswith("INNGEST_DEV is set on this server") for w in on_server)
+    assert not any("never checked in" in w for w in on_server)
+    for local in ("testserver", "localhost:8000", "127.0.0.1:8000", "192.168.1.45:8000"):
+        warnings = client.get("/talent/settings", headers={**h, "host": local}).json()["warnings"]
+        assert not any("INNGEST_DEV" in w for w in warnings), local
+
+
+def test_run_matching_names_inngest_dev_left_on_a_server(client, world, db, monkeypatch):
+    from app.agent import client as agent_client
+    from tests_talent.test_match_progress import _job
+
+    org = world.org()
+    world.enable(org, "match")
+    job = _job(world, org)
+    h = world.headers(world.user(org))
+    monkeypatch.setattr(agent_client, "_sink", None)  # really try to send: dev mode, no dev server
+    monkeypatch.setattr(agent_client.inngest_client, "send_sync", lambda *a, **k: (_ for _ in ()).throw(OSError("refused")))
+    r = client.post(f"/talent/jobs/{job.id}/match", headers={**h, "host": "api.example.com"})
+    assert r.status_code == 503 and r.json()["detail"].startswith("INNGEST_DEV is set on this server")
+    r = client.post(f"/talent/jobs/{job.id}/match", headers=h)  # locally: the general message
+    assert r.status_code == 503 and "Inngest is unreachable" in r.json()["detail"]

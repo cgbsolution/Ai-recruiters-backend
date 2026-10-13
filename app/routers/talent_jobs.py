@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -185,8 +185,8 @@ def update_job_settings(
 
 
 @router.post("/jobs/{job_id}/match", summary="Run matching (Loop B) for this job now")
-def run_matching(job_id: JobId, org_id: int = Depends(talent_org), user: User = Depends(get_current_user),
-                 db: Session = Depends(get_db)):
+def run_matching(job_id: JobId, request: Request, org_id: int = Depends(talent_org),
+                 user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     job = _job(db, job_id, user, org_id)
     reason = match_loop.request(db, job.id)
     if reason:  # say why now, instead of a run that never starts
@@ -196,7 +196,8 @@ def run_matching(job_id: JobId, org_id: int = Depends(talent_org), user: User = 
     if not _emit("talent/match.requested", {"job_id": job.id}):
         js = get_job_settings(db, job.id, job.organization_id)
         js.match_status = "failed"
-        js.match_error = "The request couldn't be handed to the background worker (Inngest is unreachable or not configured)."
+        js.match_error = heartbeat.dev_mode_problem(request.url.hostname) or (
+            "The request couldn't be handed to the background worker (Inngest is unreachable or not configured).")
         js.match_progress = {**(js.match_progress or {}), "stage": "failed"}
         db.commit()
         raise HTTPException(status_code=503, detail=js.match_error)
