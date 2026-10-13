@@ -295,26 +295,22 @@ def precision_report(org_id: int = Depends(talent_org), db: Session = Depends(ge
 # ── Backfill ────────────────────────────────────────────────────────────────
 
 class BackfillRun(BaseModel):
-    kind: str = "embed"  # embed | parse
+    kind: str = "embed"  # embed only: there is no bulk Claude re-parse
     limit: int = 50_000
 
 
-@router.get("/backfill/estimate", summary="What a Claude re-parse of the pool would cost (Batch API)")
+@router.get("/backfill/estimate", summary="How many current CV versions still need an embedding")
 def backfill_estimate(org_id: int = Depends(talent_org), db: Session = Depends(get_db)):
-    return backfill.estimate(db, org_id)
+    return backfill.status(db, org_id)
 
 
-@router.post("/backfill", summary="Start the pool backfill: embeddings, or a Claude re-parse then embeddings")
+@router.post("/backfill", summary="Embed every profile that has no vector yet")
 def start_backfill(body: BackfillRun, org_id: int = Depends(talent_org), user: User = Depends(require_talent_admin),
                    db: Session = Depends(get_db)):
-    if body.kind not in ("embed", "parse"):
-        raise HTTPException(status_code=400, detail="kind must be embed or parse")
-    audit(db, actor=user_actor(user), action=f"backfill.{body.kind}_requested", subject_type="organization",
+    if body.kind != "embed":
+        raise HTTPException(status_code=400, detail="Only embeddings can be backfilled. Profiles keep their "
+                                                    "fast-parse metadata; there is no Claude re-parse.")
+    audit(db, actor=user_actor(user), action="backfill.embed_requested", subject_type="organization",
           subject_id=org_id, organization_id=org_id, detail={"limit": body.limit}, commit=True)
-    return {"queued": _emit("talent/backfill.requested", {"organization_id": org_id, "kind": body.kind,
+    return {"queued": _emit("talent/backfill.requested", {"organization_id": org_id, "kind": "embed",
                                                           "limit": int(body.limit), "actor": user_actor(user)})}
-
-
-@router.get("/backfill/runs", summary="Message Batches the agent submitted")
-def backfill_runs(org_id: int = Depends(talent_org), db: Session = Depends(get_db)):
-    return backfill.runs(db, org_id)

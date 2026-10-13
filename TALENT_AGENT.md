@@ -36,7 +36,7 @@ app/routers/talent_public.py    candidate pages (magic links): refresh, invite, 
 | `refresh-reengage` | cron daily | fresh profiles past the refresh window become stale again |
 | `refresh-dead-letter` | cron daily | catch-up: repeatedly bounced profiles → unreachable |
 | `match-job` | `talent/job.updated` (debounced 2 min/job), `talent/match.requested` | Stage 1-2, rerank in chunks of 10, top K, stale strong matches → refresh first |
-| `cv-backfill` | `talent/backfill.requested` | v1 baselines, embeddings, optional Claude re-parse via the Batch API |
+| `cv-backfill` | `talent/backfill.requested`, every 15 min | v1 baselines and embeddings (scheduled: every organization with Match on, so new uploads become matchable). No bulk Claude re-parse: profiles keep their fast-parse metadata |
 | `invite-plan` | `talent/match.completed`, `talent/invite.plan.requested` | autopilot: invite top K; copilot: approval requests |
 | `invite-send` | `talent/invite.send` | invite → 3 days → reminder → 3 days → close |
 | `interview-schedule` | `talent/interview.offered` | email the 3 slots, wait 4 days for a booking, then expire + flag |
@@ -145,7 +145,7 @@ UPDATE talent_settings SET flags = flags || '{"refresh": false}'::jsonb WHERE or
 1. Phase 0: Talent Agent → Campaigns → *Check all profiles*. Review duplicates and *Review duplicate merge* (every deleted row is in the audit log).
 2. Record consent. The existing CVs have **no recorded contact consent**, so nothing will be sent until you decide on the lawful basis and record it: `POST /talent/consent/import` (matched by email, with the evidence `source` and `basis`), or `POST /talent/consent/bulk` for a set of profiles on a stated basis. Bulk recording never overrides a candidate's own withdrawal or a suppression.
 3. Switch on `refresh` only, create a 2,000-person pilot (stratified by CV age: under 12, 12-24, over 24 months), and watch the funnel and bounce/complaint health for a week or two of the ramp.
-4. Backfill embeddings (*Matching readiness → Embed profiles*), optionally the Claude re-parse (priced first), then switch on `match` and rate the top 10 for about 10 jobs to get a precision@10 baseline.
+4. Backfill embeddings (*Matching readiness → Embed profiles*; afterwards new uploads are embedded every 15 minutes), then switch on `match` and rate the top 10 for about 10 jobs to get a precision@10 baseline.
 5. Then `invite` with jobs on copilot, then `interview`.
 
 **Bounce or complaint spike.** The campaign (and possibly the domain) auto-pauses; the console shows why. Look at the bounced addresses' source (old CVs bounce most), fix the list (Phase 0 email check with MX lookup: `{"check_mx": true}`), then *Resume* the campaign and, if paused, *Resume sending* for the domain.

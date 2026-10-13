@@ -322,63 +322,44 @@ def test_job_api_settings_matches_and_precision(client, world, db, monkeypatch, 
 
 # ── Backfill ────────────────────────────────────────────────────────────────
 
-def test_parse_backfill_via_message_batches(world, db, monkeypatch):
-    from types import SimpleNamespace
-
-    import anthropic
-
+def test_backfill_embeds_only_and_never_reparses_with_claude(client, world, db, events):
     org = world.org()
-    p = world.profile(org, email="bf@x.com", raw_text="Data Engineer at Northwind since 2019-04. Kafka, Python. " * 10)
+    admin = world.user(org)
+    world.profile(org, email="bf@x.com", raw_text="Data Engineer at Northwind since 2019-04. Kafka, Python. " * 10)
     assert backfill.ensure_baselines(db, org.id) == 1
-    est = backfill.estimate(db, org.id)
-    assert est["profiles"] == 1 and est["estimated_cost_usd"] > 0 and est["batches"] == 1
+    h = world.headers(admin)
+    assert client.get("/talent/backfill/estimate", headers=h).json() == {"embeddings_missing": 1}
+    r = client.post("/talent/backfill", json={"kind": "parse"}, headers=h)
+    assert r.status_code == 400 and "no Claude re-parse" in r.json()["detail"]
+    assert not events
+    assert client.get("/talent/backfill/runs", headers=h).status_code == 404
+    assert client.post("/talent/backfill", json={}, headers=h).json() == {"queued": True}
+    assert events == [("talent/backfill.requested", {"organization_id": org.id, "kind": "embed", "limit": 50000,
+                                                     "actor": f"user:{admin.id}"})]
+    assert backfill.embed_chunk(db, org.id) == 1
+    assert backfill.status(db, org.id) == {"embeddings_missing": 0}
 
-    submitted = {}
-    parse_output = {
-        "identity": {"name": "X", "email": None, "phone": None, "location": "Pune"},
-        "current_role": "Data Engineer", "current_employer": "Northwind", "industry": "Analytics",
-        "work_history": [{"title": "Data Engineer", "company": "Northwind", "start": "2019-04", "end": None,
-                          "is_current": True, "summary": "Kafka"}],
-        "skills": [{"name": "Kafka", "years": 5, "last_used_year": 2026}], "education": [], "certifications": [],
-        "summary": None, "stated": {"current_ctc_lpa": None, "expected_ctc_lpa": None, "notice_period_days": None},
-        "field_confidence": {k: 0.9 for k in ("identity", "current_role", "work_history", "skills", "education",
-                                              "certifications", "industry")},
-        "changes_summary": [],
-    }
 
-    class FakeBatches:
-        def create(self, requests):
-            submitted["requests"] = requests
-            assert "fallbacks" not in requests[0]["params"]  # not allowed on the Batch API
-            return SimpleNamespace(id="msgbatch_1")
+def test_new_uploads_are_embedded_on_schedule_for_orgs_with_match_on(world, db):
+    from app.agent.cv_backfill import cv_backfill
 
-        def retrieve(self, batch_id):
-            return SimpleNamespace(processing_status="ended")
+    on, off = world.org("On"), world.org("Off")
+    world.enable(on, "match")
+    new = world.profile(on, email="new@x.com", raw_text="Data Engineer. Kafka, Python, Spark. " * 10)
+    other = world.profile(off, email="other@x.com", raw_text="Data Engineer. Kafka, Python, Spark. " * 10)
+    assert {type(t).__name__ for t in cv_backfill._triggers} == {"TriggerCron", "TriggerEvent"}
 
-        def results(self, batch_id):
-            msg = SimpleNamespace(content=[SimpleNamespace(type="text", text=json.dumps(parse_output))],
-                                  stop_reason="end_turn", usage=SimpleNamespace(input_tokens=1, output_tokens=1),
-                                  model="m")
-            for r in submitted["requests"]:
-                yield SimpleNamespace(custom_id=r["custom_id"], result=SimpleNamespace(type="succeeded", message=msg))
-
-    class FakeAnthropic:
-        def __init__(self, **kw):
-            self.messages = SimpleNamespace(batches=FakeBatches())
-
-    monkeypatch.setattr(anthropic, "Anthropic", FakeAnthropic)
-    monkeypatch.setattr(backfill.settings, "ANTHROPIC_API_KEY", "sk-test")
-    run_id = backfill.create_parse_batch(db, org.id, "user:1")
-    assert run_id and len(submitted["requests"]) == 1
-    assert backfill.batch_status(db, run_id) == "ended"
-    assert backfill.collect_parse_batch(db, run_id) == {"status": "collected", "succeeded": 1, "failed": 0}
-    current = cv.current_version(db, p.id)
-    assert current.source == "reparse" and current.prompt_version.startswith("cv-parse")
-    assert current.parsed["skills"][0] == {"name": "Kafka", "years": 5, "last_used_year": 2026}
-    assert current.parse_confidence == 0.9
-    assert backfill.estimate(db, org.id)["profiles"] == 0  # nothing left to re-parse
+    result = mocked.trigger(cv_backfill, inngest.Event(name="inngest/scheduled.timer", data={}), CapturingInngest())
+    assert result.output == {"baselines": 1, "embedded": 1}
     db.expire_all()
-    assert db.get(ResumeMetadata, p.id).current_designation == "Data Engineer"
+    assert cv.current_version(db, new.id).embedding_model == embeddings.model_name()
+    assert cv.current_version(db, other.id) is None  # Match is off there: left alone
+
+    # Embed profiles (one organization) still works whatever its switches.
+    result = mocked.trigger(cv_backfill, inngest.Event(name="talent/backfill.requested",
+                                                       data={"organization_id": off.id, "kind": "embed"}),
+                            CapturingInngest())
+    assert result.output == {"baselines": 1, "embedded": 1}
 
 
 def test_total_experience_counts_overlaps_once():
