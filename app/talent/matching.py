@@ -29,7 +29,7 @@ from app.models.job_metadata import JobMetadata
 from app.models.resume_metadata import ResumeMetadata as RM
 from app.models.talent import TalentJobSettings
 from app.services.resume_profile import normalize_city
-from app.talent import embeddings, vectors
+from app.talent import embeddings, llm, vectors
 from app.talent.config import talent_config
 from app.talent.settings import get_job_settings
 
@@ -166,7 +166,7 @@ def stage1(db: Session, job: Job, req: Requirements, limit: int = STAGE1_LIMIT) 
 
 def stage2(db: Session, job: Job, pool: List[dict], keep: Optional[int] = None) -> List[dict]:
     """Order the Stage 1 pool by semantic similarity; keep the top `keep`."""
-    keep = keep or int(talent_config.TALENT_RERANK_POOL)
+    keep = keep or llm.rerank_pool()
     by_id: Dict[int, dict] = {p["profile_id"]: p for p in pool}
     if not by_id:
         return []

@@ -35,7 +35,7 @@ from app.media import UPLOAD_ROOT
 from app.models.job import Job, JobQuestion
 from app.models.question import Question
 from app.models.talent import JobMatch, TalentInterview
-from app.talent import claude
+from app.talent import claude, llm
 from app.talent.audit import audit
 from app.talent.config import talent_config
 from app.talent.matching import requirements
@@ -113,14 +113,14 @@ async def prepare_questions(interview_id: str) -> dict:
     if ctx is None:
         return {"status": "ready"}
     questions, model, version = None, None, None
-    if claude.available():
+    if llm.available():
         user = claude.joined([
             claude.untrusted("untrusted_job", {"title": ctx["title"], "must_haves": ctx["must_haves"]}),
             claude.untrusted("untrusted_question_bank", ctx["bank"]),
             f"Write exactly {ctx['count']} questions.",
         ])
         try:
-            result = await claude.structured(
+            result = await llm.structured(
                 feature="talent_interview_questions", system=QUESTIONS_SYSTEM, user=user, schema=QUESTIONS_SCHEMA,
                 model=talent_config.TALENT_INTERVIEW_MODEL, effort=talent_config.TALENT_INTERVIEW_EFFORT,
                 prompt_version=QUESTIONS_VERSION, max_tokens=4000, organization_id=ctx["organization_id"],
@@ -299,10 +299,10 @@ def transcribe(path: str) -> Optional[str]:
 
 
 async def _follow_up(question: str, answer: str, organization_id: Optional[int]) -> Optional[str]:
-    if not claude.available() or len(answer) > 4000:
+    if not llm.followups_enabled() or len(answer) > 4000:
         return None
     try:
-        result = await asyncio.wait_for(claude.structured(
+        result = await asyncio.wait_for(llm.structured(
             feature="talent_interview_followup", system=FOLLOWUP_SYSTEM,
             user=claude.joined([claude.untrusted("untrusted_question", question),
                                 claude.untrusted("untrusted_answer", answer)]),

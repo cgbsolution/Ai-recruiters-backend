@@ -40,7 +40,28 @@ class TalentConfig(BaseSettings):
     INNGEST_MAX_CONCURRENCY: int = 5
     TALENT_WORKER_URL: str = "http://127.0.0.1:8001"
 
-    # ── Claude ───────────────────────────────────────────────────────────────
+    # ── AI provider for the Talent Agent ─────────────────────────────────────
+    # ollama (default): match scoring, CV parsing and the agent's interviews run
+    # on the self-hosted Ollama at OLLAMA_BASE_URL — no Anthropic credits used.
+    # anthropic: the same tasks on Claude (TALENT_*_MODEL below). The main
+    # product's live interviews don't use this setting.
+    TALENT_LLM_PROVIDER: str = "ollama"
+    # One local chat model for every Talent Agent task. qwen2.5:7b-instruct
+    # (~5 GB RAM) gives usable scores; qwen2.5:3b-instruct is ~2x faster but
+    # its scores are noticeably flatter. Pull it on the Ollama server first.
+    TALENT_OLLAMA_MODEL: str = "qwen2.5:7b-instruct"
+    TALENT_OLLAMA_NUM_CTX: int = 8192
+    # A CPU-only server writes ~3 tokens/s on a 7B model: one candidate's score
+    # takes 1-2 minutes, so allow long calls and keep each Inngest step small.
+    TALENT_OLLAMA_TIMEOUT_SECONDS: int = 900
+    TALENT_OLLAMA_RERANK_POOL: int = 20  # candidates AI-scored per job (Claude: TALENT_RERANK_POOL)
+    TALENT_OLLAMA_RERANK_CHUNK: int = 2  # candidates per durable step
+    TALENT_OLLAMA_PARALLEL: int = 1  # concurrent requests; more only helps with spare cores or a GPU
+    # Interview follow-up questions are generated while the candidate waits;
+    # on a CPU Ollama that wait is too long, so they're off unless you have a GPU.
+    TALENT_OLLAMA_FOLLOWUPS: bool = False
+
+    # ── Claude (TALENT_LLM_PROVIDER=anthropic) ───────────────────────────────
     # Model per task. Change these, not code. Effort applies to models that
     # accept it (output_config.effort).
     TALENT_PARSE_MODEL: str = "claude-opus-5-5"
@@ -55,7 +76,7 @@ class TalentConfig(BaseSettings):
     # Server-side refusal fallback on realtime calls (not available on Batches).
     TALENT_LLM_REFUSAL_FALLBACK: bool = True
     TALENT_RERANK_CONCURRENCY: int = 4
-    TALENT_RERANK_POOL: int = 200  # Stage 2 keeps this many for the Claude rerank
+    TALENT_RERANK_POOL: int = 200  # Stage 2 keeps this many for the Claude rerank (Ollama: TALENT_OLLAMA_RERANK_POOL)
 
     # ── Embeddings (Anthropic has no embeddings endpoint) ────────────────────
     # "" = off (Stage 2 falls back to keyword similarity) | ollama | voyage | gemini

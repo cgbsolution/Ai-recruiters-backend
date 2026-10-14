@@ -32,6 +32,9 @@ for _name in (
 os.environ["EMAIL_FROM"] = "talent@agent.test"
 os.environ["SECRET_KEY"] = "talent-tests-" + secrets.token_hex(32)
 os.environ["TALENT_AGENT_ENABLED"] = "true"
+# The suite drives the shared AI logic through the Claude fakes (tests_talent/fakes.py);
+# the Ollama path has its own tests with a mocked Ollama server (test_ollama_llm.py).
+os.environ["TALENT_LLM_PROVIDER"] = "anthropic"
 os.environ["TALENT_EMAIL_TRANSPORT"] = "memory"
 os.environ["EMBEDDING_PROVIDER"] = "hash"
 os.environ["INNGEST_DEV"] = "1"

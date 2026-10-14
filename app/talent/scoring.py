@@ -28,7 +28,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.models.job import Job
 from app.models.resume_metadata import ResumeMetadata
 from app.models.talent import JobMatch, TalentInterview, TalentJobSettings
-from app.talent import claude
+from app.talent import claude, llm
 from app.talent.audit import audit, user_actor
 from app.talent.config import talent_config
 from app.talent.matching import requirements
@@ -126,13 +126,13 @@ async def score_interview(interview_id: str) -> dict:
     if ctx is None or ctx.get("skip"):
         return {"status": "skipped"}
     result = None
-    if claude.available() and any(t["turn"] == "answer" and t["text"] for t in ctx["transcript"]):
+    if llm.available() and any(t["turn"] == "answer" and t["text"] for t in ctx["transcript"]):
         user = claude.joined([
             claude.untrusted("untrusted_rubric", {"job": ctx["title"], "criteria": ctx["rubric"]}),
             claude.untrusted("untrusted_transcript", ctx["transcript"]),
             "Score every rubric criterion, using the criterion names exactly as given.",
         ])
-        result = await claude.structured(
+        result = await llm.structured(
             feature="talent_interview_score", system=SCORER_SYSTEM, user=user, schema=SCORER_SCHEMA,
             model=talent_config.TALENT_SCORER_MODEL, effort=talent_config.TALENT_SCORER_EFFORT,
             prompt_version=SCORER_VERSION, max_tokens=12000, organization_id=ctx["organization_id"],

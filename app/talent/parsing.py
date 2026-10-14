@@ -14,7 +14,7 @@ from typing import List, Optional, Tuple
 
 import anthropic
 
-from app.talent import claude
+from app.talent import claude, llm
 from app.talent.config import talent_config
 from app.talent.prompts import CV_PARSE_SCHEMA, CV_PARSE_SYSTEM, CV_PARSE_VERSION
 
@@ -149,7 +149,7 @@ def _blank_to_none(value):
     return value
 
 
-def from_result(result: claude.ClaudeResult) -> Optional[ParseResult]:
+def from_result(result: llm.Result) -> Optional[ParseResult]:
     if result.refused or not result.data:
         return None
     data = _blank_to_none(result.data)
@@ -162,21 +162,27 @@ def from_result(result: claude.ClaudeResult) -> Optional[ParseResult]:
 
 async def parse_cv(text: str, previous: Optional[dict] = None, profile_id: Optional[int] = None,
                    organization_id: Optional[int] = None) -> Optional[ParseResult]:
-    """None when Claude isn't configured or declined — callers fall back to the regex parse."""
-    if not claude.available():
+    """None when the AI isn't configured, can't be used or declined — callers fall back to the regex parse."""
+    if not llm.available():
         return None
     try:
-        result = await claude.structured(
+        result = await llm.structured(
             feature="talent_cv_parse", system=CV_PARSE_SYSTEM, user=user_content(text, previous),
             schema=CV_PARSE_SCHEMA, model=talent_config.TALENT_PARSE_MODEL, effort=talent_config.TALENT_PARSE_EFFORT,
             prompt_version=CV_PARSE_VERSION, max_tokens=8000, organization_id=organization_id,
         )
-    except claude.ClaudeUnavailable:
+    except llm.Unavailable:
         return None
     except anthropic.BadRequestError as exc:
         # A request the API will never accept (e.g. a schema limit): retrying can't
         # help, so fall back to the regex parse instead of leaving the CV unread.
         logger.error("Claude CV parse refused the request (%s); using the regex parse", exc.request_id or "no id")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        problem = llm.account_problem_from(exc)
+        if problem is None:
+            raise  # transient: the step is retried
+        logger.error("CV parse can't use the AI (%s); using the regex parse", problem)
         return None
     parsed = from_result(result)
     if parsed is not None and parsed.changes_summary:

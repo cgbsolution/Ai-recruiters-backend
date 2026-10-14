@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session
 from app.models.job import Job
 from app.models.resume_metadata import ResumeMetadata
 from app.models.talent import JobMatch
-from app.talent import claude, cv
+from app.talent import claude, cv, llm
 from app.talent.audit import audit
 from app.talent.config import talent_config
 from app.talent.matching import requirements
@@ -111,7 +111,7 @@ def prepare(db: Session, job_id: int, items: List[dict]) -> dict:
     job = db.get(Job, job_id)
     req = requirements(db, job)
     job_payload = req.prompt_payload()
-    model = talent_config.TALENT_RERANK_MODEL
+    model = llm.model_for(talent_config.TALENT_RERANK_MODEL)  # a model change re-scores
     out = []
     for item in items:
         profile = db.get(ResumeMetadata, item["profile_id"])
@@ -145,7 +145,7 @@ def prepare(db: Session, job_id: int, items: List[dict]) -> dict:
             "items": out}
 
 
-def store(db: Session, job_id: int, organization_id: Optional[int], item: dict, result: Optional[claude.ClaudeResult],
+def store(db: Session, job_id: int, organization_id: Optional[int], item: dict, result: Optional[llm.Result],
           must_haves: List[str], error: Optional[str] = None) -> None:
     match = db.get(JobMatch, uuid.UUID(item["match_id"]))
     if match is None:
@@ -178,15 +178,11 @@ def store(db: Session, job_id: int, organization_id: Optional[int], item: dict, 
 # ── Scoring (model side) ───────────────────────────────────────────────────
 
 def _retryable(exc: Exception) -> bool:
-    import anthropic
-
-    if isinstance(exc, (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.APITimeoutError)):
-        return True
-    return isinstance(exc, anthropic.APIStatusError) and exc.status_code >= 500
+    return llm.is_transient(exc)
 
 
 async def score_chunk(job_id: int, items: List[dict]) -> dict:
-    """One durable step: score up to ~10 profiles, TALENT_RERANK_CONCURRENCY at
+    """One durable step: score a few profiles (llm.rerank_chunk()), llm.rerank_concurrency() at
     a time. Transient API errors fail the step (Inngest retries it; finished
     profiles are skipped on the retry by their input hash)."""
     from app.agent.common import run_db
@@ -197,13 +193,13 @@ async def score_chunk(job_id: int, items: List[dict]) -> dict:
     todo = [i for i in prepared["items"] if not i["skip"]]
     # No key, or an earlier chunk of this run found the account can't be used
     # (no credit, bad key): don't make calls that can only fail.
-    if not claude.available() or await run_db(match_loop.current_ai_problem, job_id):
+    if not llm.available() or await run_db(match_loop.current_ai_problem, job_id):
         for item in todo:
             await run_db(store, job_id, prepared["organization_id"], item, None, prepared["must_haves"])
         await run_db(match_loop.chunk_scored, job_id, len(items))
         return {"scored": 0, "skipped": len(prepared["items"]), "reason": "ai_unavailable"}
 
-    sem = asyncio.Semaphore(max(1, int(talent_config.TALENT_RERANK_CONCURRENCY)))
+    sem = asyncio.Semaphore(llm.rerank_concurrency())
     transient: List[Exception] = []
     blocked: List[str] = []  # an account-level problem: the rest of the chunk skips Claude
 
@@ -213,7 +209,7 @@ async def score_chunk(job_id: int, items: List[dict]) -> dict:
                 await run_db(store, job_id, prepared["organization_id"], item, None, prepared["must_haves"])
                 return
             try:
-                result = await claude.structured(
+                result = await llm.structured(
                     feature="talent_rerank", system=RERANK_SYSTEM,
                     user=user_content(prepared["job_payload"], item["payload"]), schema=RERANK_SCHEMA,
                     model=talent_config.TALENT_RERANK_MODEL, effort=talent_config.TALENT_RERANK_EFFORT,
@@ -224,7 +220,7 @@ async def score_chunk(job_id: int, items: List[dict]) -> dict:
                 if _retryable(exc):
                     transient.append(exc)
                     return
-                problem = claude.account_problem_from(exc)
+                problem = llm.account_problem_from(exc)
                 if problem and not blocked:
                     blocked.append(problem)
                 logger.warning("Rerank failed for a profile (%s)", type(exc).__name__)

@@ -89,7 +89,7 @@ def _smtp_ok() -> bool:
 
 def _settings_out(db: Session, org_id: int, request: Optional[Request] = None) -> dict:
     from app.services import file_safety
-    from app.talent import claude, embeddings
+    from app.talent import embeddings, llm
 
     row = talent_settings.get_settings(db, org_id)
     domain = _sender_domain(db, org_id)
@@ -115,10 +115,12 @@ def _settings_out(db: Session, org_id: int, request: Optional[Request] = None) -
     if not file_safety.antivirus_configured():
         warnings.append("CLAMAV_HOST is not set: uploaded resumes are checked for dangerous content but not "
                         "virus-scanned.")
-    if not claude.available():
+    if not llm.available():
         warnings.append("ANTHROPIC_API_KEY is not set: no AI parsing, ranking or interview scoring.")
-    elif talent_config.TALENT_AGENT_ENABLED and (ai_problem := claude.account_problem()):
-        warnings.append(ai_problem)  # e.g. out of credit: checked with the free token-count call
+    elif talent_config.TALENT_AGENT_ENABLED and (ai_problem := llm.account_problem()):
+        # Ollama: the chat model isn't pulled / the server is down. Claude: e.g. out of
+        # credit (checked with the free token-count call).
+        warnings.append(ai_problem)
     if talent_config.TALENT_EMAIL_TRANSPORT == "smtp" and not _smtp_ok():
         warnings.append("SMTP is not configured: email sends will wait.")
     return {
@@ -129,8 +131,11 @@ def _settings_out(db: Session, org_id: int, request: Optional[Request] = None) -
         "default_autonomy": row.default_autonomy, "sender_domain": domain,
         "consent_text": talent_settings.consent_text(row),
         "send_ramp": caps.get_domain(db, domain).ramp,
-        "models": {"parse": talent_config.TALENT_PARSE_MODEL, "rerank": talent_config.TALENT_RERANK_MODEL,
-                   "scorer": talent_config.TALENT_SCORER_MODEL, "interview": talent_config.TALENT_INTERVIEW_MODEL},
+        "ai_provider": llm.provider(),
+        "models": {"parse": llm.model_for(talent_config.TALENT_PARSE_MODEL),
+                   "rerank": llm.model_for(talent_config.TALENT_RERANK_MODEL),
+                   "scorer": llm.model_for(talent_config.TALENT_SCORER_MODEL),
+                   "interview": llm.model_for(talent_config.TALENT_INTERVIEW_MODEL)},
         "embedding_provider": talent_config.EMBEDDING_PROVIDER or None,
         "branding": {"brand_name": row.brand_name, "brand_logo_url": row.brand_logo_url,
                      "brand_color": row.brand_color, "email_signature": row.email_signature,

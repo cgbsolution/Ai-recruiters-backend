@@ -12,9 +12,7 @@ import inngest
 
 from app.agent.client import inngest_client
 from app.agent.common import run_db
-from app.talent import match_loop, rerank
-
-CHUNK = 10
+from app.talent import llm, match_loop, rerank
 
 
 async def _on_failure(ctx: inngest.Context) -> None:
@@ -38,8 +36,9 @@ async def match_job(ctx: inngest.Context) -> dict:
     if started.get("skip"):
         return started
     items = started["items"]
-    for i in range(0, len(items), CHUNK):
-        await ctx.step.run(f"rerank-{i}", rerank.score_chunk, job_id, items[i:i + CHUNK])
+    chunk = llm.rerank_chunk()  # small on a CPU Ollama, so each step stays short
+    for i in range(0, len(items), chunk):
+        await ctx.step.run(f"rerank-{i}", rerank.score_chunk, job_id, items[i:i + chunk])
     done = await ctx.step.run("finish", run_db, match_loop.finish, job_id)
     events = [inngest.Event(name="talent/match.completed", data={"job_id": job_id})]
     if done["needs_refresh"]:
