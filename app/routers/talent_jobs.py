@@ -245,7 +245,8 @@ def list_matches(
     for item in page:
         decision = consent.can_contact(db, item["profile_id"], "email", "jobs")
         item["contact"] = {"allowed": decision.allowed,
-                           "reason": None if decision.allowed else consent.describe(decision.reason)}
+                           "reason": None if decision.allowed else consent.describe(decision.reason),
+                           "code": None if decision.allowed else decision.reason}
     return {"total": len(out), "items": page}
 
 
