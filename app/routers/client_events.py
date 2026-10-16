@@ -44,6 +44,9 @@ _PROBLEM_EVENTS = {
     "recording_missing",
     "recording_upload_failed",
     "recording_upload_attempt_failed",
+    # The candidate's screen share is solid black (some Windows laptops) — the
+    # recording falls back to the camera, but the recruiter should know.
+    "screen_capture_black",
     # Device Test mic check: a candidate blocked at the gate, or our speech
     # service failing, both need to be visible without filtering INFO.
     "mic_check_failed",
