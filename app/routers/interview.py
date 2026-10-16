@@ -538,7 +538,9 @@ def get_interview_config(token: str, db: Session = Depends(get_db)):
         experience_level=job.experience_level,
         experience_min=job.experience_min,
         experience_max=job.experience_max,
-        max_questions=settings_obj.max_questions if settings_obj else 8,
+        # Plan count, not raw max_questions — "Only these questions" asks
+        # exactly the predefined list, so the progress counter must match it.
+        max_questions=svc._build_question_plan(job, settings_obj)[2],
         max_coding_questions=_coding_count,
         mode=settings_obj.mode.value if settings_obj else "TRADITIONAL",
         virtual_avatar=settings_obj.virtual_avatar if settings_obj else True,
@@ -779,7 +781,7 @@ def verify_access(
         candidate_id=candidate.id,
         job_id=tok.job_id,
         status=SessionStatus.pending,
-        total_questions=settings_obj.max_questions if settings_obj else 8,
+        total_questions=svc._build_question_plan(job, settings_obj)[2] if job else 8,
         session_metadata=metadata_json,
     )
     db.add(interview_session)

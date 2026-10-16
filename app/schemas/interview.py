@@ -144,6 +144,10 @@ class InterviewMessageResponse(BaseModel):
     # frontend's InterviewRoom reads `coding_question` and surfaces the
     # "Switch to Coding Test" button when it's present.
     coding_question: Optional[dict] = None
+    # True when `message` is Nira asking "do you want to end the interview?"
+    # after the candidate said an end command. The UI shows Yes/No buttons; a
+    # spoken/typed "yes" ends the interview, anything else re-asks the question.
+    awaiting_end_confirmation: bool = False
 
 
 # ── Violation ─────────────────────────────────────────────────────────────────

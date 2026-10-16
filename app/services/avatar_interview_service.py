@@ -65,6 +65,157 @@ def _clean_feedback(text) -> str:
     return re.sub(r"\s{2,}", " ", t).strip()
 
 
+# "End the interview" commands. A message counts only when it is NOTHING BUT
+# the command, give or take filler ("okay", "please", "now", "can you"). The
+# same words inside an answer are part of the answer: this used to be a
+# substring match with "end up" in the list, so "...we end up with an
+# EBITDA..." in a 300-word answer to Q1 ended the interview as "Ended by
+# Candidate" (session 52, 2026-10-16). Even a real command doesn't end the
+# interview outright — Nira asks the candidate to confirm first.
+# Keep in sync with isEndCommand() in the frontend's InterviewRoom.tsx.
+_END_ACTIONS = ("end", "end up", "close", "stop", "finish", "terminate", "cancel", "exit", "quit")
+_END_TARGETS = (
+    "interview", "the interview", "this interview", "my interview",
+    "call", "the call", "this call", "it", "this",
+)
+_END_INTENTS = ("", "i want to ", "i need to ", "i would like to ", "i'd like to ", "let's ", "lets ")
+END_INTERVIEW_COMMANDS = frozenset(
+    f"{intent}{action} {target}"
+    for intent in _END_INTENTS
+    for action in _END_ACTIONS
+    for target in _END_TARGETS
+) | frozenset({
+    "end", "stop", "close",  # "please end" etc. once the filler is stripped
+    "i want to end", "i want to stop", "i need to end",
+    "i want to leave", "i need to leave", "i have to leave", "i want to quit",
+})
+_COMMAND_FILLER_WORDS = frozenset({
+    "please", "kindly", "ok", "okay", "so", "sorry", "hi", "hello", "nira",
+    "now", "just", "actually", "can", "could", "you", "thanks", "thank",
+})
+
+# Nira's confirmation question. Also how a pending confirmation is recognised
+# on the next turn: the session's last message is one of these.
+END_CONFIRM_PROMPTS = {
+    "en": "Do you want to end the interview now? Say yes to end it, or no to continue.",
+    "hi": "क्या आप अभी इंटरव्यू समाप्त करना चाहते हैं? समाप्त करने के लिए हाँ कहें, या जारी रखने के लिए नहीं कहें।",
+    "ar": "هل تريد إنهاء المقابلة الآن؟ قل نعم للإنهاء، أو لا للمتابعة.",
+    "hinglish": "Kya aap abhi interview end karna chahte hain? End karne ke liye yes boliye, ya continue karne ke liye no boliye.",
+}
+END_DECLINED_FEEDBACK = {
+    "en": "No problem, let's continue.",
+    "hi": "कोई बात नहीं, चलिए जारी रखते हैं।",
+    "ar": "لا مشكلة، لنتابع.",
+    "hinglish": "Koi baat nahi, chaliye continue karte hain.",
+}
+_CONFIRM_YES_WORDS = frozenset({
+    "yes", "yeah", "yep", "yup", "ya", "yah", "sure", "confirm", "confirmed", "end",
+    "haan", "han", "haa", "haanji", "ji", "हाँ", "हां", "जी", "نعم",
+})
+_CONFIRM_NO_WORDS = frozenset({
+    "no", "nope", "nah", "not", "don't", "dont", "continue", "wait",
+    "nahi", "nahin", "nai", "na", "नहीं", "नही", "ना", "لا",
+})
+# After the confirmation question, a reply up to this long is a yes/no; a
+# longer one is the candidate answering the question after all.
+END_CONFIRM_REPLY_MAX_WORDS = 12
+
+
+def _command_words(text: Optional[str]) -> list[str]:
+    lower = (text or "").lower().replace("’", "'")
+    words = re.sub(r"[^a-z0-9' ]+", " ", lower).split()
+    while words and words[0] in _COMMAND_FILLER_WORDS:
+        words.pop(0)
+    while words and words[-1] in _COMMAND_FILLER_WORDS:
+        words.pop()
+    return words
+
+
+def _is_end_interview_request(text: Optional[str]) -> bool:
+    """True only when the whole message is an end-the-interview command."""
+    return " ".join(_command_words(text)) in END_INTERVIEW_COMMANDS
+
+
+def _is_end_confirmation_yes(text: Optional[str]) -> bool:
+    """A clear "yes" to the confirmation question. Anything unclear is a no —
+    ending is irreversible, continuing is not."""
+    tokens = [t.strip("'\"") for t in re.split(r"[\s.,!?;:।॥،؟]+", (text or "").lower()) if t.strip("'\"")]
+    if not tokens or any(t in _CONFIRM_NO_WORDS for t in tokens):
+        return False
+    if _is_end_interview_request(text):
+        return True
+    while tokens and tokens[0] in _COMMAND_FILLER_WORDS:
+        tokens.pop(0)
+    return 0 < len(tokens) <= 4 and tokens[0] in _CONFIRM_YES_WORDS
+
+
+def _awaiting_end_confirmation(db: Session, session: InterviewSession) -> bool:
+    last = (
+        db.query(InterviewMessage)
+        .filter(InterviewMessage.session_id == session.id)
+        .order_by(InterviewMessage.created_at.desc(), InterviewMessage.id.desc())
+        .first()
+    )
+    return bool(last and last.role == "ai" and last.content in END_CONFIRM_PROMPTS.values())
+
+
+def _ask_end_confirmation(db: Session, session: InterviewSession, candidate_message: str) -> dict:
+    lang = getattr(session, "interview_language", "en") or "en"
+    prompt = END_CONFIRM_PROMPTS.get(lang, END_CONFIRM_PROMPTS["en"])
+    # No question_index on either message: the evaluator groups Q&A by index,
+    # and "end the interview" must never be scored as the answer.
+    db.add(InterviewMessage(
+        session_id=session.id, role="candidate", content=candidate_message, question_index=None,
+    ))
+    db.add(InterviewMessage(session_id=session.id, role="ai", content=prompt, question_index=None))
+    _safe_commit(db, f"end confirmation asked session={session.id}")
+    return {
+        "session_id": session.id,
+        "feedback": None,
+        "message": prompt,
+        "question_index": session.current_question_index or 0,
+        "is_complete": False,
+        "is_off_topic": False,
+        "role": "ai",
+        "awaiting_end_confirmation": True,
+    }
+
+
+def _continue_after_end_declined(db: Session, session: InterviewSession, candidate_message: str) -> dict:
+    """Candidate said no (or nothing clear) — re-ask the question they were on."""
+    lang = getattr(session, "interview_language", "en") or "en"
+    current_qi = session.current_question_index or 0
+    last_question = (
+        db.query(InterviewMessage)
+        .filter(
+            InterviewMessage.session_id == session.id,
+            InterviewMessage.role == "ai",
+            InterviewMessage.question_index == current_qi,
+        )
+        .order_by(InterviewMessage.created_at.desc(), InterviewMessage.id.desc())
+        .first()
+    )
+    question = (question_text(last_question) if last_question else "") or "Please go ahead with your answer."
+    feedback = END_DECLINED_FEEDBACK.get(lang, END_DECLINED_FEEDBACK["en"])
+    db.add(InterviewMessage(
+        session_id=session.id, role="candidate", content=candidate_message, question_index=None,
+    ))
+    # Not indexed either — the original question row already holds this index.
+    db.add(InterviewMessage(
+        session_id=session.id, role="ai", content=question, feedback=feedback, question_index=None,
+    ))
+    _safe_commit(db, f"end declined session={session.id}")
+    return {
+        "session_id": session.id,
+        "feedback": feedback,
+        "message": question,
+        "question_index": current_qi,
+        "is_complete": False,
+        "is_off_topic": False,
+        "role": "ai",
+    }
+
+
 def _mark_candidate_interview_completed(
     db: Session,
     session: InterviewSession,
@@ -1021,10 +1172,18 @@ async def _conduct_turn_impl(
     interview_settings = job.interview_settings if job else None
 
     # ── Server-side guard: detect candidate requesting to end ──
-    # max_questions on InterviewSettings is the VERBAL question count (post-feature).
-    # The total interview length is verbal + coding. `max_q` represents total turns
-    # so the AI prompt's question_index references stay correct.
-    _verbal_count = interview_settings.max_questions if interview_settings else 8
+    # The verbal count comes from the question plan, NOT raw max_questions:
+    # "Only these questions" asks exactly len(predefined) and MIX may bump past
+    # max_questions. Using the raw setting made the guards disagree with the
+    # prompt — with 6 predefined and max 10 the premature-completion guard
+    # forced the model to invent Q7-Q10; with 12 and max 10 the max_q guard
+    # closed the interview before Q11. The total interview length is verbal +
+    # coding; `max_q` represents total turns so the prompt's question_index
+    # references stay correct.
+    if job is not None:
+        _verbal_count = _build_question_plan(job, interview_settings)[2]
+    else:
+        _verbal_count = interview_settings.max_questions if interview_settings else 8
     _code_enabled_v = bool(
         interview_settings.code_editor_required if interview_settings else False
     )
@@ -1049,56 +1208,58 @@ async def _conduct_turn_impl(
             f"code_editor_required={_code_enabled_v} verbal={_verbal_count} "
             f"coding={_coding_count_v} max_q={max_q} coding_turns={_coding_turns}"
         )
+    # ── Candidate asks to end → confirm first, end only on a clear yes ──
+    end_confirmed = False
     if candidate_message is not None:
-        lower_msg = candidate_message.lower().strip()
-        end_phrases = [
-            "end interview", "close interview", "stop interview",
-            "finish interview", "terminate interview", "cancel interview",
-            "close this interview", "end this interview", "end this call",
-            "close this call", "end call", "please close", "please end",
-            "please stop", "i want to end", "i want to stop", "i need to end",
-            "need to end up", "end up", "close the interview", "end the interview",
-            "want to leave", "need to leave",
-        ]
-        if any(phrase in lower_msg for phrase in end_phrases):
-            lang = getattr(session, "interview_language", "en") or "en"
-            name_part = f", {candidate.name}" if candidate else ""
-            _closings = {
-                "en": f"Thank you for your time{name_part}. It was great talking with you. We'll be in touch soon!",
-                "hi": f"आपके समय के लिए धन्यवाद{name_part}। आपसे बात करके अच्छा लगा। हम जल्द ही संपर्क करेंगे!",
-                "ar": f"شكراً لوقتك{name_part}. كان من الرائع التحدث معك. سنتواصل معك قريباً!",
-                "hinglish": f"Aapke time ke liye thank you{name_part}. Aapse baat karke accha laga. Hum jaldi contact karenge!",
-            }
-            closing = _closings.get(lang, _closings["en"])
-            db.add(InterviewMessage(
-                session_id=session.id,
-                role="candidate",
-                content=candidate_message,
-                question_index=session.current_question_index,
-            ))
-            closing_msg = InterviewMessage(
-                session_id=session.id,
-                role="ai",
-                content=closing,
-                question_index=None,  # closing message is NOT a question
-            )
-            db.add(closing_msg)
-            session.status = SessionStatus.completed
-            session.completed_at = datetime.utcnow()
-            _mark_candidate_interview_completed(
-                db, session,
-                reason="Candidate asked to end the interview",
-                new_status="Ended by Candidate",
-            )
-            db.commit()
-            return {
-                "session_id": session.id,
-                "message": closing,
-                "question_index": session.current_question_index,
-                "is_complete": True,
-                "is_off_topic": False,
-                "role": "ai",
-            }
+        if _awaiting_end_confirmation(db, session):
+            if _is_end_confirmation_yes(candidate_message):
+                end_confirmed = True
+            elif len(candidate_message.split()) <= END_CONFIRM_REPLY_MAX_WORDS:
+                return _continue_after_end_declined(db, session, candidate_message)
+            # A longer reply is the candidate answering the question after
+            # all — fall through and treat it as their answer.
+        elif _is_end_interview_request(candidate_message):
+            return _ask_end_confirmation(db, session, candidate_message)
+
+    if end_confirmed:
+        lang = getattr(session, "interview_language", "en") or "en"
+        name_part = f", {candidate.name}" if candidate else ""
+        _closings = {
+            "en": f"Thank you for your time{name_part}. It was great talking with you. We'll be in touch soon!",
+            "hi": f"आपके समय के लिए धन्यवाद{name_part}। आपसे बात करके अच्छा लगा। हम जल्द ही संपर्क करेंगे!",
+            "ar": f"شكراً لوقتك{name_part}. كان من الرائع التحدث معك. سنتواصل معك قريباً!",
+            "hinglish": f"Aapke time ke liye thank you{name_part}. Aapse baat karke accha laga. Hum jaldi contact karenge!",
+        }
+        closing = _closings.get(lang, _closings["en"])
+        db.add(InterviewMessage(
+            session_id=session.id,
+            role="candidate",
+            content=candidate_message,
+            question_index=None,  # the "yes" is not an answer to a question
+        ))
+        closing_msg = InterviewMessage(
+            session_id=session.id,
+            role="ai",
+            content=closing,
+            question_index=None,  # closing message is NOT a question
+        )
+        db.add(closing_msg)
+        session.status = SessionStatus.completed
+        session.completed_at = datetime.utcnow()
+        _mark_candidate_interview_completed(
+            db, session,
+            reason="Candidate asked to end the interview and confirmed",
+            new_status="Ended by Candidate",
+        )
+        db.commit()
+        return {
+            "session_id": session.id,
+            "message": closing,
+            "question_index": session.current_question_index,
+            "is_complete": True,
+            "is_off_topic": False,
+            "role": "ai",
+        }
 
     # ── Server-side guard: force completion if max_questions exceeded ──
     if candidate_message is not None and session.current_question_index >= max_q:
@@ -1509,9 +1670,8 @@ async def _conduct_turn_impl(
         (interview_settings.max_coding_questions if interview_settings else 0)
         if code_editor_enabled else 0
     )
-    verbal_count = interview_settings.max_questions if interview_settings else 8
     coding_turns = (
-        set(range(verbal_count + 1, max_q + 1)) if coding_count > 0 else set()
+        set(range(_verbal_count + 1, max_q + 1)) if coding_count > 0 else set()
     )
     manual_coding_enabled = bool(
         getattr(interview_settings, "manual_coding_questions", False)
