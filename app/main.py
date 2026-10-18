@@ -46,7 +46,7 @@ if settings.secret_key_is_weak:
 
 from app.database import Base, engine
 from app import media
-from app.routers import ai, auth, calendar, candidates, client_events, credits, file_manager, interview, jobs, observer, organizations, questions, resume_database, secondary_cam, talent_admin, talent_jobs, talent_pipeline, talent_public, tts, uploads
+from app.routers import ai, askmira, auth, calendar, candidates, client_events, credits, file_manager, interview, jobs, observer, organizations, questions, resume_database, secondary_cam, talent_admin, talent_jobs, talent_pipeline, talent_public, tts, uploads
 
 import app.models  # noqa: F401 — ensure all models are registered with Base
 import app.services.observer_events  # noqa: F401 — wire SQLAlchemy listeners for the live observer broker
@@ -521,6 +521,9 @@ app.include_router(ai.router, prefix="/ai", tags=["AI"])
 # which app.services.jd_metadata_service.resolve_jd_file reads from.
 app.include_router(uploads.router, prefix="/uploads", tags=["Uploads"])
 app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
+# AskMira (HRMS) link: provisioning and sign-in from AskMira. Off unless ASKMIRA_SHARED_SECRET is set.
+app.include_router(askmira.auth_router, prefix="/auth/askmira", tags=["AskMira"])
+app.include_router(askmira.integration_router, prefix="/integrations/askmira", tags=["AskMira"])
 app.include_router(interview.router, tags=["Interview"])
 app.include_router(resume_database.router, prefix="/resume-database", tags=["Resume Database"])
 app.include_router(credits.router, prefix="/credits", tags=["AI Credits"])

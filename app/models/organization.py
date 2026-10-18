@@ -27,6 +27,9 @@ class Organization(Base):
     allow_code_editor = Column(Boolean, default=False, nullable=False, server_default="false")
     allow_whatsapp = Column(Boolean, default=False, nullable=False, server_default="false")
     allow_fit_score = Column(Boolean, default=False, nullable=False, server_default="false")
+    # The AskMira workspace (tenant UUID) this organization is linked to, when
+    # it is. AskMira then provisions its people and signs them in (app.routers.askmira).
+    askmira_tenant_id = Column(String(36), unique=True, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

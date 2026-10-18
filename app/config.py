@@ -96,6 +96,12 @@ class Settings(BaseSettings):
         key = (self.SECRET_KEY or "").strip()
         return len(key) < 32 or key.lower().startswith("change-me") or "your-secret" in key.lower()
 
+    # ── AskMira (HRMS) link ──────────────────────────────────────────────────
+    # The secret this product shares with AskMira (AskMira's INTERVIEW_TOOL_SECRET).
+    # It signs AskMira's provisioning calls and sign-in links (app.routers.askmira).
+    # Empty = the link is off and those endpoints answer 404.
+    ASKMIRA_SHARED_SECRET: str = ""
+
     # ── Email / SMTP ─────────────────────────────────────────────────────────
     SMTP_HOST: str = ""
     SMTP_PORT: int = 587
