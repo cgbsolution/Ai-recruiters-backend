@@ -13,7 +13,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.models.job import Job
-from app.models.talent import AccessToken, InterviewBooking, JobMatch, TalentInterview
+from app.models.talent import AccessToken, JobMatch, TalentInterview
 from app.talent import scheduling, tokens
 from app.talent.settings import get_job_settings, get_settings, org_zone, page_brand
 
@@ -45,16 +45,14 @@ def state(db: Session, interview: TalentInterview, now: Optional[datetime] = Non
     job = db.get(Job, match.job_id)
     js = get_job_settings(db, job.id, job.organization_id)
     zone = org_zone(get_settings(db, job.organization_id))
-    offered = (db.query(InterviewBooking).filter(InterviewBooking.interview_id == interview.id,
-                                                 InterviewBooking.status == "offered")
-               .order_by(InterviewBooking.starts_at).all())
     opens, closes = scheduling.join_window(interview)
     can_start = interview.status == "scheduled" and opens is not None and opens <= now <= closes
     return {
         **page_brand(db, job.organization_id), "job_title": job.title, "status": interview.status,
         "mode": interview.mode, "question_count": js.question_count, "time_limit_minutes": js.time_limit_minutes,
-        "slots": [{"id": str(b.id), "label": scheduling.label(b.starts_at, zone), "starts_at": b.starts_at.isoformat()}
-                  for b in offered],
+        "availability": _availability(db, job, zone, now) if interview.status == "offered" else [],
+        "booking_days": scheduling.BOOKING_DAYS,
+        "time_zone": str(zone),
         "scheduled_label": scheduling.label(interview.scheduled_at, zone) if interview.scheduled_at else None,
         "scheduled_at": interview.scheduled_at.isoformat() if interview.scheduled_at else None,
         "opens_at": opens.isoformat() if opens else None,
@@ -66,6 +64,17 @@ def state(db: Session, interview: TalentInterview, now: Optional[datetime] = Non
         "consented": interview.consent_recorded_at is not None,
         "progress": _progress(db, interview, now) if interview.status == "in_progress" else None,
     }
+
+
+def _availability(db: Session, job: Job, zone, now: datetime) -> list:
+    """The calendar: each day with free times, in the org's time zone."""
+    days: dict = {}
+    for start, _end, _owner in scheduling.open_times(db, job, now):
+        local = scheduling._utc(start).astimezone(zone)
+        day = days.setdefault(local.date().isoformat(), {"date": local.date().isoformat(),
+                                                          "label": local.strftime("%a %d %b"), "times": []})
+        day["times"].append({"starts_at": start.isoformat(), "label": local.strftime("%I:%M %p").lstrip("0")})
+    return list(days.values())
 
 
 def _progress(db: Session, interview: TalentInterview, now: datetime) -> dict:

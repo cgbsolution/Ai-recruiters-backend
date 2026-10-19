@@ -93,6 +93,7 @@ def refresh_submit(token: str, body: RefreshSubmit, db: Session = Depends(get_db
 
 class InviteAnswer(BaseModel):
     interested: bool
+    consent: bool = False  # asked on the page when we don't have it yet
     current_ctc: Optional[float] = None
     expected_ctc: Optional[float] = None
     notice_period_days: Optional[int] = None
@@ -131,7 +132,7 @@ def invite_answer(token: str, body: InviteAnswer, db: Session = Depends(get_db))
 # ── Interview (Loop D) ──────────────────────────────────────────────────────
 
 class BookRequest(BaseModel):
-    slot_id: str
+    starts_at: datetime  # a start time from the page's availability (UTC)
 
 
 def _interview(db: Session, token: str):
@@ -157,7 +158,7 @@ def interview_book(token: str, body: BookRequest, db: Session = Depends(get_db))
     interview = _interview(db, token)
     _throttle(token)
     try:
-        scheduling.book(db, interview.id, body.slot_id)
+        scheduling.book_time(db, interview.id, body.starts_at)
     except (scheduling.SlotTaken, ValueError) as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail=str(exc) or "That time is no longer available.")

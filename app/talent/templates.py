@@ -222,10 +222,40 @@ def _invite(reminder: bool) -> Callable[[dict], Rendered]:
     return render
 
 
+def _consent_request(reminder: bool) -> Callable[[dict], Rendered]:
+    """A matched candidate we have no consent for: one ask (and one reminder)
+    for permission to email them about this role, then interested or not."""
+    def render(ctx: dict) -> Rendered:
+        role, org = ctx["job_title"], ctx["org_name"]
+        subject = (f"Reminder: may {org} tell you about the {role} role?" if reminder
+                   else f"{role} at {org}: may we tell you about it?")
+        summary = ctx.get("role_summary") or ""
+        intro = (f"Following up on the {role} role we wrote about." if reminder else
+                 f"We think your background fits a {role} opening "
+                 f"({ctx.get('job_location') or 'location on request'}).")
+        ask = ("Before we send you anything more, we need your permission. Open the page below to agree to hear "
+               "from us by email about this role and its interview, then tell us whether you're interested.")
+        small = ("Don't want to hear from us? Ignore this email and we won't write about this role again"
+                 + (" after one reminder." if not reminder else "."))
+        text = (f"{_greeting(ctx)}\n\n{intro}\n\n{summary}\n\n{ask}\n\nRespond: {ctx['action_url']}\n\n{small}\n"
+                + _footer_text(ctx))
+        html = _wrap(
+            f"<p>{escape(_greeting(ctx))}</p><p>{escape(intro)}</p>"
+            + (f"<p>{escape(summary)}</p>" if summary else "")
+            + f"<p>{escape(ask)}</p>{_button(ctx['action_url'], 'Give consent and respond', ctx)}"
+            + f'<p style="color:#667085;font-size:13px">{escape(small)}</p>',
+            ctx,
+        )
+        return subject, text, html
+
+    return render
+
+
 # ── Loop D: interviews ──────────────────────────────────────────────────────
 
-def _slots_lines(ctx: dict) -> List[str]:
-    return [f"• {s}" for s in ctx.get("slot_labels", [])]
+def _pick_window(ctx: dict) -> str:
+    days = ctx.get("booking_days") or 7
+    return f"Pick any date and time that suits you in the next {days} days."
 
 
 def _interview_offer(ctx: dict) -> Rendered:
@@ -233,14 +263,12 @@ def _interview_offer(ctx: dict) -> Rendered:
     subject = f"Choose a time for your {role} interview"
     disclosure = ("This first interview is conducted by an AI interviewer. You'll be told this again before it "
                   "starts, asked for consent to record, and you can ask to speak to a person instead.")
-    slots = _slots_lines(ctx)
-    text = (f"{_greeting(ctx)}\n\nThanks for your interest in the {role} role. Please pick one of these times:\n"
-            + "\n".join(slots) + f"\n\n{disclosure}\n\nPick a time: {ctx['action_url']}\n{_footer_text(ctx)}")
+    text = (f"{_greeting(ctx)}\n\nThanks for your interest in the {role} role. {_pick_window(ctx)}"
+            f"\n\n{disclosure}\n\nPick a time: {ctx['action_url']}\n{_footer_text(ctx)}")
     html = _wrap(
         f"<p>{escape(_greeting(ctx))}</p><p>Thanks for your interest in the {escape(role)} role. "
-        "Please pick one of these times:</p><ul>"
-        + "".join(f"<li>{escape(s)}</li>" for s in ctx.get("slot_labels", []))
-        + f"</ul><p>{escape(disclosure)}</p>{_button(ctx['action_url'], 'Pick a time', ctx)}",
+        f"{escape(_pick_window(ctx))}</p>"
+        f"<p>{escape(disclosure)}</p>{_button(ctx['action_url'], 'Pick a time', ctx)}",
         ctx,
     )
     return subject, text, html
@@ -250,10 +278,11 @@ def _interview_confirmed(ctx: dict) -> Rendered:
     role = ctx["job_title"]
     subject = f"Confirmed: {role} interview on {ctx['when_label']}"
     text = (f"{_greeting(ctx)}\n\nYour interview is booked for {ctx['when_label']}.\n"
-            f"Join here at that time: {ctx['action_url']}\n{_footer_text(ctx)}")
+            f"Your interview link (it opens 15 minutes before): {ctx['action_url']}\n{_footer_text(ctx)}")
     html = _wrap(
         f"<p>{escape(_greeting(ctx))}</p><p>Your interview is booked for <b>{escape(ctx['when_label'])}</b>.</p>"
-        f"{_button(ctx['action_url'], 'Open interview page', ctx)}",
+        "<p>Use the button below at that time to start your interview. It opens 15 minutes before.</p>"
+        f"{_button(ctx['action_url'], 'Open interview link', ctx)}",
         ctx,
     )
     return subject, text, html
@@ -276,12 +305,11 @@ def _interview_reminder(lead: str) -> Callable[[dict], Rendered]:
 
 def _interview_missed(ctx: dict) -> Rendered:
     subject = f"We missed you — pick a new time for the {ctx['job_title']} interview"
-    text = (f"{_greeting(ctx)}\n\nIt looks like the interview didn't happen. Choose another time:\n"
-            + "\n".join(_slots_lines(ctx)) + f"\n\n{ctx['action_url']}\n{_footer_text(ctx)}")
+    text = (f"{_greeting(ctx)}\n\nIt looks like the interview didn't happen. {_pick_window(ctx)}"
+            f"\n\n{ctx['action_url']}\n{_footer_text(ctx)}")
     html = _wrap(
-        f"<p>{escape(_greeting(ctx))}</p><p>It looks like the interview didn't happen. Choose another time:</p><ul>"
-        + "".join(f"<li>{escape(s)}</li>" for s in ctx.get("slot_labels", []))
-        + f"</ul>{_button(ctx['action_url'], 'Pick a new time', ctx)}",
+        f"<p>{escape(_greeting(ctx))}</p><p>It looks like the interview didn't happen. "
+        f"{escape(_pick_window(ctx))}</p>{_button(ctx['action_url'], 'Pick a new time', ctx)}",
         ctx,
     )
     return subject, text, html
@@ -305,6 +333,8 @@ TEMPLATES: Dict[str, Callable[[dict], Rendered]] = {
     "refresh_touch_3": _refresh(3),
     "invite": _invite(False),
     "invite_reminder": _invite(True),
+    "consent_request": _consent_request(False),
+    "consent_request_reminder": _consent_request(True),
     "interview_offer": _interview_offer,
     "interview_confirmed": _interview_confirmed,
     "interview_reminder_24h": _interview_reminder("tomorrow"),
@@ -317,6 +347,8 @@ TEMPLATES: Dict[str, Callable[[dict], Rendered]] = {
 TEMPLATE_PURPOSE = {
     "refresh_touch_1": "refresh", "refresh_touch_2": "refresh", "refresh_touch_3": "refresh",
     "invite": "jobs", "invite_reminder": "jobs", "not_moving_forward": "jobs",
+    # Asks for the "jobs" consent it lacks: the outbox checks can_request_consent instead.
+    "consent_request": "consent_request", "consent_request_reminder": "consent_request",
     "interview_offer": "interview", "interview_confirmed": "interview", "interview_reminder_24h": "interview",
     "interview_reminder_1h": "interview", "interview_missed": "interview",
 }

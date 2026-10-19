@@ -1,20 +1,23 @@
 """
 Loop C — rank and invite.
 
-plan()          after matching: the top K invitable matches. Autopilot jobs →
-                invite them; copilot jobs → an approval request per match.
+plan()          after matching: the top K invitable matches. Anyone we have no
+                consent for yet is sent a consent request at once (any
+                autonomy mode); with consent, autopilot jobs → invite them;
+                copilot jobs → an approval request per match.
 send_invite()   the only way an invite leaves: refuses a copilot job without a
-                recruiter's approval, and goes through the consent-gated outbox.
-respond()       the candidate's answer on /t/invite: interested (with CTC and
-                notice confirmed) → an interview is offered; not interested →
-                the match closes. No answer: one reminder after 3 days, then
+                recruiter's approval (except the consent request), and goes
+                through the consent-gated outbox.
+respond()       the candidate's answer on /t/invite: consent first when it's
+                missing, then interested (with CTC and notice confirmed) → an
+                interview is offered; not interested → the match closes. No answer: one reminder after 3 days, then
                 the match closes (app.agent.invite_send).
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 from sqlalchemy.orm import Session
@@ -28,6 +31,11 @@ from app.talent.match_loop import ordered_matches
 from app.talent.settings import get_job_settings, loop_enabled, page_brand
 
 INVITABLE = ("ranked", "needs_refresh")
+INVITE_KINDS = ("invite", "invite_reminder", "consent_request", "consent_request_reminder")
+CONSENT_KINDS = ("consent_request", "consent_request_reminder")
+# One consent request at a time per person: matched to several jobs, they get
+# the first and the rest wait until it has been answered or this long has passed.
+CONSENT_ASK_GAP = timedelta(days=30)
 DONE_REFRESHING = ("responded", "no_response", "skipped", "opted_out", "bounced", "cancelled")
 
 
@@ -70,7 +78,11 @@ def plan(db: Session, job_id: int) -> dict:
             waiting += 1
             continue
         if not consent.can_contact(db, profile.id, "email", "jobs").allowed:
-            continue  # never queued, never asked about: the gate would refuse anyway
+            # No consent yet: ask for it straight away, whatever the autonomy
+            # mode. Refused, withdrawn or unreachable: never queued at all.
+            if consent.can_request_consent(db, profile.id).allowed and not _consent_asked_recently(db, profile.id):
+                to_invite.append(str(match.id))
+            continue
         if js.autonomy_mode == "autopilot":
             to_invite.append(str(match.id))
         else:
@@ -80,6 +92,18 @@ def plan(db: Session, job_id: int) -> dict:
     db.commit()
     return {"invite": to_invite, "approvals": approvals_made, "waiting_for_refresh": waiting,
             "autonomy": js.autonomy_mode}
+
+
+def _consent_asked_recently(db: Session, profile_id: int) -> bool:
+    return db.query(Touch.id).filter(
+        Touch.profile_id == profile_id, Touch.template.in_(CONSENT_KINDS), Touch.status == "sent",
+        Touch.responded_at.is_(None), Touch.sent_at >= datetime.utcnow() - CONSENT_ASK_GAP,
+    ).first() is not None
+
+
+def needs_consent(db: Session, profile_id: int) -> bool:
+    """Job and interview emails both need the candidate's own yes."""
+    return any(not consent.can_contact(db, profile_id, "email", p).allowed for p in ("jobs", "interview"))
 
 
 def _role_summary(db: Session, job: Job) -> str:
@@ -105,7 +129,8 @@ def send_invite(db: Session, match_id: str, touch_no: int = 1, now: Optional[dat
     js = get_job_settings(db, job.id, job.organization_id)
     if job.status != JobStatus.open:
         return {"status": "stopped", "reason": "job_not_open"}
-    if js.autonomy_mode != "autopilot":
+    asking = not consent.can_contact(db, match.profile_id, "email", "jobs").allowed
+    if js.autonomy_mode != "autopilot" and not asking:
         try:
             approval = approvals.require(db, match, "invite")
         except approvals.NotApproved:
@@ -116,7 +141,10 @@ def send_invite(db: Session, match_id: str, touch_no: int = 1, now: Optional[dat
         match.invite_approval_id = approval.id
     campaign = invite_campaign(db, job)
     db.commit()
-    kind = "invite" if touch_no == 1 else "invite_reminder"
+    if asking:  # the consent request: the outbox lets only this one through without consent
+        kind = "consent_request" if touch_no == 1 else "consent_request_reminder"
+    else:
+        kind = "invite" if touch_no == 1 else "invite_reminder"
     result = outbox.send_touch(
         db, campaign_id=campaign.id, profile_id=match.profile_id, touch_no=touch_no, kind=kind,
         priority=caps.TRANSACTIONAL, action=("invite", str(match.id)), now=now,
@@ -160,7 +188,7 @@ def page_data(db: Session, row: AccessToken) -> dict:
         raise LinkError()
     job = db.get(Job, match.job_id)
     profile = db.get(ResumeMetadata, match.profile_id)
-    touch =(db.query(Touch).filter(Touch.profile_id == profile.id, Touch.template.in_(("invite", "invite_reminder")))
+    touch =(db.query(Touch).filter(Touch.profile_id == profile.id, Touch.template.in_(INVITE_KINDS))
              .order_by(Touch.created_at.desc()).first())
     if touch is not None and touch.opened_at is None:
         touch.opened_at = datetime.utcnow()
@@ -173,6 +201,7 @@ def page_data(db: Session, row: AccessToken) -> dict:
         "current": {"current_ctc": profile.current_ctc, "expected_ctc": profile.expected_ctc,
                     "notice_period_days": profile.notice_period_days},
         "open": job.status == JobStatus.open and match.status not in ("closed",),
+        "consent_needed": needs_consent(db, profile.id),
     }
 
 
@@ -182,6 +211,10 @@ def respond(db: Session, row: AccessToken, payload: dict) -> dict:
     if match is None or match.response:
         raise LinkError()
     interested = bool(payload.get("interested"))
+    asking = needs_consent(db, match.profile_id)
+    agreed = bool(payload.get("consent"))
+    if asking and interested and not agreed:
+        raise ValueError("Please agree to hear from us by email first, so we can arrange your interview.")
     from app.talent.refresh import _clean_number
 
     confirmed = {}
@@ -198,8 +231,14 @@ def respond(db: Session, row: AccessToken, payload: dict) -> dict:
     profile = db.get(ResumeMetadata, match.profile_id)
     match.response, match.responded_at = ("interested" if interested else "not_interested"), now
     match.confirmed = confirmed or None
-    for t in db.query(Touch).filter(Touch.profile_id == profile.id, Touch.template.in_(("invite", "invite_reminder"))):
+    for t in db.query(Touch).filter(Touch.profile_id == profile.id, Touch.template.in_(INVITE_KINDS)):
         t.responded_at = t.responded_at or now
+    if asking:  # their own answer on the page: a yes covers this role's emails and its interview
+        for purpose in ("jobs", "interview"):
+            consent.set_consent(db, profile.id, "email", purpose, agreed, source="invite_page", actor="candidate",
+                                basis="candidate_opt_in", organization_id=match.organization_id)
+        if agreed:
+            consent.lift_own_suppression(db, email=profile.candidate_email, phone=profile.phone)
     if interested:
         mark_candidate_confirmation(db)
         for key, value in confirmed.items():
@@ -210,7 +249,8 @@ def respond(db: Session, row: AccessToken, payload: dict) -> dict:
         match.status, match.status_reason = "declined", "candidate_not_interested"
     audit(db, actor="candidate", action="invite.responded", subject_type="job_match", subject_id=match.id,
           organization_id=match.organization_id, profile_id=profile.id,
-          detail={"interested": interested, "confirmed_fields": sorted(k for k, v in confirmed.items() if v is not None)})
+          detail={"interested": interested, "consent_asked": asking, "consent_given": asking and agreed,
+                  "confirmed_fields": sorted(k for k, v in confirmed.items() if v is not None)})
     db.commit()
 
     from app.agent.client import emit
