@@ -18,7 +18,7 @@ from app.authz import authorize_job
 from app.database import get_db
 from app.models.job import Job, JobStatus
 from app.models.resume_metadata import ResumeMetadata
-from app.models.talent import JobMatch, TalentJobSettings
+from app.models.talent import JobMatch, TalentInterview, TalentJobSettings
 from app.models.user import User
 from app.refs import JobId, encode_ref
 from app.talent import backfill, consent, heartbeat, match_loop, matching
@@ -240,6 +240,14 @@ def list_matches(
     if status:
         out = [o for o in out if o["status"] == status]
     page = out[:limit]
+    # The booked interview, for lists that show the date next to the status.
+    interviews = {
+        str(i.match_id): i for i in db.query(TalentInterview)
+        .filter(TalentInterview.match_id.in_([uuid.UUID(item["id"]) for item in page]))
+    } if page else {}
+    for item in page:
+        iv = interviews.get(item["id"])
+        item["interview"] = {"status": iv.status, "scheduled_at": iv.scheduled_at} if iv else None
     # Whether an invite could reach them: planning skips anyone the consent gate
     # refuses, and without the reason the recruiter just saw no approvals.
     for item in page:
