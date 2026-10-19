@@ -35,7 +35,7 @@ from app.models.talent import Campaign, CampaignMember, Touch
 from app.talent import caps, tokens
 from app.talent.audit import audit
 from app.talent.config import talent_config
-from app.talent.consent import can_contact
+from app.talent.consent import can_contact, can_request_consent
 from app.talent.settings import get_settings, loop_enabled, next_send_window
 from app.talent.templates import TEMPLATE_PURPOSE, brand_context, render
 from app.talent.transports import (
@@ -60,6 +60,7 @@ MAX_ATTEMPTS = 5
 KIND_LOOP = {
     "refresh_touch_1": "refresh", "refresh_touch_2": "refresh", "refresh_touch_3": "refresh",
     "invite": "invite", "invite_reminder": "invite",
+    "consent_request": "invite", "consent_request_reminder": "invite",
     "interview_offer": "interview", "interview_confirmed": "interview", "interview_reminder_24h": "interview",
     "interview_reminder_1h": "interview", "interview_missed": "interview",
     "not_moving_forward": None,  # a recruiter's decision; only the master switch applies
@@ -70,7 +71,7 @@ KIND_LOOP = {
 # others name the match / interview they act on and must be passed in.
 DEFAULT_ACTION = {"refresh_touch_1": ("refresh", "@touch"), "refresh_touch_2": ("refresh", "@touch"),
                   "refresh_touch_3": ("refresh", "@touch")}
-NEEDS_ACTION = {"invite", "invite_reminder", "interview_offer", "interview_confirmed", "interview_reminder_24h",
+NEEDS_ACTION = {"invite", "invite_reminder", "consent_request", "consent_request_reminder", "interview_offer", "interview_confirmed", "interview_reminder_24h",
                 "interview_reminder_1h", "interview_missed"}
 
 
@@ -214,7 +215,10 @@ def send_touch(
     if campaign.status == "paused":
         return SendResult("paused", touch.id, "campaign_paused", now + timedelta(hours=1))
 
-    decision = can_contact(db, profile_id, channel, purpose)
+    if purpose == "consent_request":  # the one email allowed before consent: the ask itself
+        decision = can_request_consent(db, profile_id) if channel == "email" else can_contact(db, profile_id, channel, "jobs")
+    else:
+        decision = can_contact(db, profile_id, channel, purpose)
     if not decision.allowed:
         return _finish(db, touch, "skipped", campaign, reason=decision.reason, action="message.skipped")
 

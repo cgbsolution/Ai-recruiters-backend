@@ -71,6 +71,7 @@ _REASON_TEXT = {
     "unreachable": "Emails to this address keep bouncing",
     "no_phone": "No phone number on the profile",
     "profile_missing": "The profile no longer exists",
+    "consent_granted": "Consent is already recorded",
 }
 
 
@@ -125,6 +126,25 @@ def can_contact(db: Session, profile_id: int, channel: str, purpose: str) -> Con
     consent = db.get(ContactConsent, (profile_id, channel, purpose))
     if consent is None or consent.status != "granted":
         return _deny("no_consent" if consent is None else f"consent_{consent.status}")
+    return _reachable(db, profile, channel, purpose)
+
+
+def can_request_consent(db: Session, profile_id: int) -> ContactDecision:
+    """May we email this person once to ask for consent to job messages? Only
+    if they have never answered for job emails (a withdrawal or refusal is
+    final), aren't on the do-not-contact list and the address works. The
+    message itself is the consent ask; nothing else may ride on this permit."""
+    profile = db.get(ResumeMetadata, profile_id)
+    if profile is None:
+        return _deny("profile_missing")
+    row = db.get(ContactConsent, (profile_id, "email", "jobs"))
+    if row is not None:
+        return _deny("consent_granted" if row.status == "granted" else f"consent_{row.status}")
+    return _reachable(db, profile, "email", "consent_request")
+
+
+def _reachable(db: Session, profile: ResumeMetadata, channel: str, purpose: str) -> ContactDecision:
+    profile_id = profile.id
     if is_suppressed(db, email=profile.candidate_email, phone=profile.phone):
         return _deny("suppressed")
 

@@ -252,8 +252,12 @@ def list_matches(
     # refuses, and without the reason the recruiter just saw no approvals.
     for item in page:
         decision = consent.can_contact(db, item["profile_id"], "email", "jobs")
-        item["contact"] = {"allowed": decision.allowed,
-                           "reason": None if decision.allowed else consent.describe(decision.reason),
+        reason = None if decision.allowed else consent.describe(decision.reason)
+        # No consent yet but reachable: the invite goes out as a consent request.
+        can_ask = decision.reason == "no_consent" and consent.can_request_consent(db, item["profile_id"]).allowed
+        if can_ask:
+            reason = "No consent yet: the invite email asks for it"
+        item["contact"] = {"allowed": decision.allowed, "reason": reason, "can_ask": can_ask,
                            "code": None if decision.allowed else decision.reason}
     return {"total": len(out), "items": page}
 

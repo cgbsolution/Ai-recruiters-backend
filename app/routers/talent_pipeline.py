@@ -91,6 +91,8 @@ def invite_one(match_id: str, org_id: int = Depends(talent_org), user: User = De
     if m.status not in invites.INVITABLE + ("approval_pending",):
         raise HTTPException(status_code=409, detail="This candidate has already been invited or closed")
     decision = consent.can_contact(db, m.profile_id, "email", "jobs")
+    if not decision.allowed and decision.reason == "no_consent":  # the invite goes out as a consent request
+        decision = consent.can_request_consent(db, m.profile_id)
     if not decision.allowed:  # the send would be refused anyway: say why now
         raise HTTPException(status_code=409, detail=f"Can't invite: {consent.describe(decision.reason)}.")
     invites.invite_now(db, m, user)
