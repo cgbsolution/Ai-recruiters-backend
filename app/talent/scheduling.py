@@ -1,11 +1,13 @@
 """
 Loop D — scheduling.
 
-offer_interview()  an interested candidate gets an interview and 3 slots.
-                   Slots come from the job's panel (panel_user_ids): business
+offer_interview()  an interested candidate gets an interview and a calendar:
+                   any free start time in the next BOOKING_DAYS days.
+                   Times come from the job's panel (panel_user_ids): business
                    hours in the org's time zone, minus each member's Google
                    Calendar busy times and their booked interviews. No panel →
-                   the AI interviews alone and any business-hours slot works.
+                   the AI interviews alone and any business-hours time works.
+book_time()        the candidate's pick, re-checked against open_times(); then
 book()             under a per-owner Postgres advisory lock, with an overlap
                    check (and the partial unique index as a backstop), so two
                    candidates can never hold the same person's time.
@@ -39,9 +41,9 @@ from app.talent.settings import get_job_settings, get_settings, org_zone
 
 logger = logging.getLogger("app.talent.scheduling")
 
-SLOTS_OFFERED = 3
-MIN_LEAD = timedelta(hours=20)
-HORIZON_DAYS = 10
+BOOKING_DAYS = 7
+MIN_LEAD = timedelta(hours=2)
+STEP = timedelta(minutes=30)
 DAY_START, DAY_END = time(10, 0), time(18, 0)
 AUTO_RESCHEDULES = 1
 NO_SHOW_GRACE = timedelta(minutes=30)
@@ -106,10 +108,10 @@ def _overlaps(a_start, a_end, intervals) -> bool:
     return any(a_start < e and a_end > s for s, e in intervals)
 
 
-def candidate_slots(db: Session, job: Job, now: Optional[datetime] = None, count: int = SLOTS_OFFERED,
-                    exclude: Optional[List[datetime]] = None) -> List[Tuple[datetime, datetime, Optional[int]]]:
-    """[(start, end, owner_user_id)] naive UTC — at most one slot per day, the
-    first free one, alternating mornings and afternoons."""
+def open_times(db: Session, job: Job, now: Optional[datetime] = None,
+               days: int = BOOKING_DAYS) -> List[Tuple[datetime, datetime, Optional[int]]]:
+    """[(start, end, owner_user_id)] naive UTC — every free start time, on the
+    half hour, in business hours on weekdays, from MIN_LEAD to `days` ahead."""
     now = now or datetime.utcnow()
     js = get_job_settings(db, job.id, job.organization_id)
     zone = org_zone(get_settings(db, job.organization_id))
@@ -118,7 +120,7 @@ def candidate_slots(db: Session, job: Job, now: Optional[datetime] = None, count
     if js.panel_user_ids:
         panel = db.query(User).filter(User.id.in_(js.panel_user_ids), User.organization_id == job.organization_id,
                                       User.is_active.is_(True)).all()
-    window_start, window_end = now + MIN_LEAD, now + timedelta(days=HORIZON_DAYS)
+    window_start, window_end = now + MIN_LEAD, now + timedelta(days=days)
     busy = {}
     for member in panel:
         cal = google_busy(member, window_start, window_end)
@@ -126,34 +128,25 @@ def candidate_slots(db: Session, job: Job, now: Optional[datetime] = None, count
             busy[member.id] = cal + _booked(db, member.id, window_start, window_end)
     if panel and not busy:
         return []  # a panel is required and no calendar could be read
-    exclude = exclude or []
-    slots = []
-    local_now = _utc(window_start).astimezone(zone)
-    for day in range(HORIZON_DAYS + 1):
-        if len(slots) >= count:
-            break
-        date = (local_now + timedelta(days=day)).date()
+    times = []
+    local_today = _utc(now).astimezone(zone).date()
+    for day in range(days + 1):
+        date = local_today + timedelta(days=day)
         if date.weekday() >= 5:
             continue
-        starts = []
         t = datetime.combine(date, DAY_START, tzinfo=zone)
         while t + length <= datetime.combine(date, DAY_END, tzinfo=zone):
-            starts.append(t)
-            t += timedelta(minutes=30)
-        if len(slots) % 2 == 1:
-            starts = starts[len(starts) // 2:] + starts[: len(starts) // 2]  # afternoon first on alternate days
-        for s in starts:
-            start, end = _naive(s), _naive(s + length)
-            if start < window_start or start in exclude:
+            start, end = _naive(t), _naive(t + length)
+            t += STEP
+            if start < window_start or start > window_end:
                 continue
             if not panel:
-                slots.append((start, end, None))
-                break
+                times.append((start, end, None))
+                continue
             owner = next((uid for uid, intervals in busy.items() if not _overlaps(start, end, intervals)), None)
             if owner is not None:
-                slots.append((start, end, owner))
-                break
-    return slots
+                times.append((start, end, owner))
+    return times
 
 
 # ── Offer, book, reschedule ─────────────────────────────────────────────────
@@ -167,24 +160,20 @@ def _mode(db: Session, job: Job) -> str:
     return mode
 
 
-def propose(db: Session, interview: TalentInterview, now: Optional[datetime] = None) -> List[InterviewBooking]:
+def propose(db: Session, interview: TalentInterview, now: Optional[datetime] = None) -> int:
+    """Open the calendar for a (new) offer: the candidate picks a time on the
+    page. With no free time at all, a recruiter is flagged instead."""
     match = db.get(JobMatch, interview.match_id)
     job = db.get(Job, match.job_id)
     db.query(InterviewBooking).filter(InterviewBooking.interview_id == interview.id,
                                       InterviewBooking.status == "offered").update({"status": "released"})
-    previous = [b.starts_at for b in db.query(InterviewBooking).filter(InterviewBooking.interview_id == interview.id)]
-    rows = []
-    for start, end, owner in candidate_slots(db, job, now, exclude=previous):
-        row = InterviewBooking(interview_id=interview.id, owner_user_id=owner, starts_at=start, ends_at=end,
-                               status="offered")
-        db.add(row)
-        rows.append(row)
-    if not rows:
+    free = len(open_times(db, job, now))
+    if not free:
         interview.needs_recruiter = True
         audit(db, actor="agent", action="interview.no_slots", subject_type="interview", subject_id=interview.id,
               organization_id=match.organization_id, profile_id=match.profile_id)
     db.flush()
-    return rows
+    return free
 
 
 def offer_interview(db: Session, match_id, now: Optional[datetime] = None) -> Tuple[TalentInterview, str]:
@@ -210,6 +199,28 @@ def offer_interview(db: Session, match_id, now: Optional[datetime] = None) -> Tu
     emit("talent/interview.offered", {"interview_id": str(interview.id), "attempt": interview.reschedule_count,
                                       "key": f"{interview.id}:{interview.reschedule_count}:offer"})
     return interview, tokens.page_url("interview", raw)
+
+
+def book_time(db: Session, interview_id, starts_at: datetime, now: Optional[datetime] = None) -> TalentInterview:
+    """Book the start time the candidate picked on the calendar (naive UTC).
+    It must still be one of open_times(); book() then re-checks the owner's
+    calendar under the lock."""
+    now = now or datetime.utcnow()
+    interview = db.get(TalentInterview, uuid.UUID(str(interview_id)))
+    if interview is None or interview.status != "offered":
+        raise SlotTaken("this interview can no longer be booked")
+    match = db.get(JobMatch, interview.match_id)
+    job = db.get(Job, match.job_id)
+    starts_at = _naive(_utc(starts_at))
+    pick = next(((s, e, o) for s, e, o in open_times(db, job, now) if s == starts_at), None)
+    if pick is None:
+        raise SlotTaken("that time isn't available — please pick another")
+    start, end, owner = pick
+    row = InterviewBooking(interview_id=interview.id, owner_user_id=owner, starts_at=start, ends_at=end,
+                           status="offered")
+    db.add(row)
+    db.flush()
+    return book(db, interview.id, row.id, now)
 
 
 def _lock_owner(db: Session, owner_id: int) -> None:
@@ -390,10 +401,7 @@ def message_context(db: Session, interview: TalentInterview) -> dict:
     match = db.get(JobMatch, interview.match_id)
     job = db.get(Job, match.job_id)
     zone = org_zone(get_settings(db, job.organization_id))
-    offered = (db.query(InterviewBooking).filter(InterviewBooking.interview_id == interview.id,
-                                                 InterviewBooking.status == "offered")
-               .order_by(InterviewBooking.starts_at).all())
-    return {"job_title": job.title, "slot_labels": [label(b.starts_at, zone) for b in offered],
+    return {"job_title": job.title, "booking_days": BOOKING_DAYS,
             "when_label": label(interview.scheduled_at, zone) if interview.scheduled_at else ""}
 
 
