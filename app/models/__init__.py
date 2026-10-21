@@ -25,7 +25,7 @@ from app.models.ai_credit_usage import AiCreditUsage
 from app.models.secondary_cam import SecondaryCamSession, SecondaryCamSnapshot
 from app.models.observer import ObserverToken
 from app.models.client_event import ClientEvent
-from app.models.askmira import AskmiraLaunch
+from app.models.askmira import AskmiraConnection, AskmiraLaunch
 from app.models.talent import (
     AccessToken,
     AgentHeartbeat,

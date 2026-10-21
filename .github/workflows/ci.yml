@@ -1,0 +1,85 @@
+# Every push and pull request: a lint gate, the migrations on an empty database,
+# and the three test suites against throwaway Postgres databases. Each suite's
+# conftest refuses any database whose name lacks "test".
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SECRET_KEY: ci-only-secret-0123456789-0123456789-0123456789
+  SKIP_STARTUP_MIGRATIONS: "1"
+  # Nothing in CI may reach a real AI, email or messaging provider.
+  ANTHROPIC_API_KEY: ""
+  OPENAI_API_KEY: ""
+  GEMINI_API_KEY: ""
+  DEEPGRAM_API_KEY: ""
+  SMTP_HOST: ""
+  WHATSAPP_TOKEN: ""
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.9.2
+      # Syntax errors and undefined names: the checks that catch real breakage
+      # without asking the codebase to adopt a style first.
+      - run: ruff check --select E9,F63,F7,F82 --target-version py312 app alembic tests tests_security tests_talent scripts
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Talent matching must work with and without pgvector.
+        postgres: ["postgres:16", "pgvector/pgvector:pg16"]
+    services:
+      postgres:
+        image: ${{ matrix.postgres }}
+        env: { POSTGRES_USER: ci, POSTGRES_PASSWORD: ci, POSTGRES_DB: postgres }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ci" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Create the test databases
+        env: { PGPASSWORD: ci }
+        run: |
+          for db in migrations_test legacy_test security_test talent_test; do
+            psql -h localhost -U ci -d postgres -c "CREATE DATABASE $db"
+          done
+      - name: Migrations upgrade an empty database to head and back
+        env:
+          DATABASE_URL: postgresql+psycopg://ci:ci@localhost:5432/migrations_test
+        run: alembic upgrade head && alembic downgrade -1 && alembic upgrade head
+      - name: tests/
+        env:
+          DATABASE_URL: postgresql+psycopg://ci:ci@localhost:5432/legacy_test
+        run: pytest tests -q
+      - name: tests_security/
+        env:
+          SECURITY_TEST_DATABASE_URL: postgresql+psycopg://ci:ci@localhost:5432/security_test
+        run: pytest tests_security -q
+      - name: tests_talent/
+        env:
+          TALENT_TEST_DATABASE_URL: postgresql+psycopg://ci:ci@localhost:5432/talent_test
+        run: pytest tests_talent -q

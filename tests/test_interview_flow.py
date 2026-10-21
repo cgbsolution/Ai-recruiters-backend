@@ -93,15 +93,19 @@ def test_system_prompt_includes_opening_instruction():
     settings.special_instructions = None
     settings.max_questions = 7
     settings.resume_based = True
+    settings.code_editor_required = False  # verbal interview; coding has its own tests
+    settings.manual_coding_questions = False
 
     prompt = _build_system_prompt(job, candidate, settings)
 
-    # Verify opening instructions are present
+    # The opening is two steps: a short welcome that asks the candidate to
+    # introduce themselves (question 0), then the first real question (question 1).
     assert "OPENING" in prompt
-    assert "SHORT 1-line greeting" in prompt
-    assert "IMMEDIATELY ask" in prompt
-    assert "question_index to 1" in prompt
-    assert "Hi John! I'm Alex" in prompt
+    assert "introduce themselves" in prompt
+    assert "Set question_index to 0" in prompt
+    assert "Set question_index to 1" in prompt
+    assert "Do NOT ask any interview question" in prompt
+    assert "Hi John! I'm Nira" in prompt
     print("✓ System prompt includes clear opening instructions")
 
     # Verify mode instructions are present
@@ -133,6 +137,8 @@ def test_system_prompt_mix_mode_sections():
     settings.special_instructions = None
     settings.max_questions = 7
     settings.resume_based = True
+    settings.code_editor_required = False  # verbal interview; coding has its own tests
+    settings.manual_coding_questions = False
 
     prompt = _build_system_prompt(job, candidate, settings)
 
@@ -165,11 +171,13 @@ def test_system_prompt_question_counting_rules():
     settings.special_instructions = None
     settings.max_questions = 7
     settings.resume_based = True
+    settings.code_editor_required = False  # verbal interview; coding has its own tests
+    settings.manual_coding_questions = False
 
     prompt = _build_system_prompt(job, candidate, settings)
 
     # Verify question counting rules
-    assert "question_index starts at 1" in prompt
+    assert "Set question_index to 0 (this is the intro" in prompt  # the intro is not counted
     assert "NEVER exceeds" in prompt or "NEVER exceed" in prompt
     assert "Increment by 1" in prompt or "Increment" in prompt
     assert "FLOW EXAMPLE" in prompt

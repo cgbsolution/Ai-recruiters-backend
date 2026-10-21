@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func, cast, Date
+from sqlalchemy import func, cast, Date, text
 from sqlalchemy.orm import Session
 
 from app.models.candidate import Candidate
