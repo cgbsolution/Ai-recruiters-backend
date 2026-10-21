@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, Integer, String
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String
 
 from app.database import Base
 
@@ -17,21 +17,43 @@ class AskmiraLaunch(Base):
     expires_at = Column(DateTime, nullable=False, index=True)
 
 
-class AskmiraConnection(Base):
-    """This server's connection to AskMira, made with a connection key — no .env edit.
+class AskmiraOrgConnection(Base):
+    """An organization's connection to one AskMira workspace (app.routers.askmira).
 
-    One row (id 1). The platform super admin generates a key here; it carries a
-    secret derived from SECRET_KEY and a random nonce, and only the nonce is
-    stored, so the database never holds the secret itself. The key is "pending"
-    until AskMira proves it holds the secret with a signed handshake, and then
-    becomes the active connection. ASKMIRA_SHARED_SECRET stays the fallback.
+    Made when an admin of the organization allows AskMira's connect request.
+    Only the nonce is stored: the secret is derived from SECRET_KEY and it, so a
+    copy of the database holds no usable credential. One per organization.
     """
 
-    __tablename__ = "askmira_connection"
+    __tablename__ = "askmira_org_connections"
 
-    id = Column(Integer, primary_key=True)
-    active_nonce = Column(String(64), nullable=True)
-    connected_at = Column(DateTime, nullable=True)
-    pending_nonce = Column(String(64), nullable=True)
-    pending_expires_at = Column(DateTime, nullable=True)
-    generated_by_user_id = Column(Integer, nullable=True)
+    organization_id = Column(
+        Integer, ForeignKey("organizations.id", ondelete="CASCADE"), primary_key=True
+    )
+    secret_nonce = Column(String(64), nullable=False)
+    #: Which AskMira workspace, as shown to the admin who allowed it.
+    askmira_name = Column(String(200), nullable=True)
+    askmira_origin = Column(String(300), nullable=True)
+    connected_at = Column(DateTime, nullable=False)
+    connected_by_user_id = Column(Integer, nullable=True)
+
+
+class AskmiraConnectCode(Base):
+    """A one-time code from "Allow", good for five minutes, swapped by AskMira's server.
+
+    Only its hash is kept. `challenge` is the SHA-256 of a verifier that only
+    AskMira's server holds (PKCE), so a code seen on its way through the browser
+    is useless on its own.
+    """
+
+    __tablename__ = "askmira_connect_codes"
+
+    code_hash = Column(String(64), primary_key=True)
+    organization_id = Column(Integer, nullable=False)
+    askmira_tenant_id = Column(String(36), nullable=False)
+    askmira_name = Column(String(200), nullable=True)
+    askmira_origin = Column(String(300), nullable=True)
+    challenge = Column(String(128), nullable=False)
+    user_id = Column(Integer, nullable=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    used_at = Column(DateTime, nullable=True)

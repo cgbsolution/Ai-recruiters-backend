@@ -6,15 +6,17 @@ here server to server to create (or adopt) the company's organization and to
 send who should have access; and it sends people here already signed in, with
 a one-time link, so they never need a second password.
 
-Every request carries a short-lived HS256 token signed with the shared secret
-(aud "askmira:interview", iss "askmira"). The secret comes from the connection
-the platform super admin made with a connection key ("Connection key" below),
-or else from ASKMIRA_SHARED_SECRET:
+Each AskMira workspace connects to one organization here, started by its admin
+in AskMira and allowed by an admin of the organization here ("Connecting"
+below); the connection has its own secret, which reaches that organization
+only. Every request carries a short-lived HS256 token signed with that secret
+(aud "askmira:interview", iss "askmira"), or, for a workspace linked the older
+way, with ASKMIRA_SHARED_SECRET:
 
   POST /integrations/askmira/organizations   use=provision, `bh` = SHA-256 of the body
   POST /integrations/askmira/users/sync      use=provision, `bh` = SHA-256 of the body
   POST /integrations/askmira/query           use=query, `bh` = SHA-256 of the body
-  POST /integrations/askmira/handshake       use=handshake, `bh`; accepts a pending key
+  POST /integrations/askmira/connect/revoke  use=revoke, `bh`; AskMira disconnected
   POST /auth/askmira/exchange                use=launch; each `jti` is accepted once
 
 `query` is read-only: AskMira's companion asks it on behalf of one person (see
@@ -26,12 +28,10 @@ they drop out of AskMira's roster; accounts made here are never touched.
 import base64
 import hashlib
 import hmac
-import json
 import logging
 import re
 import secrets
-import time
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -43,10 +43,10 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
-from app.auth import create_access_token, get_current_user, hash_password, is_global_admin
+from app.auth import create_access_token, get_current_user, hash_password
 from app.config import settings
 from app.database import SessionLocal, get_db
-from app.models.askmira import AskmiraConnection, AskmiraLaunch
+from app.models.askmira import AskmiraConnectCode, AskmiraLaunch, AskmiraOrgConnection
 from app.models.candidate import Candidate, CandidateStatus
 from app.models.interview import InterviewSession, SessionStatus
 from app.models.job import Job, JobStatus
@@ -66,56 +66,46 @@ _DOMAIN = re.compile(r"^[a-z0-9.-]+\.[a-z]{2,}$")
 
 
 # ── Token checks ─────────────────────────────────────────────────────────────
-
-# ── Connection key ───────────────────────────────────────────────────────────
 #
-# The platform super admin connects AskMira from the app, with no .env edit:
-# "Generate connection key" stores a random nonce as pending and hands out
-#
-#     amk1.<base64url JSON {"p": "interview", "api", "app", "s": secret, "exp"}>
-#
-# where the secret is derived from SECRET_KEY and the nonce, so the database
-# never holds it. AskMira's super admin pastes the key there; AskMira proves it
-# holds the secret with a signed handshake, and the pending nonce becomes the
-# active one. A new key replaces the connection only once its handshake lands.
-
-KEY_PREFIX = "amk1."
-KEY_LIFETIME = timedelta(minutes=30)
-_CONNECTION_ID = 1
-#: The active secret is looked up at most this often per process.
-_CACHE_SECONDS = 30.0
-_cache: dict = {"at": float("-inf"), "secret": None}
+# Each AskMira workspace connects to one organization here, by itself (see
+# "Connecting" below), and gets a secret of its own. A token is checked with
+# the secret of the workspace it names — `sub` on server-to-server calls, `tid`
+# on a sign-in link — so one workspace's secret can never act for another.
+# A workspace that has not connected that way falls back to
+# ASKMIRA_SHARED_SECRET, the older server-wide setting; with neither, the
+# endpoints behave as if they did not exist.
 
 
-def _derive(nonce: str) -> str:
-    message = f"askmira-connection:v1:{nonce}".encode()
+def _derive(organization_id: int, nonce: str) -> str:
+    """An organization's AskMira secret: derived, so the database holds only the nonce."""
+    message = f"askmira-org:v1:{organization_id}:{nonce}".encode()
     return hmac.new((settings.SECRET_KEY or "").encode(), message, hashlib.sha256).hexdigest()
 
 
-def _forget() -> None:
-    _cache.update(at=float("-inf"), secret=None)
+def _tenant_secret(db: Session, tenant_id: str) -> Optional[str]:
+    """The secret of the connection this AskMira workspace made, if it made one."""
+    if not tenant_id:
+        return None
+    try:
+        row = (
+            db.query(AskmiraOrgConnection)
+            .join(Organization, Organization.id == AskmiraOrgConnection.organization_id)
+            .filter(Organization.askmira_tenant_id == tenant_id)
+            .first()
+        )
+    except SQLAlchemyError:
+        # Before the migration has run: no connections made here.
+        db.rollback()
+        return None
+    return _derive(row.organization_id, row.secret_nonce) if row is not None else None
 
 
-def _connected_secret() -> Optional[str]:
-    """The secret of the connection made with a key, if there is one."""
-    now = time.monotonic()
-    if now - _cache["at"] < _CACHE_SECONDS:
-        return _cache["secret"]
+def _secret_for(tenant_id: str) -> str:
     db = SessionLocal()
     try:
-        row = db.get(AskmiraConnection, _CONNECTION_ID)
-        secret = _derive(row.active_nonce) if row is not None and row.active_nonce else None
-    except SQLAlchemyError:
-        # Before the migration has run: no connection made here.
-        secret = None
+        secret = _tenant_secret(db, tenant_id) or settings.ASKMIRA_SHARED_SECRET or ""
     finally:
         db.close()
-    _cache.update(at=now, secret=secret)
-    return secret
-
-
-def _secret() -> str:
-    secret = _connected_secret() or settings.ASKMIRA_SHARED_SECRET or ""
     if len(secret) < 32:
         # Off (or misconfigured): behave as if the endpoints did not exist.
         raise HTTPException(status_code=404, detail="Not Found")
@@ -124,9 +114,15 @@ def _secret() -> str:
 
 def _claims(token: str, use: str) -> dict:
     try:
-        claims = jwt.decode(
-            token, _secret(), algorithms=["HS256"], audience=AUDIENCE, issuer=ISSUER,
-        )
+        unverified = jwt.get_unverified_claims(token)
+    except JWTError:
+        _secret_for("")  # names no workspace: as if absent unless the older link is on
+        raise HTTPException(status_code=401, detail="This AskMira link is not valid or has expired.")
+    # Whose secret to check with: the workspace the token is for.
+    tenant_id = str(unverified.get("tid") if use == "launch" else unverified.get("sub") or "")
+    secret = _secret_for(tenant_id)
+    try:
+        claims = jwt.decode(token, secret, algorithms=["HS256"], audience=AUDIENCE, issuer=ISSUER)
     except JWTError:
         raise HTTPException(status_code=401, detail="This AskMira link is not valid or has expired.")
     if claims.get("use") != use:
@@ -138,13 +134,28 @@ async def _provision_claims(request: Request, use: str = "provision") -> tuple[d
     """AskMira's server-to-server assertion, bound to this exact body."""
     header = request.headers.get("authorization", "")
     if not header.lower().startswith("bearer "):
-        _secret()
+        await run_in_threadpool(_secret_for, "")  # as if absent where the link is off
         raise HTTPException(status_code=401, detail="Missing AskMira assertion.")
     body = await request.body()
-    claims = _claims(header[7:].strip(), use)
+    claims = await run_in_threadpool(_claims, header[7:].strip(), use)
     if not hmac.compare_digest(str(claims.get("bh", "")), hashlib.sha256(body).hexdigest()):
         raise HTTPException(status_code=401, detail="The assertion does not match this request.")
     return claims, body
+
+
+# ── Connecting (from AskMira, by an admin of this organization) ─────────────
+#
+# Like "Sign in with…": an admin of a workspace in AskMira presses Connect
+# there, lands on /connect/askmira here, signs in and presses Allow. That makes
+# a one-time code bound to their organization and to a challenge only AskMira's
+# server can answer (PKCE); AskMira's server swaps code + verifier for the
+# organization's own secret (/connect/token). The secret reaches only that one
+# organization's records, and either side can disconnect.
+
+CODE_LIFETIME = timedelta(minutes=5)
+CALLBACK_PATH = "/settings/connectors/callback"
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_PKCE = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
 
 
 def _now() -> datetime:
@@ -155,146 +166,194 @@ def _iso_or_none(value: Optional[datetime]) -> Optional[str]:
     return value.replace(tzinfo=timezone.utc).isoformat() if value else None
 
 
-def _platform_admin(user: User = Depends(get_current_user)) -> User:
-    if not is_global_admin(user):
-        raise HTTPException(status_code=403, detail="Only the platform super admin connects AskMira.")
+def _hash(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _org_admin(user: User = Depends(get_current_user)) -> User:
+    """An admin (or super admin) of an organization: the one they connect."""
+    if user.role not in (UserRole.admin, UserRole.super_admin) or user.organization_id is None:
+        raise HTTPException(
+            status_code=403, detail="Only an admin of an organization connects it to AskMira."
+        )
     return user
 
 
-def _address(value: str, what: str) -> str:
-    text = (value or "").strip().rstrip("/")
-    parsed = urlparse(text)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise HTTPException(status_code=422, detail=f"The {what} must be a web address.")
-    if parsed.scheme == "http" and parsed.hostname not in ("localhost", "127.0.0.1"):
-        raise HTTPException(status_code=422, detail=f"The {what} must use https.")
-    return text
+def _askmira_origin(redirect_uri: str) -> str:
+    """The AskMira that is asking, from where it wants the answer sent; refuses anything odd."""
+    parsed = urlparse(redirect_uri or "")
+    local = parsed.hostname in ("localhost", "127.0.0.1")
+    if (
+        parsed.scheme not in ("https", "http")
+        or (parsed.scheme == "http" and not local)
+        or not parsed.hostname
+        or parsed.path.rstrip("/") != CALLBACK_PATH
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(status_code=422, detail="That is not an AskMira connect link.")
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    allowed = [o.strip().rstrip("/") for o in settings.ASKMIRA_ALLOWED_ORIGINS.split(",") if o.strip()]
+    if allowed and origin not in allowed:
+        raise HTTPException(status_code=403, detail="This AskMira is not one this server connects to.")
+    return origin
 
 
-def _connection_read(row: Optional[AskmiraConnection]) -> dict:
-    by_key = row is not None and bool(row.active_nonce)
-    by_env = len(settings.ASKMIRA_SHARED_SECRET or "") >= 32
-    pending = bool(
-        row is not None and row.pending_nonce and row.pending_expires_at
-        and row.pending_expires_at > _now()
-    )
+def _connection_read(db: Session, org: Organization) -> dict:
+    row = db.get(AskmiraOrgConnection, org.id)
     return {
-        "connected": by_key or by_env,
-        "source": "key" if by_key else "environment" if by_env else None,
-        "connected_at": _iso_or_none(row.connected_at) if by_key else None,
-        "pending_until": _iso_or_none(row.pending_expires_at) if pending else None,
+        "organization": org.name,
+        "connected": row is not None,
+        "askmira_workspace": row.askmira_name if row else None,
+        "askmira_origin": row.askmira_origin if row else None,
+        "connected_at": _iso_or_none(row.connected_at) if row else None,
     }
 
 
-class ConnectionKeyIn(BaseModel):
-    #: This server's API, as AskMira will call it.
-    api_url: str = Field(min_length=8, max_length=500)
-    #: This product's web app, where AskMira sends people signed in.
-    app_url: str = Field(min_length=8, max_length=500)
+@integration_router.get("/my-connection")
+def my_connection(user: User = Depends(_org_admin), db: Session = Depends(get_db)):
+    """Whether the caller's organization is connected to an AskMira workspace, and which."""
+    org = db.get(Organization, user.organization_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Your organization was not found.")
+    return _connection_read(db, org)
 
 
-@integration_router.get("/connection")
-def connection_status(_: User = Depends(_platform_admin), db: Session = Depends(get_db)):
-    """Whether AskMira is connected to this server, and how."""
-    return _connection_read(db.get(AskmiraConnection, _CONNECTION_ID))
+class ApproveIn(BaseModel):
+    tenant_id: str = Field(min_length=36, max_length=36)
+    tenant_name: str = Field(min_length=1, max_length=200)
+    redirect_uri: str = Field(min_length=10, max_length=500)
+    state: str = Field(min_length=10, max_length=2000)
+    challenge: str = Field(min_length=43, max_length=128)
 
 
-@integration_router.post("/connection-key")
-def generate_connection_key(
-    payload: ConnectionKeyIn, user: User = Depends(_platform_admin), db: Session = Depends(get_db),
-):
-    """A key, good for 30 minutes, for AskMira's super admin to paste in its console."""
+@integration_router.post("/connect/approve")
+def approve_connection(payload: ApproveIn, user: User = Depends(_org_admin), db: Session = Depends(get_db)):
+    """The admin pressed Allow: a one-time code for AskMira, bound to their organization."""
     if settings.secret_key_is_weak:
+        raise HTTPException(status_code=409, detail="Set a strong SECRET_KEY on this server first.")
+    tenant_id = payload.tenant_id.lower()
+    if not _UUID.match(tenant_id) or not _PKCE.match(payload.challenge):
+        raise HTTPException(status_code=422, detail="That is not an AskMira connect link.")
+    origin = _askmira_origin(payload.redirect_uri)
+    org = db.get(Organization, user.organization_id)
+    if org is None or not org.is_active:
+        raise HTTPException(status_code=403, detail="Your organization is not active.")
+    if org.askmira_tenant_id and org.askmira_tenant_id != tenant_id:
         raise HTTPException(
             status_code=409,
-            detail="Set a strong SECRET_KEY on this server before connecting AskMira.",
+            detail="Your organization is already connected to another AskMira workspace. Disconnect it first.",
         )
-    api_url = _address(payload.api_url, "server address")
-    app_url = _address(payload.app_url, "app address")
-    nonce = secrets.token_urlsafe(32)
-    expires = _now() + KEY_LIFETIME
-    row = db.get(AskmiraConnection, _CONNECTION_ID)
-    if row is None:
-        row = AskmiraConnection(id=_CONNECTION_ID)
-        db.add(row)
-    row.pending_nonce = nonce
-    row.pending_expires_at = expires
-    row.generated_by_user_id = user.id
+    taken = (
+        db.query(Organization)
+        .filter(Organization.askmira_tenant_id == tenant_id, Organization.id != org.id)
+        .first()
+    )
+    if taken is not None:
+        raise HTTPException(
+            status_code=409, detail="That AskMira workspace is already connected to another organization here."
+        )
+    code = secrets.token_urlsafe(32)
+    db.query(AskmiraConnectCode).filter(AskmiraConnectCode.expires_at < _now()).delete()
+    db.add(AskmiraConnectCode(
+        code_hash=_hash(code),
+        organization_id=org.id,
+        askmira_tenant_id=tenant_id,
+        askmira_name=payload.tenant_name.strip()[:200],
+        askmira_origin=origin,
+        challenge=payload.challenge,
+        user_id=user.id,
+        expires_at=_now() + CODE_LIFETIME,
+    ))
     db.commit()
-    body = {
-        "p": "interview",
-        "api": api_url,
-        "app": app_url,
-        "s": _derive(nonce),
-        "exp": int(expires.replace(tzinfo=timezone.utc).timestamp()),
-    }
-    encoded = base64.urlsafe_b64encode(json.dumps(body, separators=(",", ":")).encode()).decode()
-    logger.info("[AskMira] connection key generated by user %s", user.id)
-    return {"key": KEY_PREFIX + encoded.rstrip("="), "expires_at": _iso_or_none(expires)}
+    logger.info("[AskMira] org %s approved a connection to workspace %s at %s", org.id, tenant_id, origin)
+    query = urlencode({"code": code, "state": payload.state, "product": "interview"})
+    return {"redirect_to": f"{payload.redirect_uri.rstrip('/')}?{query}"}
 
 
-@integration_router.delete("/connection")
-def disconnect(user: User = Depends(_platform_admin), db: Session = Depends(get_db)):
-    """Forget the connection made with a key. ASKMIRA_SHARED_SECRET, if set, takes over."""
-    row = db.get(AskmiraConnection, _CONNECTION_ID)
-    if row is not None:
-        row.active_nonce = None
-        row.connected_at = None
-        row.pending_nonce = None
-        row.pending_expires_at = None
-        db.commit()
-    _forget()
-    logger.info("[AskMira] connection removed by user %s", user.id)
-    return _connection_read(row)
+class TokenIn(BaseModel):
+    code: str = Field(min_length=20, max_length=200)
+    verifier: str = Field(min_length=43, max_length=128)
+    tenant_id: str = Field(min_length=36, max_length=36)
 
 
-def _handshake(token: str, body: bytes) -> dict:
-    db = SessionLocal()
+@integration_router.post("/connect/token")
+def connect_token(payload: TokenIn, db: Session = Depends(get_db)):
+    """AskMira's server swaps the code (and the verifier only it holds) for the organization's secret."""
+    row = db.get(AskmiraConnectCode, _hash(payload.code))
+    refused = HTTPException(status_code=400, detail="This connect code is not valid or has expired.")
+    if row is None or row.used_at is not None or row.expires_at < _now():
+        raise refused
+    row.used_at = _now()  # one use, whatever happens next
+    db.commit()
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(payload.verifier.encode()).digest()).decode().rstrip("=")
+    if row.askmira_tenant_id != payload.tenant_id.lower() or not hmac.compare_digest(challenge, row.challenge):
+        raise refused
+    org = db.get(Organization, row.organization_id)
+    if org is None or not org.is_active:
+        raise HTTPException(status_code=403, detail="That organization is not active.")
+    nonce = secrets.token_urlsafe(32)
+    connection = db.get(AskmiraOrgConnection, org.id) or AskmiraOrgConnection(organization_id=org.id)
+    connection.secret_nonce = nonce
+    connection.askmira_name = row.askmira_name
+    connection.askmira_origin = row.askmira_origin
+    connection.connected_at = _now()
+    connection.connected_by_user_id = row.user_id
+    db.add(connection)
+    org.askmira_tenant_id = row.askmira_tenant_id
     try:
-        row = db.get(AskmiraConnection, _CONNECTION_ID)
-        candidates: list[tuple[str, str]] = []
-        if (
-            row is not None and row.pending_nonce and row.pending_expires_at
-            and row.pending_expires_at > _now()
-        ):
-            candidates.append(("pending", _derive(row.pending_nonce)))
-        _forget()
-        current = _connected_secret() or settings.ASKMIRA_SHARED_SECRET or ""
-        if len(current) >= 32:
-            candidates.append(("current", current))
-        if not candidates:
-            raise HTTPException(status_code=404, detail="Not Found")
-        for kind, secret in candidates:
-            try:
-                claims = jwt.decode(token, secret, algorithms=["HS256"], audience=AUDIENCE, issuer=ISSUER)
-            except JWTError:
-                continue
-            if claims.get("use") != "handshake" or not hmac.compare_digest(
-                str(claims.get("bh", "")), hashlib.sha256(body).hexdigest()
-            ):
-                raise HTTPException(status_code=401, detail="The assertion does not match this request.")
-            if kind == "pending":
-                row.active_nonce = row.pending_nonce
-                row.connected_at = _now()
-                row.pending_nonce = None
-                row.pending_expires_at = None
-                db.commit()
-                _forget()
-                logger.info("[AskMira] connected with a connection key")
-            return {"product": "interview", "brand": "AnytimeHire"}
-        raise HTTPException(status_code=401, detail="This AskMira link is not valid or has expired.")
-    finally:
-        db.close()
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="That AskMira workspace is already connected to another organization here."
+        )
+    logger.info("[AskMira] org %s connected to workspace %s", org.id, row.askmira_tenant_id)
+    return {
+        "product": "interview",
+        "brand": "AnytimeHire",
+        "secret": _derive(org.id, nonce),
+        "external_ref": str(org.id),
+        "organization": org.name,
+    }
 
 
-@integration_router.post("/handshake")
-async def handshake(request: Request):
-    """AskMira proves it holds a connection key's secret; a pending key becomes active."""
-    header = request.headers.get("authorization", "")
-    if not header.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing AskMira assertion.")
-    body = await request.body()
-    return await run_in_threadpool(_handshake, header[7:].strip(), body)
+def _forget_connection(db: Session, org: Organization) -> None:
+    row = db.get(AskmiraOrgConnection, org.id)
+    if row is not None:
+        db.delete(row)
+    org.askmira_tenant_id = None
+    db.commit()
+
+
+@integration_router.delete("/my-connection")
+def disconnect_mine(user: User = Depends(_org_admin), db: Session = Depends(get_db)):
+    """Disconnect from this side: AskMira's secret for this organization stops working at once."""
+    org = db.get(Organization, user.organization_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Your organization was not found.")
+    _forget_connection(db, org)
+    logger.info("[AskMira] org %s disconnected by user %s", org.id, user.id)
+    return _connection_read(db, org)
+
+
+@integration_router.post("/connect/revoke")
+async def revoke_connection(request: Request):
+    """AskMira disconnected: forget this workspace's secret here too."""
+    claims, _ = await _provision_claims(request, use="revoke")
+
+    def run() -> dict:
+        db = SessionLocal()
+        try:
+            org = db.query(Organization).filter(Organization.askmira_tenant_id == claims["sub"]).first()
+            if org is not None:
+                _forget_connection(db, org)
+                logger.info("[AskMira] org %s disconnected from AskMira", org.id)
+            return {"disconnected": True}
+        finally:
+            db.close()
+
+    return await run_in_threadpool(run)
 
 
 # ── Organizations ────────────────────────────────────────────────────────────

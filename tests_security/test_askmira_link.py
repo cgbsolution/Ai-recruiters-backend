@@ -369,76 +369,131 @@ def test_query_refuses_strangers_other_workspaces_and_other_tokens(client):
     assert _query(client, tenant, hr, "jobs").status_code == 403
 
 
-# ── Connection key (no .env edit) ────────────────────────────────────────────
+# ── Connecting from AskMira, per organization ───────────────────────────────
 
-def _decode_key(key):
+CALLBACK = "https://askmira.test/settings/connectors/callback"
+
+
+def _pkce():
     import base64
-    body = key.removeprefix("amk1.")
-    return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    return verifier, challenge
 
 
-def _handshake(client, secret):
-    body = json.dumps({"product": "interview", "from": "askmira"}).encode()
-    token = _token("handshake", "askmira", secret=secret, bh=hashlib.sha256(body).hexdigest())
-    return client.post(
-        "/integrations/askmira/handshake", content=body,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-    )
+def _approve(client, headers, tenant, challenge, redirect_uri=CALLBACK):
+    return client.post("/integrations/askmira/connect/approve", headers=headers, json={
+        "tenant_id": tenant, "tenant_name": "CGB Solutions", "redirect_uri": redirect_uri,
+        "state": "opaque-state-from-askmira", "challenge": challenge,
+    })
 
 
-def test_connection_key_connects_askmira_without_env(client, world, monkeypatch):
-    monkeypatch.setattr(settings, "ASKMIRA_SHARED_SECRET", "")
-    addresses = {"api_url": "https://api.anytimehire.test", "app_url": "https://app.anytimehire.test"}
-    # Only the platform super admin may generate one.
-    assert client.post("/integrations/askmira/connection-key", json=addresses,
-                       headers=world.admin_a).status_code == 403
-    assert client.get("/integrations/askmira/connection", headers=world.root).json()["connected"] is False
+def _connect(client, headers, tenant):
+    """Allow, then swap the code as AskMira's server would. Returns the secret."""
+    from urllib.parse import parse_qs, urlparse
+    verifier, challenge = _pkce()
+    allowed = _approve(client, headers, tenant, challenge)
+    assert allowed.status_code == 200, allowed.text
+    query = parse_qs(urlparse(allowed.json()["redirect_to"]).query)
+    assert query["state"] == ["opaque-state-from-askmira"] and query["product"] == ["interview"]
+    swapped = client.post("/integrations/askmira/connect/token",
+                          json={"code": query["code"][0], "verifier": verifier, "tenant_id": tenant})
+    assert swapped.status_code == 200, swapped.text
+    return swapped.json()
 
-    made = client.post("/integrations/askmira/connection-key", json=addresses, headers=world.root)
-    assert made.status_code == 200, made.text
-    key = _decode_key(made.json()["key"])
-    assert key["p"] == "interview" and key["api"] == addresses["api_url"] and len(key["s"]) >= 32
+
+def _fresh_org():
+    """An organization of its own, and its admin's headers: tests here connect and disconnect."""
+    from app.auth import create_access_token
     with SessionLocal() as db:
-        from app.models.askmira import AskmiraConnection
-        row = db.get(AskmiraConnection, 1)
-        assert row.pending_nonce and key["s"] not in (row.pending_nonce or "")  # the secret is never stored
+        org = Organization(name=f"Conn {uuid.uuid4().hex[:6]}", domain=f"conn-{uuid.uuid4().hex[:8]}.test",
+                           is_active=True)
+        db.add(org)
+        db.flush()
+        admin = User(name="Org Admin", email=f"admin-{uuid.uuid4().hex[:8]}@{org.domain}",
+                     password_hash=hash_password("x" * 12), role=UserRole.admin,
+                     organization_id=org.id, is_active=True)
+        db.add(admin)
+        db.commit()
+        token = create_access_token(admin.id, admin.role.value, admin.organization_id)
+        return org.id, {"Authorization": f"Bearer {token}"}
 
-    # Pending only: provisioning is not accepted with it yet.
-    tenant = str(uuid.uuid4())
-    assert _provision(client, "/organizations", _company(tenant), secret=key["s"]).status_code == 404
 
-    assert _handshake(client, "a-secret-this-server-never-issued-0123456789").status_code == 401
-    done = _handshake(client, key["s"])
-    assert done.status_code == 200 and done.json()["product"] == "interview"
-    status = client.get("/integrations/askmira/connection", headers=world.root).json()
-    assert status["connected"] is True and status["source"] == "key" and status["pending_until"] is None
+def _sync(client, tenant, secret, users):
+    return _provision(client, "/users/sync", {"tenant_id": tenant, "complete": True, "users": users},
+                      secret=secret)
 
-    created = _provision(client, "/organizations", _company(tenant), secret=key["s"])
-    assert created.status_code == 200, created.text
-    # Checking again later with the active secret works, and changes nothing.
-    assert _handshake(client, key["s"]).status_code == 200
 
-    gone = client.delete("/integrations/askmira/connection", headers=world.root)
+def test_an_org_admin_connects_and_the_secret_reaches_only_that_org(client, world):
+    tenant, other = str(uuid.uuid4()), str(uuid.uuid4())
+    org_id, admin = _fresh_org()
+    me = client.get("/integrations/askmira/my-connection", headers=admin).json()
+    assert me["connected"] is False
+
+    made = _connect(client, admin, tenant)
+    assert made["external_ref"] == str(org_id) and len(made["secret"]) >= 32
+    secret = made["secret"]
+    with SessionLocal() as db:
+        from app.models.askmira import AskmiraOrgConnection
+        row = db.get(AskmiraOrgConnection, org_id)
+        assert row.askmira_name == "CGB Solutions" and secret not in row.secret_nonce  # never stored
+        assert db.get(Organization, org_id).askmira_tenant_id == tenant
+
+    people = [{"id": str(uuid.uuid4()), "email": f"hire-{uuid.uuid4().hex[:6]}@conn-test.com", "name": "HR",
+               "role": "admin"}]
+    assert _sync(client, tenant, secret, people).status_code == 200
+    # The server-wide secret no longer speaks for a workspace that connected itself…
+    assert _sync(client, tenant, SECRET, people).status_code == 401
+    # …and this workspace's secret can't speak for any other.
+    assert _sync(client, other, secret, people).status_code == 401
+
+    status = client.get("/integrations/askmira/my-connection", headers=admin).json()
+    assert status["connected"] is True and status["askmira_origin"] == "https://askmira.test"
+
+    # Disconnected here: the secret stops working at once.
+    gone = client.delete("/integrations/askmira/my-connection", headers=admin)
     assert gone.status_code == 200 and gone.json()["connected"] is False
-    assert _provision(client, "/organizations", _company(tenant), secret=key["s"]).status_code == 404
+    assert _sync(client, tenant, secret, people).status_code == 401
 
 
-def test_a_new_key_replaces_the_connection_only_once_its_handshake_lands(client, world):
-    addresses = {"api_url": "https://api.anytimehire.test", "app_url": "https://app.anytimehire.test"}
-    first = _decode_key(client.post("/integrations/askmira/connection-key", json=addresses,
-                                    headers=world.root).json()["key"])
-    assert _handshake(client, first["s"]).status_code == 200
-    second = _decode_key(client.post("/integrations/askmira/connection-key", json=addresses,
-                                     headers=world.root).json()["key"])
+def test_a_code_is_one_use_and_useless_without_the_verifier(client, world):
+    from urllib.parse import parse_qs, urlparse
     tenant = str(uuid.uuid4())
-    # Until AskMira uses the new key, the old one still works.
-    assert _provision(client, "/organizations", _company(tenant), secret=first["s"]).status_code == 200
-    assert _handshake(client, second["s"]).status_code == 200
-    assert _provision(client, "/organizations", _company(tenant), secret=first["s"]).status_code == 401
-    assert _provision(client, "/organizations", _company(tenant), secret=second["s"]).status_code == 200
-    client.delete("/integrations/askmira/connection", headers=world.root)
+    org_id, admin = _fresh_org()
+    verifier, challenge = _pkce()
+    code = parse_qs(urlparse(_approve(client, admin, tenant, challenge).json()["redirect_to"]).query)["code"][0]
+    swap = lambda v, t=tenant: client.post(  # noqa: E731
+        "/integrations/askmira/connect/token", json={"code": code, "verifier": v, "tenant_id": t})
+    assert swap(secrets.token_urlsafe(48)).status_code == 400  # wrong verifier burns the code
+    assert swap(verifier).status_code == 400
+    with SessionLocal() as db:
+        assert db.get(Organization, org_id).askmira_tenant_id is None
 
 
-def test_connection_key_refuses_plain_http_off_localhost(client, world):
-    bad = {"api_url": "http://api.anytimehire.test", "app_url": "https://app.anytimehire.test"}
-    assert client.post("/integrations/askmira/connection-key", json=bad, headers=world.root).status_code == 422
+def test_only_an_org_admin_may_allow_and_only_to_an_askmira_callback(client, world):
+    tenant = str(uuid.uuid4())
+    _, challenge = _pkce()
+    assert _approve(client, world.orphan, tenant, challenge).status_code == 403  # recruiter, no org
+    assert _approve(client, world.root, tenant, challenge).status_code == 403  # no organization to give
+    for bad in ("http://askmira.test/settings/connectors/callback",  # plain http off localhost
+                "https://evil.test/steal",  # not AskMira's callback
+                "https://askmira.test/settings/connectors/callback?next=//evil.test"):
+        assert _approve(client, world.admin_b, tenant, challenge, redirect_uri=bad).status_code == 422, bad
+
+
+def test_an_org_connects_to_one_workspace_and_askmira_can_revoke(client, world):
+    tenant = str(uuid.uuid4())
+    _, admin = _fresh_org()
+    secret = _connect(client, admin, tenant)["secret"]
+    _, challenge = _pkce()
+    assert _approve(client, admin, str(uuid.uuid4()), challenge).status_code == 409
+    # Nor may a second organization take a workspace that is already connected.
+    _, someone_else = _fresh_org()
+    assert _approve(client, someone_else, tenant, challenge).status_code == 409
+
+    body = json.dumps({"tenant_id": tenant}).encode()
+    revoke = _token("revoke", tenant, secret=secret, bh=hashlib.sha256(body).hexdigest())
+    done = client.post("/integrations/askmira/connect/revoke", content=body,
+                       headers={"Authorization": f"Bearer {revoke}", "Content-Type": "application/json"})
+    assert done.status_code == 200
+    assert client.get("/integrations/askmira/my-connection", headers=admin).json()["connected"] is False

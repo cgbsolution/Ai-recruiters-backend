@@ -97,10 +97,14 @@ class Settings(BaseSettings):
         return len(key) < 32 or key.lower().startswith("change-me") or "your-secret" in key.lower()
 
     # ── AskMira (HRMS) link ──────────────────────────────────────────────────
-    # The secret this product shares with AskMira (AskMira's INTERVIEW_TOOL_SECRET).
-    # It signs AskMira's provisioning calls and sign-in links (app.routers.askmira).
-    # Empty = the link is off and those endpoints answer 404.
+    # The older, server-wide secret shared with AskMira (AskMira's INTERVIEW_TOOL_SECRET),
+    # for workspaces linked before per-organization connections. A workspace that
+    # connected from AskMira's Connectors uses its own secret instead.
     ASKMIRA_SHARED_SECRET: str = ""
+    # Optional: the AskMira web addresses allowed to connect an organization here
+    # (comma-separated, e.g. "https://app.askmira.in"). Empty = any https AskMira,
+    # named on the approval page so the admin sees who is asking.
+    ASKMIRA_ALLOWED_ORIGINS: str = ""
 
     # ── Email / SMTP ─────────────────────────────────────────────────────────
     SMTP_HOST: str = ""
