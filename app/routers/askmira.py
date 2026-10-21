@@ -827,12 +827,14 @@ def _answer(question: QueryIn) -> dict:
             )
         email = question.actor.email.lower()
         user = db.query(User).filter(func.lower(User.email) == email).first()
+        # Read-only and limited to this organization's records, so a super admin
+        # who belongs to it may ask too (they see the same records here).
         if (
             ROLES.get(question.actor.role) is None
             or user is None
             or user.organization_id != org.id
             or not user.is_active
-            or user.role not in (UserRole.admin, UserRole.recruiter)
+            or user.role not in (UserRole.admin, UserRole.recruiter, UserRole.super_admin)
         ):
             raise HTTPException(
                 status_code=403,
@@ -907,7 +909,15 @@ def exchange(body: ExchangeIn, db: Session = Depends(get_db)):
         )
         db.add(user)
     else:
-        if user.organization_id != org.id or user.role == UserRole.super_admin:
+        if user.role == UserRole.super_admin:
+            # A sign-in link from AskMira never opens a platform super admin session:
+            # that power is managed here, with this tool's own password.
+            raise HTTPException(
+                status_code=403,
+                detail="You are a super admin in AnytimeHire. Sign in to AnytimeHire directly "
+                "with your password; AskMira's sign-in link is for your team.",
+            )
+        if user.organization_id != org.id:
             raise HTTPException(
                 status_code=409,
                 detail="This email already has an account with another organization here.",

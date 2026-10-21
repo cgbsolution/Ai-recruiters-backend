@@ -497,3 +497,30 @@ def test_an_org_connects_to_one_workspace_and_askmira_can_revoke(client, world):
                        headers={"Authorization": f"Bearer {revoke}", "Content-Type": "application/json"})
     assert done.status_code == 200
     assert client.get("/integrations/askmira/my-connection", headers=admin).json()["connected"] is False
+
+
+def test_a_super_admin_of_the_connected_org_can_read_it_but_never_sign_in_from_askmira(client, world):
+    tenant = str(uuid.uuid4())
+    org_id, admin = _fresh_org()
+    secret = _connect(client, admin, tenant)["secret"]
+    with SessionLocal() as db:
+        owner = User(name="Owner", email=f"owner-{uuid.uuid4().hex[:6]}@conn-test.com",
+                     password_hash=hash_password("x" * 12), role=UserRole.super_admin,
+                     organization_id=org_id, is_active=True)
+        db.add(owner)
+        db.commit()
+        owner_email = owner.email
+
+    def ask(email):
+        payload = {"tenant_id": tenant, "actor": {"id": str(uuid.uuid4()), "email": email, "role": "admin"},
+                   "kind": "jobs", "params": {}}
+        body = json.dumps(payload).encode()
+        tok = _token("query", tenant, secret=secret, bh=hashlib.sha256(body).hexdigest())
+        return client.post("/integrations/askmira/query", content=body,
+                           headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
+
+    assert ask(owner_email).status_code == 200  # reads this organization's jobs
+    launch = _token("launch", str(uuid.uuid4()), secret=secret, tid=tenant, ext=str(org_id),
+                    email=owner_email, name="Owner", role="admin")
+    refused = client.post("/auth/askmira/exchange", json={"token": launch})
+    assert refused.status_code == 403 and "Sign in to AnytimeHire directly" in refused.json()["detail"]
