@@ -312,6 +312,7 @@ def refresh_session(
         "access_token": create_access_token(
             user.id, user.role.value, org_id=user.organization_id,
             password_hash=user.password_hash, auth_time=int(auth_time),
+            scope=payload.get("scope"),
         ),
         "token_type": "bearer",
         "expires_in": settings.SESSION_TIMEOUT_MINUTES * 60,

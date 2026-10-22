@@ -11,6 +11,7 @@ import bcrypt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -68,13 +69,19 @@ def password_fingerprint(password_hash: Optional[str]) -> str:
     ).hexdigest()[:24]
 
 
+#: A session that acts as an admin of the user's own organization only, whatever
+#: their role: how a super admin is signed in from AskMira (app.routers.askmira).
+ORG_SCOPE = "org"
+
+
 def create_access_token(
     user_id: int, role: str, org_id: Optional[int] = None, password_hash: Optional[str] = None,
-    auth_time: Optional[int] = None,
+    auth_time: Optional[int] = None, scope: Optional[str] = None,
 ) -> str:
     """`auth_time` (epoch seconds) is when the password was entered. A renewed
     token (POST /auth/refresh) carries the original one forward, which is what
-    SESSION_MAX_LIFETIME_DAYS is measured from."""
+    SESSION_MAX_LIFETIME_DAYS is measured from. So does `scope`: a renewed
+    organization-scoped session must stay scoped."""
     expire = datetime.utcnow() + timedelta(minutes=settings.SESSION_TIMEOUT_MINUTES)
     payload = {
         "sub": str(user_id),
@@ -86,6 +93,8 @@ def create_access_token(
         payload["org_id"] = org_id
     if password_hash:
         payload["pwf"] = password_fingerprint(password_hash)
+    if scope:
+        payload["scope"] = scope
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=ALGORITHM)
 
 
@@ -133,6 +142,18 @@ def get_current_user(
             detail="Your password was changed. Please sign in again.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    # An organization-scoped session (a super admin signed in from AskMira) acts
+    # as an admin of their own organization only: every role check below and in
+    # the routes sees "admin", so nothing platform-wide is reachable with it. The
+    # account itself is untouched — set_committed_value is never written back.
+    if payload.get("scope") == ORG_SCOPE and user.role == UserRole.super_admin:
+        if user.organization_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="This session is not valid. Please sign in again.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        set_committed_value(user, "role", UserRole.admin)
     # Tenant users must belong to an ACTIVE organization. Suspending a tenant
     # (Organization.is_active=False) previously had no effect on live tokens,
     # and deleting an org left its users with organization_id=NULL — which

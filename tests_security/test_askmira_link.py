@@ -499,7 +499,7 @@ def test_an_org_connects_to_one_workspace_and_askmira_can_revoke(client, world):
     assert client.get("/integrations/askmira/my-connection", headers=admin).json()["connected"] is False
 
 
-def test_a_super_admin_of_the_connected_org_can_read_it_but_never_sign_in_from_askmira(client, world):
+def test_a_super_admin_of_the_connected_org_reads_it_and_signs_in_as_its_admin_only(client, world):
     tenant = str(uuid.uuid4())
     org_id, admin = _fresh_org()
     secret = _connect(client, admin, tenant)["secret"]
@@ -520,7 +520,33 @@ def test_a_super_admin_of_the_connected_org_can_read_it_but_never_sign_in_from_a
                            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
 
     assert ask(owner_email).status_code == 200  # reads this organization's jobs
+
     launch = _token("launch", str(uuid.uuid4()), secret=secret, tid=tenant, ext=str(org_id),
                     email=owner_email, name="Owner", role="admin")
-    refused = client.post("/auth/askmira/exchange", json={"token": launch})
-    assert refused.status_code == 403 and "Sign in to AnytimeHire directly" in refused.json()["detail"]
+    signed_in = client.post("/auth/askmira/exchange", json={"token": launch})
+    assert signed_in.status_code == 200, signed_in.text
+    assert signed_in.json()["user"]["role"] == "admin"
+    scoped = {"Authorization": f"Bearer {signed_in.json()['access_token']}"}
+
+    # The session acts as an admin of this organization only.
+    assert client.get("/auth/me", headers=scoped).json()["role"] == "admin"
+    assert client.get("/integrations/askmira/my-connection", headers=scoped).status_code == 200
+    assert client.get("/organizations/", headers=scoped).status_code == 403  # platform-wide: no
+    # Renewing keeps it scoped: it never turns back into a super admin session.
+    renewed = client.post("/auth/refresh", headers=scoped)
+    assert renewed.status_code == 200
+    again = {"Authorization": f"Bearer {renewed.json()['access_token']}"}
+    assert client.get("/organizations/", headers=again).status_code == 403
+    assert client.get("/auth/me", headers=again).json()["role"] == "admin"
+    # The account itself is untouched: with its own password it is still a super admin.
+    with SessionLocal() as db:
+        owner = db.query(User).filter(User.email == owner_email).one()
+        assert owner.role == UserRole.super_admin and owner.askmira_user_id is None
+        from app.auth import create_access_token
+        full = {"Authorization": f"Bearer {create_access_token(owner.id, 'super_admin', owner.organization_id)}"}
+    assert client.get("/organizations/", headers=full).status_code == 200
+
+    # A super admin of no organization (or another one) is never signed in from AskMira.
+    root_launch = _token("launch", str(uuid.uuid4()), secret=secret, tid=tenant, ext=str(org_id),
+                         email="root@platform.test", name="Root", role="admin")
+    assert client.post("/auth/askmira/exchange", json={"token": root_launch}).status_code == 409

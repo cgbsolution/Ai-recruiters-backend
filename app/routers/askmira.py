@@ -43,7 +43,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
-from app.auth import create_access_token, get_current_user, hash_password
+from app.auth import ORG_SCOPE, create_access_token, get_current_user, hash_password
 from app.config import settings
 from app.database import SessionLocal, get_db
 from app.models.askmira import AskmiraConnectCode, AskmiraLaunch, AskmiraOrgConnection
@@ -894,6 +894,7 @@ def exchange(body: ExchangeIn, db: Session = Depends(get_db)):
     if not email or role is None:
         raise HTTPException(status_code=403, detail="AskMira did not give you a role in this tool.")
 
+    scope = None  # set for a super admin of this organization (below)
     user = db.query(User).filter(User.email == email).first()
     if user is None:
         # Joined since the last sync: let them in now; the next sync confirms it.
@@ -909,14 +910,6 @@ def exchange(body: ExchangeIn, db: Session = Depends(get_db)):
         )
         db.add(user)
     else:
-        if user.role == UserRole.super_admin:
-            # A sign-in link from AskMira never opens a platform super admin session:
-            # that power is managed here, with this tool's own password.
-            raise HTTPException(
-                status_code=403,
-                detail="You are a super admin in AnytimeHire. Sign in to AnytimeHire directly "
-                "with your password; AskMira's sign-in link is for your team.",
-            )
         if user.organization_id != org.id:
             raise HTTPException(
                 status_code=409,
@@ -924,15 +917,26 @@ def exchange(body: ExchangeIn, db: Session = Depends(get_db)):
             )
         if not user.is_active:
             raise HTTPException(status_code=403, detail="Your account here has been switched off.")
-        user.role = role
-        user.askmira_user_id = str(claims.get("sub"))
+        if user.role == UserRole.super_admin:
+            # A super admin of this organization gets a session that acts as an
+            # admin of it only (app.auth.ORG_SCOPE): never the platform-wide power,
+            # which needs this tool's own password. Their account is left as it is.
+            scope = ORG_SCOPE
+        else:
+            user.role = role
+            user.askmira_user_id = str(claims.get("sub"))
     db.commit()
     db.refresh(user)
+    acting_role = UserRole.admin if scope else user.role
 
-    logger.info("[AskMira] %s signed in from AskMira (org %s)", user.email, org.id)
+    logger.info(
+        "[AskMira] %s signed in from AskMira (org %s%s)",
+        user.email, org.id, ", as an admin of it only" if scope else "",
+    )
     return {
         "access_token": create_access_token(
-            user.id, user.role.value, org_id=user.organization_id, password_hash=user.password_hash
+            user.id, acting_role.value, org_id=user.organization_id,
+            password_hash=user.password_hash, scope=scope,
         ),
         "token_type": "bearer",
         "expires_in": settings.SESSION_TIMEOUT_MINUTES * 60,
@@ -940,7 +944,7 @@ def exchange(body: ExchangeIn, db: Session = Depends(get_db)):
             "id": user.id,
             "name": user.name,
             "email": user.email,
-            "role": user.role.value,
+            "role": acting_role.value,
             "is_email_verified": user.is_email_verified,
             "organization_id": user.organization_id,
             "organization_name": org.name,
