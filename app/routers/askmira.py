@@ -23,8 +23,10 @@ way, with ASKMIRA_SHARED_SECRET:
 `query` is read-only: AskMira's companion asks it on behalf of one person (see
 "Read-only queries" below).
 
-Users AskMira manages carry `askmira_user_id`. Only they are switched off when
-they drop out of AskMira's roster; accounts made here are never touched.
+Only users the link itself created (`askmira_managed`) are switched off when
+they drop out of AskMira's roster; accounts made here are never switched on or
+off by a sync, even after their owner signs in from AskMira. An empty roster,
+or one that would switch off most people at once, switches no one off.
 """
 import base64
 import hashlib
@@ -460,14 +462,16 @@ def _apply_roster(roster: RosterIn) -> dict:
             raise HTTPException(status_code=404, detail="This workspace is not linked here yet.")
         created = updated = deactivated = 0
         skipped: list[dict] = []
-        kept: set[str] = set()
+        # Everyone named in the roster, even those skipped below: being in
+        # AskMira's roster is never a reason to be switched off here.
+        present: set[str] = {p.email.lower() for p in roster.users}
         for person in roster.users:
             email = person.email.lower()
-            role = ROLES.get(person.role)
+            role = ROLES.get(person.role.strip().lower())
             if role is None:
                 skipped.append({"email": email, "reason": f"unknown role {person.role!r}"})
                 continue
-            user = db.query(User).filter(User.email == email).first()
+            user = db.query(User).filter(func.lower(User.email) == email).first()
             if user is None:
                 db.add(User(
                     name=person.name.strip()[:150] or email,
@@ -478,9 +482,9 @@ def _apply_roster(roster: RosterIn) -> dict:
                     is_active=True,
                     is_email_verified=True,
                     askmira_user_id=person.id,
+                    askmira_managed=True,
                 ))
                 created += 1
-                kept.add(email)
                 continue
             if user.organization_id != org.id:
                 skipped.append({"email": email, "reason": "belongs to another organization here"})
@@ -488,35 +492,60 @@ def _apply_roster(roster: RosterIn) -> dict:
             if user.role == UserRole.super_admin:
                 skipped.append({"email": email, "reason": "a platform super admin here"})
                 continue
-            kept.add(email)
-            changed = False
-            for field, value in (
+            fields = [
                 ("name", person.name.strip()[:150] or user.name),
                 ("role", role),
                 ("askmira_user_id", person.id),
-                ("is_active", True),
-            ):
+            ]
+            if user.askmira_managed:
+                # Back in the roster: switched on again. An account made here
+                # keeps whatever an admin here set.
+                fields.append(("is_active", True))
+            changed = False
+            for field, value in fields:
                 if getattr(user, field) != value:
                     setattr(user, field, value)
                     changed = True
             if changed:
                 updated += 1
+
+        held: Optional[str] = None
         if roster.complete:
-            leavers = db.query(User).filter(
+            managed = db.query(User).filter(
                 User.organization_id == org.id,
-                User.askmira_user_id.isnot(None),
+                User.askmira_managed == True,  # noqa: E712
                 User.is_active == True,  # noqa: E712
             ).all()
-            for user in leavers:
-                if user.email not in kept:
+            leavers = [u for u in managed if u.email.lower() not in present]
+            # A roster that would empty the organization, or take out most of
+            # it at once, is far likelier a bad or partial send than real
+            # leavers: hold off and say so rather than lock people out.
+            if leavers and not present:
+                held = "the roster was empty"
+            elif len(leavers) >= 3 and len(leavers) * 2 > len(managed):
+                held = f"it would switch off {len(leavers)} of {len(managed)} people at once"
+            if held:
+                logger.warning(
+                    "[AskMira] roster for org %s: not switching anyone off, %s", org.id, held,
+                )
+            else:
+                for user in leavers:
                     user.is_active = False
                     deactivated += 1
+                if leavers:
+                    logger.info(
+                        "[AskMira] roster for org %s: switched off %s",
+                        org.id, ", ".join(u.email for u in leavers),
+                    )
         db.commit()
         logger.info(
             "[AskMira] roster for org %s: %s created, %s updated, %s deactivated, %s skipped",
             org.id, created, updated, deactivated, len(skipped),
         )
-        return {"created": created, "updated": updated, "deactivated": deactivated, "skipped": skipped}
+        result = {"created": created, "updated": updated, "deactivated": deactivated, "skipped": skipped}
+        if held:
+            result["deactivation_held"] = held
+        return result
     finally:
         db.close()
 
@@ -1212,7 +1241,7 @@ def exchange(body: ExchangeIn, db: Session = Depends(get_db)):
         raise HTTPException(status_code=403, detail="AskMira did not give you a role in this tool.")
 
     scope = None  # set for a super admin of this organization (below)
-    user = db.query(User).filter(User.email == email).first()
+    user = db.query(User).filter(func.lower(User.email) == email).first()
     if user is None:
         # Joined since the last sync: let them in now; the next sync confirms it.
         user = User(
@@ -1224,6 +1253,7 @@ def exchange(body: ExchangeIn, db: Session = Depends(get_db)):
             is_active=True,
             is_email_verified=True,
             askmira_user_id=str(claims.get("sub")),
+            askmira_managed=True,
         )
         db.add(user)
     else:

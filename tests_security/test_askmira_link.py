@@ -13,6 +13,7 @@ import uuid
 
 import pytest
 from jose import jwt
+from sqlalchemy import func
 
 from app.auth import hash_password
 from app.config import settings
@@ -149,6 +150,73 @@ def test_roster_sync_adds_updates_and_switches_off_only_managed_users(client):
     assert r.json()["updated"] >= 1
 
 
+def test_sync_never_switches_off_accounts_made_here(client):
+    """An admin made here who once opened the tool from AskMira, then is missing
+    from a roster, stays on (this used to switch whole teams off)."""
+    tenant = str(uuid.uuid4())
+    org_id = int(_provision(client, "/organizations", _company(tenant, slug="native-co")).json()["external_ref"])
+    db = SessionLocal()
+    db.add(User(name="Made Here", email="Admin@native-co-test.com", password_hash=hash_password("Passw0rd!!"),
+                role=UserRole.admin, organization_id=org_id, is_active=True))
+    db.commit()
+    db.close()
+
+    # Signs in from AskMira (stamps AskMira's id on the account), in any letter case.
+    r, _ = _launch(client, tenant, org_id, "admin@native-co-test.com", role="admin")
+    assert r.status_code == 200, r.text
+    other = {"id": str(uuid.uuid4()), "email": "new@native-co-test.com", "name": "New", "role": "recruiter"}
+    r = _provision(client, "/users/sync", {"tenant_id": tenant, "complete": True, "users": [other]})
+    assert r.status_code == 200 and r.json()["deactivated"] == 0
+
+    # Switched off here by an admin: a sync naming them does not switch them back on.
+    db = SessionLocal()
+    native = db.query(User).filter(User.email == "Admin@native-co-test.com").one()
+    assert native.is_active is True and native.askmira_managed is False
+    native.is_active = False
+    db.commit()
+    db.close()
+    me = {"id": str(uuid.uuid4()), "email": "ADMIN@native-co-test.com", "name": "Made Here", "role": "Admin"}
+    r = _provision(client, "/users/sync", {"tenant_id": tenant, "complete": True, "users": [me, other]})
+    assert r.status_code == 200 and r.json()["created"] == 0 and not r.json()["skipped"]
+    with SessionLocal() as db:
+        assert db.query(User).filter(User.email == "Admin@native-co-test.com").one().is_active is False
+        assert db.query(User).filter(func.lower(User.email) == "admin@native-co-test.com").count() == 1
+
+
+def test_people_still_in_the_roster_are_never_switched_off(client):
+    tenant = str(uuid.uuid4())
+    _provision(client, "/organizations", _company(tenant, slug="odd-role-co"))
+    a = {"id": str(uuid.uuid4()), "email": "a@odd-role-co-test.com", "name": "A", "role": "admin"}
+    b = {"id": str(uuid.uuid4()), "email": "b@odd-role-co-test.com", "name": "B", "role": "recruiter"}
+    _provision(client, "/users/sync", {"tenant_id": tenant, "complete": True, "users": [a, b]})
+    # B's role comes through as one this tool doesn't know: skipped, but kept on.
+    r = _provision(client, "/users/sync", {"tenant_id": tenant, "complete": True,
+                                          "users": [a, {**b, "role": "hr_manager"}]})
+    assert r.json()["deactivated"] == 0
+    with SessionLocal() as db:
+        assert db.query(User).filter(User.email == "b@odd-role-co-test.com").one().is_active is True
+
+
+def test_empty_or_mostly_missing_roster_switches_no_one_off(client):
+    tenant = str(uuid.uuid4())
+    _provision(client, "/organizations", _company(tenant, slug="partial-co"))
+    people = [{"id": str(uuid.uuid4()), "email": f"p{i}@partial-co-test.com", "name": f"P{i}", "role": "recruiter"}
+              for i in range(5)]
+    _provision(client, "/users/sync", {"tenant_id": tenant, "complete": True, "users": people})
+
+    r = _provision(client, "/users/sync", {"tenant_id": tenant, "complete": True, "users": []})
+    assert r.json()["deactivated"] == 0 and "empty" in r.json()["deactivation_held"]
+    r = _provision(client, "/users/sync", {"tenant_id": tenant, "complete": True, "users": people[:1]})
+    assert r.json()["deactivated"] == 0 and "4 of 5" in r.json()["deactivation_held"]
+    with SessionLocal() as db:
+        assert db.query(User).filter(User.email.like("%@partial-co-test.com"),
+                                     User.is_active == True).count() == 5  # noqa: E712
+
+    # One real leaver still goes.
+    r = _provision(client, "/users/sync", {"tenant_id": tenant, "complete": True, "users": people[1:]})
+    assert r.json()["deactivated"] == 1 and "deactivation_held" not in r.json()
+
+
 def test_sync_for_an_unlinked_workspace_is_404(client):
     tenant = str(uuid.uuid4())
     r = _provision(client, "/users/sync", {"tenant_id": tenant, "complete": True, "users": []})
@@ -201,8 +269,9 @@ def test_switched_off_user_or_suspended_org_cannot_launch(client):
     tenant = str(uuid.uuid4())
     org_id = int(_provision(client, "/organizations", _company(tenant, slug="off-co")).json()["external_ref"])
     person = {"id": str(uuid.uuid4()), "email": "gone@off-co-test.com", "name": "Gone", "role": "admin"}
-    _provision(client, "/users/sync", {"tenant_id": tenant, "complete": True, "users": [person]})
-    _provision(client, "/users/sync", {"tenant_id": tenant, "complete": True, "users": []})
+    stays = {"id": str(uuid.uuid4()), "email": "stays@off-co-test.com", "name": "Stays", "role": "admin"}
+    _provision(client, "/users/sync", {"tenant_id": tenant, "complete": True, "users": [person, stays]})
+    _provision(client, "/users/sync", {"tenant_id": tenant, "complete": True, "users": [stays]})
     r, _ = _launch(client, tenant, org_id, "gone@off-co-test.com")
     assert r.status_code == 403
 
