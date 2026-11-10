@@ -16,6 +16,7 @@ way, with ASKMIRA_SHARED_SECRET:
   POST /integrations/askmira/organizations   use=provision, `bh` = SHA-256 of the body
   POST /integrations/askmira/users/sync      use=provision, `bh` = SHA-256 of the body
   POST /integrations/askmira/query           use=query, `bh` = SHA-256 of the body
+  POST /integrations/askmira/act             use=act, `bh`; each `jti` once (open a job)
   POST /integrations/askmira/connect/revoke  use=revoke, `bh`; AskMira disconnected
   POST /auth/askmira/exchange                use=launch; each `jti` is accepted once
 
@@ -46,7 +47,12 @@ from starlette.concurrency import run_in_threadpool
 from app.auth import ORG_SCOPE, create_access_token, get_current_user, hash_password
 from app.config import settings
 from app.database import SessionLocal, get_db
-from app.models.askmira import AskmiraConnectCode, AskmiraLaunch, AskmiraOrgConnection
+from app.models.askmira import (
+    AskmiraConnectCode,
+    AskmiraJobRequest,
+    AskmiraLaunch,
+    AskmiraOrgConnection,
+)
 from app.models.candidate import Candidate, CandidateStatus
 from app.models.interview import InterviewSession, SessionStatus
 from app.models.job import Job, JobStatus
@@ -568,7 +574,8 @@ _INTERVIEW_LABEL = {
 _NOT_SCHEDULED = ("New", "Applied", "Added from Database")
 _JOB_STATUS = {status.value.lower(): status for status in JobStatus}
 _CANDIDATE_STATUS = {status.value.lower(): status for status in CandidateStatus}
-_MAX_WINDOW = timedelta(days=100)
+# A year (and a day, for a leap year): AskMira asks about "the last 12 months".
+_MAX_WINDOW = timedelta(days=366)
 
 
 class ActorIn(BaseModel):
@@ -627,7 +634,7 @@ def _window(params: dict) -> tuple[datetime, datetime]:
     start, end = _instant(params.get("start")), _instant(params.get("end"))
     if end <= start or end - start > _MAX_WINDOW:
         raise HTTPException(
-            status_code=422, detail="The window must end after it starts, within 100 days."
+            status_code=422, detail="The window must end after it starts, within a year."
         )
     return start, end
 
@@ -800,12 +807,52 @@ def _q_interviews(db: Session, org: Organization, params: dict) -> dict:
     }
 
 
+def _q_hires(db: Session, org: Organization, params: dict) -> dict:
+    """Candidates marked Hired, with what onboarding needs: for AskMira's HR only.
+
+    The one answer here that carries contact details, because the person is
+    joining the company: AskMira's HR adds them as a joiner from it. Never AI
+    scores, fit scores or anything from the interview.
+    """
+    query = _org_candidates(db, org).filter(Candidate.status == CandidateStatus.hired)
+    rows = (
+        query.order_by(Candidate.applied_date.desc().nullslast(), Candidate.id.desc())
+        .limit(min(max(int(params.get("limit") or 100), 1), 200))
+        .all()
+    )
+    jobs = {
+        job.id: job
+        for job in db.query(Job).filter(Job.id.in_({c.job_id for c, _ in rows if c.job_id}))
+    }
+    out = []
+    for candidate, title in rows:
+        job = jobs.get(candidate.job_id)
+        out.append(
+            {
+                "ref": encode_ref("candidate", candidate.id),
+                "name": candidate.name,
+                "email": candidate.email,
+                "phone": candidate.phone,
+                "job": title,
+                "department": job.department if job else None,
+                "location": candidate.location or (job.location if job else None),
+                "applied_at": _iso(candidate.applied_date),
+                "job_ref": encode_ref("job", candidate.job_id),
+            }
+        )
+    return {"total": query.count(), "hires": out}
+
+
 _QUERIES = {
     "overview": _q_overview,
     "jobs": _q_jobs,
     "candidates": _q_candidates,
     "interviews": _q_interviews,
+    "hires": _q_hires,
 }
+#: Answers with contact details: only for someone AskMira calls admin (its HR),
+#: who is an admin here too.
+_HR_ONLY = {"hires"}
 
 
 def _answer(question: QueryIn) -> dict:
@@ -841,6 +888,14 @@ def _answer(question: QueryIn) -> dict:
                 detail="You don't have access to hiring data in the interview tool yet. "
                 "Open it once from AskMira, then ask again.",
             )
+        if question.kind in _HR_ONLY and (
+            question.actor.role != "admin"
+            or user.role not in (UserRole.admin, UserRole.super_admin)
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Hired candidates' details are for HR, who add them as joiners.",
+            )
         answer = handler(db, org, question.params or {})
         logger.info("[AskMira] query %s for org %s by %s", question.kind, org.id, email)
         return {"kind": question.kind, **answer}
@@ -858,6 +913,268 @@ async def query(request: Request):
     if question.tenant_id != claims.get("sub"):
         raise HTTPException(status_code=401, detail="The assertion is for another workspace.")
     return await run_in_threadpool(_answer, question)
+
+
+# ── Actions (AskMira's assistant, for one person) ────────────────────────────
+#
+# POST /integrations/askmira/act, use=act, `bh` as above, each `jti` accepted
+# once (the same table that keeps launch links single-use).
+#
+#   job.open      open one job opening for a role an order needs. `key` names
+#                 the order and the role; asking again with the same key gives
+#                 back the job opened the first time. The organization's job
+#                 quota is claimed exactly as the Jobs page claims it, and a
+#                 refusal says how much of the plan is used.
+#   job.withdraw  take back a job opened from AskMira with that key, when a
+#                 later step of AskMira's order failed — only while nobody has
+#                 applied; its quota slot is given back, since it never served.
+#
+# The person must be an active admin or recruiter of the linked organization
+# here, and AskMira must have given them that role.
+
+_KEY = re.compile(r"^[A-Za-z0-9:._/-]{3,120}$")
+
+
+class SkillAsk(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
+class JobAsk(BaseModel):
+    key: str
+    title: str = Field(min_length=2, max_length=255)
+    department: str = Field(default="Delivery", min_length=1, max_length=255)
+    location: str = Field(min_length=1, max_length=255)
+    job_type: str = Field(default="Full Time", max_length=100)
+    emp_type: str = Field(default="Permanent", max_length=100)
+    experience_min: int = Field(default=0, ge=0, le=60)
+    experience_max: int = Field(default=2, ge=0, le=60)
+    openings: int = Field(default=1, ge=1, le=500)
+    skills: list[SkillAsk] = Field(default_factory=list, max_length=30)
+    responsibilities: list[str] = Field(default_factory=list, max_length=30)
+    deadline: Optional[str] = Field(default=None, max_length=100)
+    note: Optional[str] = Field(default=None, max_length=2000)
+
+
+def _spend_once(db: Session, claims: dict) -> None:
+    jti, exp = claims.get("jti"), claims.get("exp")
+    if not jti or not isinstance(exp, (int, float)):
+        raise HTTPException(status_code=401, detail="This AskMira request is not valid.")
+    now = _now()
+    db.query(AskmiraLaunch).filter(AskmiraLaunch.expires_at < now - timedelta(minutes=5)).delete()
+    db.add(
+        AskmiraLaunch(
+            jti=str(jti)[:64],
+            expires_at=datetime.fromtimestamp(exp, timezone.utc).replace(tzinfo=None),
+        )
+    )
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=401, detail="This request was already carried out.")
+
+
+def _actor_here(db: Session, org: Organization, actor: ActorIn) -> User:
+    user = db.query(User).filter(func.lower(User.email) == actor.email.lower()).first()
+    if (
+        ROLES.get(actor.role) is None
+        or user is None
+        or user.organization_id != org.id
+        or not user.is_active
+        or user.role not in (UserRole.admin, UserRole.recruiter, UserRole.super_admin)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Opening jobs in the interview tool is for its admins and recruiters. "
+            "Open it once from AskMira, then ask again.",
+        )
+    return user
+
+
+def _job_read(job: Job) -> dict:
+    return {
+        "ref": encode_ref("job", job.id),
+        "title": job.title,
+        "status": job.status.value if job.status else None,
+        "openings": job.openings or 0,
+        "location": job.location,
+        "experience": f"{job.experience_min}-{job.experience_max} years",
+    }
+
+
+def _open_job(db: Session, org: Organization, user: User, params: dict) -> dict:
+    from app.routers.jobs import _create_token
+    from app.schemas.job import JobCreate, ResponsibilityIn, SkillIn
+    from app.services import job_service
+
+    try:
+        ask = JobAsk.model_validate(params)
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        raise HTTPException(
+            status_code=422, detail=f"{'.'.join(str(p) for p in first['loc'])}: {first['msg']}"
+        )
+    if not _KEY.match(ask.key):
+        raise HTTPException(status_code=422, detail="The request key is not valid.")
+    if ask.experience_max < ask.experience_min:
+        raise HTTPException(status_code=422, detail="The experience range ends before it starts.")
+
+    asked = (
+        db.query(AskmiraJobRequest)
+        .filter(
+            AskmiraJobRequest.organization_id == org.id,
+            AskmiraJobRequest.request_key == ask.key,
+        )
+        .first()
+    )
+    if asked is not None:
+        job = db.query(Job).filter(Job.id == asked.job_id).first()
+        if job is not None:
+            return {"job": _job_read(job), "existing": True}
+        db.delete(asked)
+        db.flush()
+
+    # The quota, claimed as the Jobs page claims it: one conditional UPDATE,
+    # committed with the job (job_service.create_job commits), so a failed
+    # create never uses a slot.
+    claimed = (
+        db.query(Organization)
+        .filter(
+            Organization.id == org.id,
+            or_(
+                func.coalesce(Organization.max_jobs, 0) <= 0,
+                func.coalesce(Organization.total_jobs_used, 0) < Organization.max_jobs,
+            ),
+        )
+        .update(
+            {Organization.total_jobs_used: func.coalesce(Organization.total_jobs_used, 0) + 1},
+            synchronize_session=False,
+        )
+    )
+    if not claimed:
+        db.rollback()
+        db.refresh(org)
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"The interview tool's plan for {org.name} allows {org.max_jobs} job openings and "
+                f"all {org.total_jobs_used or 0} are used. Upgrade the plan or close a job, "
+                "then try again."
+            ),
+        )
+    years = f"{ask.experience_min}-{ask.experience_max} Years"
+    job = job_service.create_job(
+        db,
+        JobCreate(
+            title=ask.title,
+            department=ask.department,
+            location=ask.location,
+            job_type=ask.job_type,
+            emp_type=ask.emp_type,
+            experience_level=years,
+            experience_min=ask.experience_min,
+            experience_max=ask.experience_max,
+            openings=ask.openings,
+            status=JobStatus.open.value,
+            deadline=ask.deadline,
+            skills=[SkillIn(name=s.name, skill=s.name) for s in ask.skills],
+            responsibilities=[ResponsibilityIn(description=r[:2000]) for r in ask.responsibilities],
+        ),
+        org_id=org.id,
+    )
+    db.add(
+        AskmiraJobRequest(
+            organization_id=org.id,
+            request_key=ask.key,
+            job_id=job.id,
+            created_at=_now(),
+            requested_by=user.email,
+        )
+    )
+    db.commit()
+    _create_token(db, job.id)
+    logger.info("[AskMira] job %s opened for org %s by %s (%s)", job.id, org.id, user.email, ask.key)
+    return {"job": _job_read(job), "existing": False}
+
+
+def _withdraw_job(db: Session, org: Organization, user: User, params: dict) -> dict:
+    from app.services import job_service
+
+    key = str(params.get("key") or "")
+    if not _KEY.match(key):
+        raise HTTPException(status_code=422, detail="Which job? Its request key is missing.")
+    asked = (
+        db.query(AskmiraJobRequest)
+        .filter(AskmiraJobRequest.organization_id == org.id, AskmiraJobRequest.request_key == key)
+        .first()
+    )
+    if asked is None:
+        # Never opened, or already withdrawn: nothing to undo.
+        return {"withdrawn": False, "reason": "not_found"}
+    job = db.query(Job).filter(Job.id == asked.job_id, Job.organization_id == org.id).first()
+    if job is None:
+        db.delete(asked)
+        db.commit()
+        return {"withdrawn": False, "reason": "not_found"}
+    applied = db.query(func.count(Candidate.id)).filter(Candidate.job_id == job.id).scalar() or 0
+    if applied:
+        raise HTTPException(
+            status_code=409,
+            detail=f"“{job.title}” already has {applied} applicant(s), so it was left open.",
+        )
+    title = job.title
+    db.delete(asked)
+    db.commit()
+    job_service.delete_job(db, job.id)
+    # It never served: give the plan its slot back.
+    db.query(Organization).filter(
+        Organization.id == org.id, func.coalesce(Organization.total_jobs_used, 0) > 0
+    ).update(
+        {Organization.total_jobs_used: Organization.total_jobs_used - 1},
+        synchronize_session=False,
+    )
+    db.commit()
+    logger.info("[AskMira] job %s withdrawn for org %s by %s (%s)", title, org.id, user.email, key)
+    return {"withdrawn": True, "title": title}
+
+
+_ACTIONS = {"job.open": _open_job, "job.withdraw": _withdraw_job}
+
+
+def _carry_out(question: QueryIn, claims: dict) -> dict:
+    action = _ACTIONS.get(question.kind)
+    if action is None:
+        raise HTTPException(status_code=422, detail="Unknown action.")
+    db = SessionLocal()
+    try:
+        _spend_once(db, claims)
+        org = (
+            db.query(Organization)
+            .filter(Organization.askmira_tenant_id == question.tenant_id)
+            .first()
+        )
+        if org is None:
+            raise HTTPException(status_code=404, detail="This workspace is not linked here yet.")
+        if not org.is_active:
+            raise HTTPException(
+                status_code=403, detail="Your organization's account here is suspended."
+            )
+        user = _actor_here(db, org, question.actor)
+        return {"kind": question.kind, **action(db, org, user, question.params or {})}
+    finally:
+        db.close()
+
+
+@integration_router.post("/act")
+async def act(request: Request):
+    claims, body = await _provision_claims(request, use="act")
+    try:
+        question = QueryIn.model_validate_json(body)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()[0].get("msg", "Invalid body"))
+    if question.tenant_id != claims.get("sub"):
+        raise HTTPException(status_code=401, detail="The assertion is for another workspace.")
+    return await run_in_threadpool(_carry_out, question, claims)
 
 
 # ── Sign-in from AskMira ─────────────────────────────────────────────────────

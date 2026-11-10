@@ -361,7 +361,8 @@ def test_query_refuses_strangers_other_workspaces_and_other_tokens(client):
     # A workspace that isn't linked is not found.
     assert _query(client, str(uuid.uuid4()), hr, "jobs").status_code == 404
     assert _query(client, tenant, hr, "salaries").status_code == 422
-    too_long = {"start": "2026-01-01T00:00:00+00:00", "end": "2026-12-31T00:00:00+00:00"}
+    # More than a year (366 days) is refused.
+    too_long = {"start": "2025-01-01T00:00:00+00:00", "end": "2026-12-31T00:00:00+00:00"}
     assert _query(client, tenant, hr, "interviews", too_long).status_code == 422
 
     # Switched off by AskMira: no more answers.
@@ -550,3 +551,145 @@ def test_a_super_admin_of_the_connected_org_reads_it_and_signs_in_as_its_admin_o
     root_launch = _token("launch", str(uuid.uuid4()), secret=secret, tid=tenant, ext=str(org_id),
                          email="root@platform.test", name="Root", role="admin")
     assert client.post("/auth/askmira/exchange", json={"token": root_launch}).status_code == 409
+
+
+# ── Actions: job openings for an order win (POST /integrations/askmira/act) ──
+
+
+def _act(client, tenant_id, kind, params, *, email, role="admin", use="act", jti=None):
+    payload = {"tenant_id": tenant_id, "actor": {"id": "u-1", "email": email, "role": role},
+               "kind": kind, "params": params}
+    body = json.dumps(payload).encode()
+    extra = {"jti": jti} if jti else {}
+    token = _token(use, tenant_id, bh=hashlib.sha256(body).hexdigest(), **extra)
+    return client.post(
+        "/integrations/askmira/act", content=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+
+
+def _act_org(client, slug, *, max_jobs=0):
+    tenant = str(uuid.uuid4())
+    org_id = int(_provision(client, "/organizations", _company(tenant, slug=slug)).json()["external_ref"])
+    db = SessionLocal()
+    org = db.query(Organization).filter(Organization.id == org_id).one()
+    org.max_jobs = max_jobs
+    org.total_jobs_used = 0
+    email = f"hr-{slug}@{slug}-test.com"
+    db.add(User(name="HR", email=email, password_hash=hash_password("Passw0rd!!"),
+                role=UserRole.admin, organization_id=org_id, is_active=True))
+    db.commit()
+    db.close()
+    return tenant, org_id, email
+
+
+def _role(i, **extra):
+    return {"key": f"PO-1:{i}", "title": f"Developer {i} (Kestrel)", "location": "Pune",
+            "emp_type": "Hybrid", "experience_min": 4, "experience_max": 6, "openings": 2,
+            "skills": [{"name": "OutSystems"}], **extra}
+
+
+def test_a_job_is_opened_once_per_key_as_an_admin_here(client):
+    from app.models.askmira import AskmiraJobRequest
+    from app.models.job import Job, JobStatus
+
+    tenant, org_id, email = _act_org(client, "act-once")
+    first = _act(client, tenant, "job.open", _role(1), email=email)
+    assert first.status_code == 200, first.text
+    job = first.json()["job"]
+    assert first.json()["existing"] is False and job["status"] == "Open" and job["openings"] == 2
+    # The same key again (a retry, or the order sent twice): the same job, no second one.
+    again = _act(client, tenant, "job.open", _role(1), email=email)
+    assert again.json()["existing"] is True and again.json()["job"]["ref"] == job["ref"]
+    db = SessionLocal()
+    assert db.query(Job).filter(Job.organization_id == org_id).count() == 1
+    assert db.query(AskmiraJobRequest).filter(AskmiraJobRequest.organization_id == org_id).count() == 1
+    made = db.query(Job).filter(Job.organization_id == org_id).one()
+    assert made.status == JobStatus.open and [s.name for s in made.skills] == ["OutSystems"]
+    db.close()
+
+
+def test_an_action_needs_an_act_token_used_once_by_someone_who_hires_here(client):
+    tenant, _, email = _act_org(client, "act-guard")
+    # A read token never writes.
+    assert _act(client, tenant, "job.open", _role(1), email=email, use="query").status_code == 401
+    # The same token twice: refused the second time.
+    jti = secrets.token_urlsafe(18)
+    assert _act(client, tenant, "job.open", _role(1), email=email, jti=jti).status_code == 200
+    assert _act(client, tenant, "job.open", _role(2), email=email, jti=jti).status_code == 401
+    # Someone who is not an admin or recruiter of this organization.
+    assert _act(client, tenant, "job.open", _role(3), email="nobody@nowhere-test.com").status_code == 403
+    assert _act(client, tenant, "job.open", _role(3), email=email, role="employee").status_code == 403
+    # Anything odd in the request is refused before anything is made.
+    bad = _act(client, tenant, "job.open", _role(4, experience_min=6, experience_max=4), email=email)
+    assert bad.status_code == 422
+    assert _act(client, tenant, "job.delete_all", {}, email=email).status_code == 422
+
+
+def test_the_job_quota_refuses_with_how_much_is_used(client):
+    tenant, org_id, email = _act_org(client, "act-quota", max_jobs=2)
+    assert _act(client, tenant, "job.open", _role(1), email=email).status_code == 200
+    assert _act(client, tenant, "job.open", _role(2), email=email).status_code == 200
+    third = _act(client, tenant, "job.open", _role(3), email=email)
+    assert third.status_code == 409
+    assert "allows 2 job openings and all 2 are used" in third.json()["detail"]
+    db = SessionLocal()
+    assert db.query(Organization).filter(Organization.id == org_id).one().total_jobs_used == 2
+    db.close()
+
+
+def test_withdrawing_takes_the_job_back_and_its_quota_slot_unless_someone_applied(client):
+    from app.models.candidate import Candidate
+    from app.models.job import Job
+
+    tenant, org_id, email = _act_org(client, "act-undo", max_jobs=5)
+    assert _act(client, tenant, "job.open", _role(1), email=email).status_code == 200
+    assert _act(client, tenant, "job.open", _role(2), email=email).status_code == 200
+    undone = _act(client, tenant, "job.withdraw", {"key": "PO-1:1"}, email=email)
+    assert undone.status_code == 200 and undone.json()["withdrawn"] is True
+    db = SessionLocal()
+    assert db.query(Organization).filter(Organization.id == org_id).one().total_jobs_used == 1
+    remaining = db.query(Job).filter(Job.organization_id == org_id).one()
+    db.add(Candidate(name="Applicant", email="applicant@cand-test.com", job_id=remaining.id))
+    db.commit()
+    db.close()
+    # Nothing to undo: said, not an error.
+    assert _act(client, tenant, "job.withdraw", {"key": "PO-1:1"}, email=email).json()["withdrawn"] is False
+    # Someone applied: left open.
+    kept = _act(client, tenant, "job.withdraw", {"key": "PO-1:2"}, email=email)
+    assert kept.status_code == 409 and "applicant" in kept.json()["detail"]
+
+
+def test_hires_give_hr_the_details_onboarding_needs_and_nobody_else(client):
+    """A candidate marked Hired, with contact details, for AskMira's HR to add as a joiner."""
+    from app.models import Candidate
+    from app.models.candidate import CandidateStatus
+
+    tenant, other, people = _hiring_world(client, "hire-h")
+    db = SessionLocal()
+    priya = db.query(Candidate).filter(Candidate.email == "priya@hire-h-cand.com").first()
+    priya.status = CandidateStatus.hired
+    priya.location = "Pune"
+    db.commit()
+    db.close()
+
+    hr = _actor(people[0]["email"])
+    r = _query(client, tenant, hr, "hires")
+    assert r.status_code == 200, r.text
+    hires = r.json()
+    assert hires["total"] == 1
+    [hire] = hires["hires"]
+    assert hire["name"] == "Priya Nair"
+    assert hire["email"] == "priya@hire-h-cand.com"
+    assert hire["phone"] == "+91 90000 00001"
+    assert (hire["job"], hire["department"], hire["location"]) == ("Backend Engineer", "Engineering", "Pune")
+    # Nothing from the interview leaves with it.
+    for word in ("score", "cheat", "fit", "resume"):
+        assert word not in r.text.lower(), word
+
+    # A recruiter (a hiring manager in AskMira) is refused: contact details are HR's.
+    mgr = _actor(people[1]["email"], role="recruiter")
+    assert _query(client, tenant, mgr, "hires").status_code == 403
+    # The other workspace sees none of them.
+    other_hr = _actor("hr@hire-h-other-test.com")
+    assert _query(client, other, other_hr, "hires").json()["hires"] == []

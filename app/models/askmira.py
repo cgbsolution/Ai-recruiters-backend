@@ -57,3 +57,25 @@ class AskmiraConnectCode(Base):
     user_id = Column(Integer, nullable=True)
     expires_at = Column(DateTime, nullable=False, index=True)
     used_at = Column(DateTime, nullable=True)
+
+
+class AskmiraJobRequest(Base):
+    """A job opening AskMira asked for, by its own key (app.routers.askmira, /act).
+
+    AskMira opens the positions an order needs, one per role, each with a key
+    that names the order and the role ("<PO>:<n>"). Asking again with the same
+    key gives back the job opened the first time instead of a second one, so a
+    retried or repeated request never doubles the openings. Withdrawing (when a
+    later step of AskMira's order fails) removes the row with the job.
+    """
+
+    __tablename__ = "askmira_job_requests"
+
+    organization_id = Column(
+        Integer, ForeignKey("organizations.id", ondelete="CASCADE"), primary_key=True
+    )
+    request_key = Column(String(120), primary_key=True)
+    job_id = Column(Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False)
+    #: The AskMira person who asked, by their login email.
+    requested_by = Column(String(255), nullable=True)
