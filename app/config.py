@@ -105,6 +105,10 @@ class Settings(BaseSettings):
     # (comma-separated, e.g. "https://app.askmira.in"). Empty = any https AskMira,
     # named on the approval page so the admin sees who is asking.
     ASKMIRA_ALLOWED_ORIGINS: str = ""
+    # The AskMira platform's key for this tool (AskMira → Platform → Connected
+    # tools). With it AskMira's super admin creates an organization here, with
+    # its first admin, or attaches one that exists. Empty = off.
+    ASKMIRA_PLATFORM_SECRET: str = ""
 
     # ── Email / SMTP ─────────────────────────────────────────────────────────
     SMTP_HOST: str = ""
